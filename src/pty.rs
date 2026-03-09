@@ -134,6 +134,14 @@ impl PaneProcess {
             .cursor_position()
     }
 
+    pub fn screen_size(&self) -> (u16, u16) {
+        self.parser
+            .lock()
+            .expect("pane parser lock poisoned")
+            .screen()
+            .size()
+    }
+
     pub fn selection_text(
         &self,
         start_row: u16,

@@ -74,7 +74,7 @@ impl Session {
             )?,
         );
 
-        Ok(Self {
+        let mut session = Self {
             name,
             cwd,
             command,
@@ -83,7 +83,9 @@ impl Session {
             windows,
             window_order: vec![window_id],
             active_window: window_id,
-        })
+        };
+        session.sync_pane_sizes()?;
+        Ok(session)
     }
 
     pub fn active_window(&self) -> Option<&WindowRuntime> {
@@ -243,24 +245,10 @@ impl Session {
         Ok(())
     }
 
-    pub fn resize(&self, rows: u16, cols: u16) -> Result<()> {
-        for window in self.windows.values() {
-            for pane in window.panes.values() {
-                pane.process.resize(rows.max(1), cols.max(1))?;
-            }
-        }
-        Ok(())
-    }
-
     pub fn set_viewport(&mut self, rows: u16, cols: u16) -> Result<()> {
         self.rows = rows.max(1);
         self.cols = cols.max(1);
-        for window in self.windows.values() {
-            for pane in window.panes.values() {
-                pane.process.resize(rows.max(1), cols.max(1))?;
-            }
-        }
-        Ok(())
+        self.sync_pane_sizes()
     }
 
     pub fn pane_area(&self) -> Rect {
@@ -316,6 +304,7 @@ impl Session {
         };
         window.panes.insert(pane_id, pane);
         window.layout.split_active(axis, pane_id);
+        self.sync_pane_sizes()?;
         Ok(SplitResult {
             window_id: active_window,
             pane_id,
@@ -344,6 +333,7 @@ impl Session {
         self.windows.insert(window_id, window);
         self.window_order.push(window_id);
         self.active_window = window_id;
+        self.sync_pane_sizes()?;
         Ok(WindowCreation { window_id, pane_id })
     }
 
@@ -428,6 +418,7 @@ impl Session {
             return Ok(None);
         }
         let _ = window.layout.remove_pane(pane_id);
+        self.sync_pane_sizes()?;
         Ok(Some(KillResult { window_id, pane_id }))
     }
 
@@ -442,6 +433,9 @@ impl Session {
         self.window_order.retain(|id| *id != window_id);
         if let Some(next_window) = self.window_order.last().copied() {
             self.active_window = next_window;
+        }
+        if !self.window_order.is_empty() {
+            self.sync_pane_sizes()?;
         }
         Ok(!self.window_order.is_empty())
     }
@@ -496,6 +490,23 @@ impl Session {
 
     pub fn window_mut(&mut self, window_id: Option<WindowId>) -> Option<&mut WindowRuntime> {
         self.windows.get_mut(&window_id.unwrap_or(self.active_window))
+    }
+
+    fn sync_pane_sizes(&mut self) -> Result<()> {
+        let area = self.pane_area();
+        for window in self.windows.values() {
+            let rects = window.layout.pane_rects(area);
+            for (pane_id, pane) in &window.panes {
+                let rect = rects
+                    .get(pane_id)
+                    .copied()
+                    .unwrap_or(area)
+                    .content();
+                pane.process
+                    .resize(rect.height.max(1), rect.width.max(1))?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -562,5 +573,34 @@ fn convert_direction(direction: NavigationDirection) -> Direction {
         NavigationDirection::Right => Direction::Right,
         NavigationDirection::Up => Direction::Up,
         NavigationDirection::Down => Direction::Down,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_window_uses_full_viewport_width_for_pty() {
+        let mut session = Session::new(
+            "work".into(),
+            None,
+            vec!["sh".into()],
+            WindowId(1),
+            PaneId(1),
+        )
+        .expect("create session");
+        session.set_viewport(30, 120).expect("set viewport");
+
+        let created = session
+            .new_window(WindowId(2), PaneId(2), Some("logs".into()), &["sh".into()])
+            .expect("create window");
+
+        let window = session.windows.get(&created.window_id).expect("window");
+        let pane = window.panes.get(&created.pane_id).expect("pane");
+        let (rows, cols) = pane.process.screen_size();
+
+        assert_eq!(rows, 27);
+        assert_eq!(cols, 118);
     }
 }
