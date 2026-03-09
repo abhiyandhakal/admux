@@ -163,14 +163,7 @@ impl Session {
                     .process
                     .visible_rows_formatted(content.width, content.height);
                 let (cursor_row, cursor_col) = pane.process.cursor_position();
-                let cursor = if cursor_row < content.height && cursor_col < content.width {
-                    Some(PaneCursor {
-                        row: cursor_row,
-                        col: cursor_col,
-                    })
-                } else {
-                    None
-                };
+                let cursor = clamp_cursor(content, cursor_row, cursor_col);
 
                 Some(PaneRender {
                     pane_id: pane.id.0,
@@ -576,6 +569,17 @@ fn convert_direction(direction: NavigationDirection) -> Direction {
     }
 }
 
+fn clamp_cursor(content: Rect, row: u16, col: u16) -> Option<PaneCursor> {
+    if content.width == 0 || content.height == 0 {
+        return None;
+    }
+
+    Some(PaneCursor {
+        row: row.min(content.height.saturating_sub(1)),
+        col: col.min(content.width.saturating_sub(1)),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -602,5 +606,24 @@ mod tests {
 
         assert_eq!(rows, 27);
         assert_eq!(cols, 118);
+    }
+
+    #[test]
+    fn cursor_is_clamped_into_pane_content() {
+        let cursor = clamp_cursor(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 5,
+            }
+            .content(),
+            20,
+            20,
+        )
+        .expect("cursor");
+
+        assert_eq!(cursor.row, 2);
+        assert_eq!(cursor.col, 7);
     }
 }
