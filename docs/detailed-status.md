@@ -22,29 +22,34 @@
 
 - session store in the daemon
 - PTY-backed command spawning through `portable-pty`
+- session now owns ordered windows and each window owns a split-tree of panes
 - VT100-backed screen parsing of PTY output
-- pane output capture for attach previews from parsed screen state
-- kill path that terminates pane processes when a session is removed
-- resize path from the client into the active PTY
+- pane output capture for clipped pane regions and attach previews from parsed screen state
+- pane/window/session cleanup when child processes exit
+- resize path from the client into all pane PTYs plus stored viewport geometry
 
 ### Layout and pane foundations
 
-- pane identifiers and pane snapshots in `src/pane.rs`
-- layout tree and split model in `src/layout.rs`
-- session model that owns layout state and panes in `src/session.rs`
+- pane and window identifiers plus render rects in `src/pane.rs`
+- ratio-based layout tree, directional focus, and pane removal collapse in `src/layout.rs`
+- session/window runtime model in `src/session.rs`
+- window summaries in `src/window.rs`
 
 ### Client interaction
 
 - non-interactive attach path that prints session name and pane preview
 - interactive `crossterm` attach path with:
   - alternate screen entry
-  - custom redraws
-  - reverse-video status line
+  - multi-pane redraws from daemon snapshots
+  - pane borders and titles
+  - balanced reverse-video status line with window list
   - `Ctrl-b d` detach
   - direct key forwarding to the active PTY
   - control-key forwarding such as `Ctrl-l`
   - arrow/home/end/delete forwarding
-  - resize propagation from the current terminal into the active PTY
+  - split/window/focus/resize leader-key actions
+  - resize propagation from the current terminal into pane PTYs
+  - mouse focus, selection copy, wheel scroll, and border resize
 
 ### Input and copy-mode foundations
 
@@ -64,20 +69,26 @@
 - session store tests
 - render tests
 - binary smoke tests that execute `admux` and `admuxd`
+- direct binary smoke for split-pane and new-window command flow
 
 ### Manual
 
 The following direct shell-level smoke path was run against built binaries:
 
 1. Start `target/debug/admuxd serve --socket <temp-socket>`
-2. Run `target/debug/admux new --name demo -- sh -lc "printf demo-ok"`
-3. Poll `target/debug/admux attach demo` until pane output appears
+2. Run `ADMUX_SOCKET=<temp-socket> target/debug/admux new -d --name work -- sh -lc "printf base; sleep 5"`
+3. Run `ADMUX_SOCKET=<temp-socket> target/debug/admux split-pane work --vertical`
+4. Run `ADMUX_SOCKET=<temp-socket> target/debug/admux list-panes work`
+5. Run `ADMUX_SOCKET=<temp-socket> target/debug/admux new-window work --name logs -- sh -lc "printf logs; sleep 5"`
+6. Run `ADMUX_SOCKET=<temp-socket> target/debug/admux list-windows work`
 
 Observed result:
 
 - session creation succeeded
-- attach succeeded
-- pane output `demo-ok` was observed from the PTY-backed process
+- pane split succeeded
+- pane list showed two panes in the first window
+- second window creation succeeded
+- window list showed the new active `logs` window
 
 ## Commit history so far
 
@@ -86,14 +97,13 @@ Observed result:
 - `9b9eb6e` `feat: add config loading and ipc foundations`
 - `29eb401` `feat: add daemon lifecycle and core cli commands`
 - `da946e8` `feat: add pty-backed sessions and interactive attach`
+- pending new multipane/window commit in current worktree
 
 ## Known gaps
 
-- no exposed pane-splitting command yet, even though layout support exists internally
-- no exposed window management yet
-- copy mode is not wired into the interactive client
-- mouse events are ignored in the interactive client
-- attach currently targets a single active pane preview rather than a full multi-pane compositor
+- copy mode is still drag-selection focused rather than a full modal copy-mode UI
+- no rename-window command yet
+- no help overlay yet
 - session state is in-memory only while `admuxd` is alive
 
 ## Module map

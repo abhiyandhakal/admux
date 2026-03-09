@@ -1,11 +1,16 @@
-use crate::{
-    ipc::ScrollDirection,
-    layout::LayoutTree,
-    pane::{PaneId, PaneSnapshot},
-    pty::PaneProcess,
-};
-use anyhow::Result;
 use std::{collections::BTreeMap, path::PathBuf};
+
+use anyhow::{Result, anyhow};
+
+use crate::{
+    ipc::{
+        NavigationDirection, PaneCursor, PaneRender, PaneSummary, RenderSnapshot, ScrollDirection,
+    },
+    layout::{Direction, LayoutTree, SplitAxis},
+    pane::{PaneId, PaneSnapshot, Rect, WindowId},
+    pty::PaneProcess,
+    window::WindowSummary,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionName(pub String);
@@ -14,6 +19,16 @@ pub struct Session {
     pub name: String,
     pub cwd: Option<PathBuf>,
     pub command: Vec<String>,
+    pub rows: u16,
+    pub cols: u16,
+    pub windows: BTreeMap<WindowId, WindowRuntime>,
+    pub window_order: Vec<WindowId>,
+    pub active_window: WindowId,
+}
+
+pub struct WindowRuntime {
+    pub id: WindowId,
+    pub name: String,
     pub layout: LayoutTree,
     pub panes: BTreeMap<PaneId, PaneRuntime>,
 }
@@ -24,61 +39,95 @@ pub struct PaneRuntime {
     pub process: PaneProcess,
 }
 
+pub struct SplitResult {
+    pub window_id: WindowId,
+    pub pane_id: PaneId,
+}
+
+pub struct WindowCreation {
+    pub window_id: WindowId,
+    pub pane_id: PaneId,
+}
+
+pub struct KillResult {
+    pub window_id: WindowId,
+    pub pane_id: PaneId,
+}
+
 impl Session {
     pub fn new(
         name: String,
         cwd: Option<PathBuf>,
         command: Vec<String>,
+        window_id: WindowId,
         pane_id: PaneId,
     ) -> Result<Self> {
-        let process = PaneProcess::spawn(&command, cwd.as_deref())?;
-        let pane = PaneRuntime {
-            id: pane_id,
-            title: name.clone(),
-            process,
-        };
-        let mut panes = BTreeMap::new();
-        panes.insert(pane_id, pane);
+        let mut windows = BTreeMap::new();
+        windows.insert(
+            window_id,
+            WindowRuntime::new(
+                window_id,
+                default_window_name(&command),
+                cwd.clone(),
+                &command,
+                pane_id,
+            )?,
+        );
 
         Ok(Self {
             name,
             cwd,
             command,
-            layout: LayoutTree::new(pane_id),
-            panes,
+            rows: 24,
+            cols: 80,
+            windows,
+            window_order: vec![window_id],
+            active_window: window_id,
         })
     }
 
+    pub fn active_window(&self) -> Option<&WindowRuntime> {
+        self.windows.get(&self.active_window)
+    }
+
+    pub fn active_window_mut(&mut self) -> Option<&mut WindowRuntime> {
+        self.windows.get_mut(&self.active_window)
+    }
+
     pub fn active_pane_preview(&self) -> String {
-        self.panes
-            .get(&self.layout.active)
+        self.active_window()
+            .and_then(|window| window.active_pane())
             .map(|pane| pane.process.preview())
             .unwrap_or_default()
     }
 
     pub fn active_pane_formatted_preview(&self) -> String {
-        self.panes
-            .get(&self.layout.active)
+        self.active_window()
+            .and_then(|window| window.active_pane())
             .map(|pane| pane.process.formatted_preview())
             .unwrap_or_default()
     }
 
     pub fn active_pane_formatted_cursor(&self) -> String {
-        self.panes
-            .get(&self.layout.active)
+        self.active_window()
+            .and_then(|window| window.active_pane())
             .map(|pane| pane.process.formatted_cursor())
             .unwrap_or_default()
     }
 
     pub fn active_pane_selection_text(
         &self,
+        pane_id: Option<PaneId>,
         start_row: u16,
         start_col: u16,
         end_row: u16,
         end_col: u16,
     ) -> String {
-        self.panes
-            .get(&self.layout.active)
+        self.active_window()
+            .and_then(|window| {
+                let pane_id = pane_id.unwrap_or(window.layout.active);
+                window.panes.get(&pane_id)
+            })
             .map(|pane| {
                 pane.process
                     .selection_text(start_row, start_col, end_row, end_col)
@@ -87,8 +136,8 @@ impl Session {
     }
 
     pub fn active_pane_snapshot(&self) -> Option<PaneSnapshot> {
-        self.panes
-            .get(&self.layout.active)
+        self.active_window()
+            .and_then(|window| window.active_pane())
             .map(|pane| PaneSnapshot {
                 id: pane.id,
                 title: pane.title.clone(),
@@ -96,40 +145,422 @@ impl Session {
             })
     }
 
-    pub fn send_keys(&self, keys: &[String]) -> Result<()> {
-        if let Some(pane) = self.panes.get(&self.layout.active) {
-            pane.process.send_keys(keys)?;
-        }
+    pub fn render_snapshot(&self, size: Rect) -> Option<RenderSnapshot> {
+        let window = self.active_window()?;
+        let rects = window.layout.pane_rects(size);
+        let panes = window
+            .layout
+            .panes()
+            .into_iter()
+            .filter_map(|pane_id| {
+                let pane = window.panes.get(&pane_id)?;
+                let rect = *rects.get(&pane_id)?;
+                let content = rect.content();
+                let rows_plain = pane.process.visible_rows(content.width, content.height);
+                let rows_formatted = pane
+                    .process
+                    .visible_rows_formatted(content.width, content.height);
+                let (cursor_row, cursor_col) = pane.process.cursor_position();
+                let cursor = if cursor_row < content.height && cursor_col < content.width {
+                    Some(PaneCursor {
+                        row: cursor_row,
+                        col: cursor_col,
+                    })
+                } else {
+                    None
+                };
+
+                Some(PaneRender {
+                    pane_id: pane.id.0,
+                    title: pane.title.clone(),
+                    rect,
+                    focused: pane_id == window.layout.active,
+                    rows_plain,
+                    rows_formatted,
+                    cursor,
+                })
+            })
+            .collect();
+
+        Some(RenderSnapshot {
+            windows: self.list_windows(),
+            panes,
+            active_window_id: window.id.0,
+            active_pane_id: window.layout.active.0,
+        })
+    }
+
+    pub fn list_windows(&self) -> Vec<WindowSummary> {
+        self.window_order
+            .iter()
+            .enumerate()
+            .filter_map(|(index, id)| {
+                let window = self.windows.get(id)?;
+                Some(WindowSummary::new(
+                    *id,
+                    index,
+                    window.name.clone(),
+                    *id == self.active_window,
+                ))
+            })
+            .collect()
+    }
+
+    pub fn list_panes(&self, window_id: Option<WindowId>) -> Vec<PaneSummary> {
+        let window_id = window_id.unwrap_or(self.active_window);
+        self.windows
+            .get(&window_id)
+            .map(|window| {
+                window
+                    .layout
+                    .panes()
+                    .into_iter()
+                    .map(|pane_id| PaneSummary {
+                        id: pane_id.0,
+                        title: window
+                            .panes
+                            .get(&pane_id)
+                            .map(|pane| pane.title.clone())
+                            .unwrap_or_else(|| "pane".into()),
+                        active: pane_id == window.layout.active,
+                        window_id: window.id.0,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn send_keys(&self, window_id: Option<WindowId>, pane_id: Option<PaneId>, keys: &[String]) -> Result<()> {
+        let window = self
+            .window(window_id)
+            .ok_or_else(|| anyhow!("unknown window"))?;
+        let pane_id = pane_id.unwrap_or(window.layout.active);
+        let pane = window
+            .panes
+            .get(&pane_id)
+            .ok_or_else(|| anyhow!("unknown pane"))?;
+        pane.process.send_keys(keys)?;
         Ok(())
     }
 
     pub fn resize(&self, rows: u16, cols: u16) -> Result<()> {
-        if let Some(pane) = self.panes.get(&self.layout.active) {
-            pane.process.resize(rows, cols)?;
+        for window in self.windows.values() {
+            for pane in window.panes.values() {
+                pane.process.resize(rows.max(1), cols.max(1))?;
+            }
         }
         Ok(())
+    }
+
+    pub fn set_viewport(&mut self, rows: u16, cols: u16) -> Result<()> {
+        self.rows = rows.max(1);
+        self.cols = cols.max(1);
+        for window in self.windows.values() {
+            for pane in window.panes.values() {
+                pane.process.resize(rows.max(1), cols.max(1))?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn pane_area(&self) -> Rect {
+        Rect {
+            x: 0,
+            y: 0,
+            width: self.cols.max(1),
+            height: self.rows.saturating_sub(1).max(1),
+        }
     }
 
     pub fn handle_mouse_scroll(
         &self,
+        pane_id: Option<PaneId>,
         direction: ScrollDirection,
         row: u16,
         col: u16,
     ) -> Result<()> {
-        if let Some(pane) = self.panes.get(&self.layout.active) {
-            pane.process.handle_mouse_scroll(direction, row, col)?;
+        let window = self
+            .active_window()
+            .ok_or_else(|| anyhow!("unknown window"))?;
+        let pane_id = pane_id.unwrap_or(window.layout.active);
+        let pane = window
+            .panes
+            .get(&pane_id)
+            .ok_or_else(|| anyhow!("unknown pane"))?;
+        pane.process.handle_mouse_scroll(direction, row, col)?;
+        Ok(())
+    }
+
+    pub fn split_active_pane(
+        &mut self,
+        axis: SplitAxis,
+        pane_id: PaneId,
+        command: &[String],
+    ) -> Result<SplitResult> {
+        let cwd = self.cwd.clone();
+        let default_command = if command.is_empty() {
+            self.command.clone()
+        } else {
+            command.to_vec()
+        };
+        let active_window = self.active_window;
+        let window = self
+            .windows
+            .get_mut(&active_window)
+            .ok_or_else(|| anyhow!("unknown window"))?;
+        let process = PaneProcess::spawn(&default_command, cwd.as_deref())?;
+        let pane = PaneRuntime {
+            id: pane_id,
+            title: default_window_name(&default_command),
+            process,
+        };
+        window.panes.insert(pane_id, pane);
+        window.layout.split_active(axis, pane_id);
+        Ok(SplitResult {
+            window_id: active_window,
+            pane_id,
+        })
+    }
+
+    pub fn new_window(
+        &mut self,
+        window_id: WindowId,
+        pane_id: PaneId,
+        name: Option<String>,
+        command: &[String],
+    ) -> Result<WindowCreation> {
+        let command = if command.is_empty() {
+            self.command.clone()
+        } else {
+            command.to_vec()
+        };
+        let window = WindowRuntime::new(
+            window_id,
+            name.unwrap_or_else(|| default_window_name(&command)),
+            self.cwd.clone(),
+            &command,
+            pane_id,
+        )?;
+        self.windows.insert(window_id, window);
+        self.window_order.push(window_id);
+        self.active_window = window_id;
+        Ok(WindowCreation { window_id, pane_id })
+    }
+
+    pub fn select_pane(&mut self, window_id: Option<WindowId>, pane_id: PaneId) -> Result<()> {
+        let window = self
+            .window_mut(window_id)
+            .ok_or_else(|| anyhow!("unknown window"))?;
+        if window.panes.contains_key(&pane_id) {
+            window.layout.active = pane_id;
+            Ok(())
+        } else {
+            Err(anyhow!("unknown pane"))
         }
+    }
+
+    pub fn move_focus(&mut self, direction: NavigationDirection, area: Rect) -> Result<()> {
+        let window = self
+            .active_window_mut()
+            .ok_or_else(|| anyhow!("unknown window"))?;
+        let _ = window
+            .layout
+            .select_direction(convert_direction(direction), area);
+        Ok(())
+    }
+
+    pub fn resize_active_pane(
+        &mut self,
+        window_id: Option<WindowId>,
+        direction: NavigationDirection,
+        amount: u16,
+    ) -> Result<()> {
+        let window = self
+            .window_mut(window_id)
+            .ok_or_else(|| anyhow!("unknown window"))?;
+        let _ = window.layout.resize_active(convert_direction(direction), amount);
+        Ok(())
+    }
+
+    pub fn select_window(&mut self, window_id: WindowId) -> Result<()> {
+        if self.windows.contains_key(&window_id) {
+            self.active_window = window_id;
+            Ok(())
+        } else {
+            Err(anyhow!("unknown window"))
+        }
+    }
+
+    pub fn cycle_window(&mut self, next: bool) -> Result<()> {
+        let current = self
+            .window_order
+            .iter()
+            .position(|id| *id == self.active_window)
+            .ok_or_else(|| anyhow!("unknown window"))?;
+        let len = self.window_order.len();
+        let next_index = if next {
+            (current + 1) % len
+        } else {
+            (current + len - 1) % len
+        };
+        self.active_window = self.window_order[next_index];
+        Ok(())
+    }
+
+    pub fn kill_pane(&mut self, window_id: Option<WindowId>, pane_id: Option<PaneId>) -> Result<Option<KillResult>> {
+        let window_id = window_id.unwrap_or(self.active_window);
+        let window = match self.windows.get_mut(&window_id) {
+            Some(window) => window,
+            None => return Err(anyhow!("unknown window")),
+        };
+        let pane_id = pane_id.unwrap_or(window.layout.active);
+        let pane = window
+            .panes
+            .remove(&pane_id)
+            .ok_or_else(|| anyhow!("unknown pane"))?;
+        pane.process.kill()?;
+        if window.panes.is_empty() {
+            self.windows.remove(&window_id);
+            self.window_order.retain(|id| *id != window_id);
+            if let Some(next_window) = self.window_order.last().copied() {
+                self.active_window = next_window;
+            }
+            return Ok(None);
+        }
+        let _ = window.layout.remove_pane(pane_id);
+        Ok(Some(KillResult { window_id, pane_id }))
+    }
+
+    pub fn kill_window(&mut self, window_id: WindowId) -> Result<bool> {
+        let window = self
+            .windows
+            .remove(&window_id)
+            .ok_or_else(|| anyhow!("unknown window"))?;
+        for pane in window.panes.into_values() {
+            pane.process.kill()?;
+        }
+        self.window_order.retain(|id| *id != window_id);
+        if let Some(next_window) = self.window_order.last().copied() {
+            self.active_window = next_window;
+        }
+        Ok(!self.window_order.is_empty())
+    }
+
+    pub fn rename_active_window(&mut self, name: String) -> Result<()> {
+        let window = self
+            .active_window_mut()
+            .ok_or_else(|| anyhow!("unknown window"))?;
+        window.name = name;
         Ok(())
     }
 
     pub fn kill(self) -> Result<()> {
-        for pane in self.panes.into_values() {
-            pane.process.kill()?;
+        for window in self.windows.into_values() {
+            for pane in window.panes.into_values() {
+                pane.process.kill()?;
+            }
         }
         Ok(())
     }
 
     pub fn is_alive(&self) -> bool {
+        self.windows.values().any(WindowRuntime::is_alive)
+    }
+
+    pub fn prune_dead(&mut self) -> bool {
+        let mut empty_windows = Vec::new();
+        for (window_id, window) in &mut self.windows {
+            window.prune_dead();
+            if window.panes.is_empty() {
+                empty_windows.push(*window_id);
+            }
+        }
+
+        for window_id in empty_windows {
+            self.windows.remove(&window_id);
+            self.window_order.retain(|id| *id != window_id);
+        }
+
+        if !self.windows.contains_key(&self.active_window)
+            && let Some(window_id) = self.window_order.last().copied()
+        {
+            self.active_window = window_id;
+        }
+
+        !self.window_order.is_empty()
+    }
+
+    pub fn window(&self, window_id: Option<WindowId>) -> Option<&WindowRuntime> {
+        self.windows.get(&window_id.unwrap_or(self.active_window))
+    }
+
+    pub fn window_mut(&mut self, window_id: Option<WindowId>) -> Option<&mut WindowRuntime> {
+        self.windows.get_mut(&window_id.unwrap_or(self.active_window))
+    }
+}
+
+impl WindowRuntime {
+    fn new(
+        id: WindowId,
+        name: String,
+        cwd: Option<PathBuf>,
+        command: &[String],
+        pane_id: PaneId,
+    ) -> Result<Self> {
+        let process = PaneProcess::spawn(command, cwd.as_deref())?;
+        let pane = PaneRuntime {
+            id: pane_id,
+            title: default_window_name(command),
+            process,
+        };
+        let mut panes = BTreeMap::new();
+        panes.insert(pane_id, pane);
+
+        Ok(Self {
+            id,
+            name,
+            layout: LayoutTree::new(pane_id),
+            panes,
+        })
+    }
+
+    fn active_pane(&self) -> Option<&PaneRuntime> {
+        self.panes.get(&self.layout.active)
+    }
+
+    fn prune_dead(&mut self) {
+        let dead: Vec<_> = self
+            .panes
+            .iter()
+            .filter_map(|(pane_id, pane)| (!pane.process.is_alive()).then_some(*pane_id))
+            .collect();
+        for pane_id in dead {
+            self.panes.remove(&pane_id);
+            if !self.panes.is_empty() {
+                let _ = self.layout.remove_pane(pane_id);
+            }
+        }
+    }
+
+    fn is_alive(&self) -> bool {
         self.panes.values().any(|pane| pane.process.is_alive())
+    }
+}
+
+fn default_window_name(command: &[String]) -> String {
+    command
+        .first()
+        .and_then(|part| part.rsplit('/').next())
+        .filter(|part| !part.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| "shell".into())
+}
+
+fn convert_direction(direction: NavigationDirection) -> Direction {
+    match direction {
+        NavigationDirection::Left => Direction::Left,
+        NavigationDirection::Right => Direction::Right,
+        NavigationDirection::Up => Direction::Up,
+        NavigationDirection::Down => Direction::Down,
     }
 }

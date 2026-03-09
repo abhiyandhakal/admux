@@ -105,6 +105,35 @@ impl PaneProcess {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
+    pub fn visible_rows(&self, width: u16, height: u16) -> Vec<String> {
+        self.parser
+            .lock()
+            .expect("pane parser lock poisoned")
+            .screen()
+            .rows(0, width)
+            .take(height as usize)
+            .collect()
+    }
+
+    pub fn visible_rows_formatted(&self, width: u16, height: u16) -> Vec<String> {
+        self.parser
+            .lock()
+            .expect("pane parser lock poisoned")
+            .screen()
+            .rows_formatted(0, width)
+            .take(height as usize)
+            .map(|row| String::from_utf8_lossy(&row).into_owned())
+            .collect()
+    }
+
+    pub fn cursor_position(&self) -> (u16, u16) {
+        self.parser
+            .lock()
+            .expect("pane parser lock poisoned")
+            .screen()
+            .cursor_position()
+    }
+
     pub fn selection_text(
         &self,
         start_row: u16,

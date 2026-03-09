@@ -1,10 +1,13 @@
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+
+use crate::{layout::SplitAxis, pane::Rect, window::WindowSummary};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtocolVersion(pub u16);
 
-pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(1);
+pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(2);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommandRequest {
@@ -20,12 +23,50 @@ pub enum CommandRequest {
         session: Option<String>,
     },
     ListSessions,
+    ListWindows {
+        session: String,
+    },
+    ListPanes {
+        target: String,
+    },
     KillSession {
         session: String,
+    },
+    KillWindow {
+        target: String,
+    },
+    KillPane {
+        target: String,
     },
     SendKeys {
         target: String,
         keys: Vec<String>,
+    },
+    SplitPane {
+        target: String,
+        axis: SplitAxis,
+        command: Vec<String>,
+    },
+    NewWindow {
+        session: String,
+        name: Option<String>,
+        command: Vec<String>,
+    },
+    SelectPane {
+        target: Option<String>,
+        direction: Option<NavigationDirection>,
+    },
+    SelectWindow {
+        target: String,
+    },
+    CycleWindow {
+        session: String,
+        direction: CycleDirection,
+    },
+    ResizePane {
+        target: String,
+        direction: NavigationDirection,
+        amount: u16,
     },
     MouseScroll {
         session: String,
@@ -35,6 +76,7 @@ pub enum CommandRequest {
     },
     CopySelection {
         session: String,
+        pane_id: Option<u64>,
         start_row: u16,
         start_col: u16,
         end_row: u16,
@@ -57,6 +99,16 @@ pub enum CommandResponse {
         session: String,
         pane_id: u64,
     },
+    WindowCreated {
+        session: String,
+        window_id: u64,
+        pane_id: u64,
+    },
+    PaneSplit {
+        session: String,
+        window_id: u64,
+        pane_id: u64,
+    },
     Attached {
         session: String,
         preview: String,
@@ -64,12 +116,29 @@ pub enum CommandResponse {
         formatted_preview: String,
         #[serde(default)]
         formatted_cursor: String,
+        #[serde(default)]
+        snapshot: Option<RenderSnapshot>,
     },
     SessionList {
         sessions: Vec<String>,
     },
+    WindowList {
+        windows: Vec<WindowSummary>,
+    },
+    PaneList {
+        panes: Vec<PaneSummary>,
+    },
     SessionKilled {
         session: String,
+    },
+    WindowKilled {
+        session: String,
+        window_id: u64,
+    },
+    PaneKilled {
+        session: String,
+        window_id: u64,
+        pane_id: u64,
     },
     KeysSent,
     SelectionCopied {
@@ -77,6 +146,7 @@ pub enum CommandResponse {
     },
     Scrolled,
     Resized,
+    FocusChanged,
     ConfigReloaded,
     Error {
         message: String,
@@ -87,6 +157,53 @@ pub enum CommandResponse {
 pub enum ScrollDirection {
     Up,
     Down,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NavigationDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CycleDirection {
+    Next,
+    Prev,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneCursor {
+    pub row: u16,
+    pub col: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneRender {
+    pub pane_id: u64,
+    pub title: String,
+    pub rect: Rect,
+    pub focused: bool,
+    pub rows_plain: Vec<String>,
+    pub rows_formatted: Vec<String>,
+    pub cursor: Option<PaneCursor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenderSnapshot {
+    pub windows: Vec<WindowSummary>,
+    pub panes: Vec<PaneRender>,
+    pub active_window_id: u64,
+    pub active_pane_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneSummary {
+    pub id: u64,
+    pub title: String,
+    pub active: bool,
+    pub window_id: u64,
 }
 
 #[cfg(test)]
@@ -123,6 +240,7 @@ mod tests {
                 preview: "plain output".into(),
                 formatted_preview: String::new(),
                 formatted_cursor: String::new(),
+                snapshot: None,
             }
         );
     }

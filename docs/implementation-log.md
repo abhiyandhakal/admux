@@ -90,3 +90,27 @@ This document records each completed implementation slice in detail, including t
   - `created demo pane 1`
   - `attached demo`
   - `after`
+
+## Multipane and window slice
+
+- Goal: add real `sessions -> windows -> panes`, ratio-based split layouts, multi-pane rendering, richer CLI commands, leader-key pane/window actions, and mouse-driven pane resizing on top of the existing daemon/client architecture.
+- Files changed:
+  - runtime and protocol: `src/ipc.rs`, `src/server.rs`, `src/session.rs`, `src/layout.rs`, `src/pane.rs`, `src/window.rs`, `src/pty.rs`
+  - client and rendering: `src/client.rs`, `src/input.rs`, `src/render.rs`, `src/cli.rs`
+  - docs: `README.md`, `docs/detailed-status.md`
+- Verification:
+  - `cargo build`
+  - `cargo test`
+  - direct binary smoke:
+    - `target/debug/admuxd serve --socket <temp-socket>`
+    - `ADMUX_SOCKET=<temp-socket> target/debug/admux new -d --name work -- sh -lc 'printf base; sleep 5'`
+    - `ADMUX_SOCKET=<temp-socket> target/debug/admux split-pane work --vertical`
+    - `ADMUX_SOCKET=<temp-socket> target/debug/admux list-panes work`
+    - `ADMUX_SOCKET=<temp-socket> target/debug/admux new-window work --name logs -- sh -lc 'printf logs; sleep 5'`
+    - `ADMUX_SOCKET=<temp-socket> target/debug/admux list-windows work`
+- Observed output:
+  - `created work pane 1`
+  - `split work:1 pane 2`
+  - pane list showed panes `1` and `2` in window `1`
+  - `created work:2 pane 3`
+  - window list showed window `1` and active window `2 logs`

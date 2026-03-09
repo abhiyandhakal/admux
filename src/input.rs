@@ -1,5 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use crate::{ipc::NavigationDirection, layout::SplitAxis};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputMode {
     Normal,
@@ -12,6 +14,13 @@ pub enum InputAction {
     Noop,
     Detach,
     SendBytes(Vec<u8>),
+    SplitPane(SplitAxis),
+    NewWindow,
+    NextWindow,
+    PrevWindow,
+    FocusPane(NavigationDirection),
+    ResizePane(NavigationDirection, u16),
+    KillPane,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +53,20 @@ impl InputState {
                 self.mode = InputMode::Normal;
                 match event.code {
                     KeyCode::Char('d') => InputAction::Detach,
+                    KeyCode::Char('%') => InputAction::SplitPane(SplitAxis::Vertical),
+                    KeyCode::Char('"') => InputAction::SplitPane(SplitAxis::Horizontal),
+                    KeyCode::Char('c') => InputAction::NewWindow,
+                    KeyCode::Char('n') => InputAction::NextWindow,
+                    KeyCode::Char('p') => InputAction::PrevWindow,
+                    KeyCode::Char('h') => InputAction::FocusPane(NavigationDirection::Left),
+                    KeyCode::Char('j') => InputAction::FocusPane(NavigationDirection::Down),
+                    KeyCode::Char('k') => InputAction::FocusPane(NavigationDirection::Up),
+                    KeyCode::Char('l') => InputAction::FocusPane(NavigationDirection::Right),
+                    KeyCode::Char('H') => InputAction::ResizePane(NavigationDirection::Left, 50),
+                    KeyCode::Char('J') => InputAction::ResizePane(NavigationDirection::Down, 50),
+                    KeyCode::Char('K') => InputAction::ResizePane(NavigationDirection::Up, 50),
+                    KeyCode::Char('L') => InputAction::ResizePane(NavigationDirection::Right, 50),
+                    KeyCode::Char('x') => InputAction::KillPane,
                     _ => InputAction::Noop,
                 }
             }
@@ -100,6 +123,16 @@ mod tests {
         assert_eq!(
             state.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)),
             InputAction::SendBytes(vec![0x0c])
+        );
+    }
+
+    #[test]
+    fn leader_split_triggers_split_action() {
+        let mut state = InputState::default();
+        let _ = state.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        assert_eq!(
+            state.handle_key(KeyEvent::new(KeyCode::Char('%'), KeyModifiers::NONE)),
+            InputAction::SplitPane(SplitAxis::Vertical)
         );
     }
 }

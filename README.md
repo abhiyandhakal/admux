@@ -8,30 +8,31 @@ The repository currently contains a working foundation with:
 - `admuxd` as the background daemon
 - TOML config loading from `~/.config/admux/config.toml`
 - Unix socket client/daemon IPC
-- PTY-backed pane processes
-- VT100-backed screen parsing for PTY output
-- non-interactive attach previews
-- a `crossterm` interactive attach loop with a status line and `Ctrl-b d` detach
+- PTY-backed pane and window processes
+- ratio-based split layouts
+- VT100-backed screen parsing and clipped pane rendering
+- a `crossterm` interactive attach loop with pane borders, a rich status line, and tmux-style leader keys
 
 ## Current scope
 
 Implemented now:
 
 - create, list, attach, kill, and send keys to sessions
+- split panes horizontally and vertically
+- create, list, cycle, and select windows
+- list panes within the active window
 - daemon autostart from `admux`
 - session state stored in the daemon
-- PTY-backed command execution per session
-- VT-style screen updates interpreted before rendering
-- custom `crossterm` rendering for interactive attach
-- leader-key input state and detach handling
+- PTY-backed command execution per pane
+- multi-pane `crossterm` rendering with borders and per-pane cursors
+- leader-key commands for split, window navigation, pane focus, pane resize, and detach
+- mouse focus, drag-selection copy, wheel scroll, and border resize
 - unit, integration, and binary smoke coverage
 
 Not finished yet:
 
-- multi-pane splitting from the CLI or interactive client
-- multi-window navigation
-- copy-mode UI beyond the search helper foundation
-- mouse actions in the interactive client
+- rename-window command and help overlay
+- copy-mode UI beyond drag-selection
 - restart recovery or persistent session metadata
 
 ## Build and run
@@ -44,8 +45,12 @@ cargo test
 Examples:
 
 ```bash
-cargo run --bin admux -- new --name work -- sh -lc "printf hello"
+cargo run --bin admux -- new --name work -- sh
 cargo run --bin admux -- ls
+cargo run --bin admux -- split-pane work --vertical
+cargo run --bin admux -- list-panes work
+cargo run --bin admux -- new-window work --name logs -- sh -lc "tail -f /var/log/messages"
+cargo run --bin admux -- list-windows work
 cargo run --bin admux -- attach work
 cargo run --bin admux -- kill work
 ```

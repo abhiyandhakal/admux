@@ -1,11 +1,11 @@
-use crate::{
-    cli::{AdmuxCli, ClientCommand},
-    copy_mode::Selection,
-    input::{InputAction, InputState},
-    ipc::{CommandRequest, CommandResponse},
-    paths::RuntimePaths,
-    render::{TerminalSize, render_session},
+use std::{
+    io::{self, IsTerminal, Read, Write},
+    os::unix::net::UnixStream,
+    process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
+
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::Parser;
@@ -13,17 +13,27 @@ use crossterm::{
     cursor::{Hide, Show},
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, MouseButton, MouseEventKind,
+        Event, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use std::{
-    io::{self, IsTerminal, Read, Write},
-    os::unix::net::UnixStream,
-    process::{Command, Stdio},
-    thread,
-    time::{Duration, Instant},
+
+use crate::{
+    cli::{
+        AdmuxCli, ClientCommand, NewWindowArgs, ResizePaneArgs, SelectPaneArgs, SplitPaneArgs,
+    },
+    copy_mode::Selection,
+    input::{InputAction, InputState},
+    ipc::{
+        CommandRequest, CommandResponse, CycleDirection, NavigationDirection, PaneCursor,
+        PaneRender, RenderSnapshot,
+    },
+    layout::SplitAxis,
+    pane::Rect,
+    paths::RuntimePaths,
+    render::{PaneSelection, TerminalSize, render_session},
+    window::WindowSummary,
 };
 
 pub fn run_from_env() -> Result<()> {
@@ -65,13 +75,46 @@ pub fn run(cli: AdmuxCli) -> Result<()> {
             session: args.session,
         },
         ClientCommand::Ls => CommandRequest::ListSessions,
+        ClientCommand::ListWindows(args) => CommandRequest::ListWindows {
+            session: args.session,
+        },
+        ClientCommand::ListPanes(args) => CommandRequest::ListPanes { target: args.target },
         ClientCommand::Kill(args) => CommandRequest::KillSession {
             session: args.session,
+        },
+        ClientCommand::KillWindow(args) => CommandRequest::KillWindow {
+            target: args.target,
+        },
+        ClientCommand::KillPane(args) => CommandRequest::KillPane {
+            target: args.target,
         },
         ClientCommand::SendKeys(args) => CommandRequest::SendKeys {
             target: args.target,
             keys: args.keys,
         },
+        ClientCommand::SplitPane(args) => split_pane_request(args),
+        ClientCommand::NewWindow(NewWindowArgs {
+            session,
+            name,
+            command,
+        }) => CommandRequest::NewWindow {
+            session,
+            name,
+            command,
+        },
+        ClientCommand::SelectPane(args) => select_pane_request(args),
+        ClientCommand::SelectWindow(args) => CommandRequest::SelectWindow {
+            target: args.target,
+        },
+        ClientCommand::NextWindow(args) => CommandRequest::CycleWindow {
+            session: args.session,
+            direction: CycleDirection::Next,
+        },
+        ClientCommand::PrevWindow(args) => CommandRequest::CycleWindow {
+            session: args.session,
+            direction: CycleDirection::Prev,
+        },
+        ClientCommand::ResizePane(args) => resize_pane_request(args),
         ClientCommand::ReloadConfig => CommandRequest::ReloadConfig,
     };
 
@@ -85,6 +128,53 @@ pub fn request_response(paths: &RuntimePaths, request: CommandRequest) -> Result
         read_message(stream)
     })?;
     Ok(response)
+}
+
+fn split_pane_request(args: SplitPaneArgs) -> CommandRequest {
+    CommandRequest::SplitPane {
+        target: args.target,
+        axis: if args.vertical {
+            SplitAxis::Vertical
+        } else {
+            SplitAxis::Horizontal
+        },
+        command: args.command,
+    }
+}
+
+fn select_pane_request(args: SelectPaneArgs) -> CommandRequest {
+    let direction = if args.left {
+        Some(NavigationDirection::Left)
+    } else if args.right {
+        Some(NavigationDirection::Right)
+    } else if args.up {
+        Some(NavigationDirection::Up)
+    } else if args.down {
+        Some(NavigationDirection::Down)
+    } else {
+        None
+    };
+    CommandRequest::SelectPane {
+        target: args.target,
+        direction,
+    }
+}
+
+fn resize_pane_request(args: ResizePaneArgs) -> CommandRequest {
+    let direction = if args.left {
+        NavigationDirection::Left
+    } else if args.right {
+        NavigationDirection::Right
+    } else if args.up {
+        NavigationDirection::Up
+    } else {
+        NavigationDirection::Down
+    };
+    CommandRequest::ResizePane {
+        target: args.target,
+        direction,
+        amount: args.amount,
+    }
 }
 
 fn with_connection<T>(
@@ -177,11 +267,26 @@ fn print_response(paths: &RuntimePaths, response: CommandResponse) -> Result<()>
         CommandResponse::SessionCreated { session, pane_id } => {
             println!("created {session} pane {pane_id}");
         }
+        CommandResponse::WindowCreated {
+            session,
+            window_id,
+            pane_id,
+        } => {
+            println!("created {session}:{window_id} pane {pane_id}");
+        }
+        CommandResponse::PaneSplit {
+            session,
+            window_id,
+            pane_id,
+        } => {
+            println!("split {session}:{window_id} pane {pane_id}");
+        }
         CommandResponse::Attached {
             session,
             preview,
             formatted_preview,
-            formatted_cursor: _,
+            snapshot,
+            ..
         } => {
             if io::stdout().is_terminal() && std::env::var_os("ADMUX_NONINTERACTIVE").is_none() {
                 attach_interactive(paths, &session)?;
@@ -193,6 +298,12 @@ fn print_response(paths: &RuntimePaths, response: CommandResponse) -> Result<()>
                     }
                 } else if !preview.is_empty() {
                     print!("{preview}");
+                } else if let Some(snapshot) = snapshot {
+                    for pane in snapshot.panes {
+                        for row in pane.rows_plain {
+                            println!("{row}");
+                        }
+                    }
                 }
             }
         }
@@ -201,18 +312,35 @@ fn print_response(paths: &RuntimePaths, response: CommandResponse) -> Result<()>
                 println!("{session}");
             }
         }
-        CommandResponse::SessionKilled { session } => {
-            println!("killed {session}");
+        CommandResponse::WindowList { windows } => {
+            for window in windows {
+                let marker = if window.active { "*" } else { " " };
+                println!("{marker} {} {}", window.id, window.name);
+            }
         }
-        CommandResponse::KeysSent => {
-            println!("keys sent");
+        CommandResponse::PaneList { panes } => {
+            for pane in panes {
+                let marker = if pane.active { "*" } else { " " };
+                println!("{marker} {} {} ({})", pane.id, pane.title, pane.window_id);
+            }
         }
-        CommandResponse::SelectionCopied { .. } => {}
-        CommandResponse::Scrolled => {}
-        CommandResponse::Resized => {}
-        CommandResponse::ConfigReloaded => {
-            println!("config reloaded");
+        CommandResponse::SessionKilled { session } => println!("killed {session}"),
+        CommandResponse::WindowKilled { session, window_id } => {
+            println!("killed {session}:{window_id}");
         }
+        CommandResponse::PaneKilled {
+            session,
+            window_id,
+            pane_id,
+        } => {
+            println!("killed {session}:{window_id}.{pane_id}");
+        }
+        CommandResponse::KeysSent => println!("keys sent"),
+        CommandResponse::SelectionCopied { .. }
+        | CommandResponse::Scrolled
+        | CommandResponse::Resized
+        | CommandResponse::FocusChanged => {}
+        CommandResponse::ConfigReloaded => println!("config reloaded"),
         CommandResponse::Error { message } => return Err(anyhow!(message)),
     }
     Ok(())
@@ -243,16 +371,32 @@ fn attach_interactive(paths: &RuntimePaths, session: &str) -> Result<()> {
     result
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SelectionAnchor {
+    pane_id: u64,
+    row: u16,
+    col: u16,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResizeDrag {
+    pane_id: u64,
+    direction: NavigationDirection,
+    last_row: u16,
+    last_col: u16,
+}
+
 fn run_attach_loop(paths: &RuntimePaths, session: &str, stdout: &mut impl Write) -> Result<()> {
     let mut state = InputState::default();
     let mut last_size = (0, 0);
-    let mut selection_anchor: Option<(u16, u16)> = None;
-    let mut active_selection: Option<Selection> = None;
+    let mut selection_anchor: Option<SelectionAnchor> = None;
+    let mut active_selection: Option<PaneSelection> = None;
+    let mut resize_drag: Option<ResizeDrag> = None;
     let mut status_message: Option<String> = None;
 
     loop {
         let (width, height) = terminal::size().context("failed to read terminal size")?;
-        let rows = height.saturating_sub(1).max(1);
+        let rows = height.max(1);
         let cols = width.max(1);
         if last_size != (rows, cols) {
             let _ = request_response(
@@ -272,19 +416,14 @@ fn run_attach_loop(paths: &RuntimePaths, session: &str, stdout: &mut impl Write)
                 session: Some(session.to_string()),
             },
         )?;
-        let (preview, formatted_preview, formatted_cursor) = match response {
+
+        let snapshot = match response {
             CommandResponse::Attached {
                 preview,
-                formatted_preview,
-                formatted_cursor,
+                snapshot,
+                session: _,
                 ..
-            } => {
-                if formatted_preview.is_empty() {
-                    (preview.clone(), preview, String::new())
-                } else {
-                    (preview, formatted_preview, formatted_cursor)
-                }
-            }
+            } => snapshot.unwrap_or_else(|| fallback_snapshot(preview, width, height)),
             CommandResponse::Error { message } => return Err(anyhow!(message)),
             other => return Err(anyhow!("unexpected attach response: {other:?}")),
         };
@@ -292,9 +431,7 @@ fn run_attach_loop(paths: &RuntimePaths, session: &str, stdout: &mut impl Write)
         render_session(
             stdout,
             session,
-            &preview,
-            &formatted_preview,
-            &formatted_cursor,
+            &snapshot,
             status_message.as_deref(),
             active_selection,
             TerminalSize { width, height },
@@ -307,98 +444,282 @@ fn run_attach_loop(paths: &RuntimePaths, session: &str, stdout: &mut impl Write)
                 Event::Key(key) => match state.handle_key(key) {
                     InputAction::Noop => {}
                     InputAction::Detach => break,
-                    InputAction::SendBytes(bytes) => {
-                        send_input_bytes(paths, session, &bytes)?;
+                    InputAction::SendBytes(bytes) => send_input_bytes(paths, session, &bytes)?,
+                    InputAction::SplitPane(axis) => {
+                        let _ = request_response(
+                            paths,
+                            CommandRequest::SplitPane {
+                                target: session.to_string(),
+                                axis,
+                                command: Vec::new(),
+                            },
+                        )?;
+                    }
+                    InputAction::NewWindow => {
+                        let _ = request_response(
+                            paths,
+                            CommandRequest::NewWindow {
+                                session: session.to_string(),
+                                name: None,
+                                command: Vec::new(),
+                            },
+                        )?;
+                    }
+                    InputAction::NextWindow => {
+                        let _ = request_response(
+                            paths,
+                            CommandRequest::CycleWindow {
+                                session: session.to_string(),
+                                direction: CycleDirection::Next,
+                            },
+                        )?;
+                    }
+                    InputAction::PrevWindow => {
+                        let _ = request_response(
+                            paths,
+                            CommandRequest::CycleWindow {
+                                session: session.to_string(),
+                                direction: CycleDirection::Prev,
+                            },
+                        )?;
+                    }
+                    InputAction::FocusPane(direction) => {
+                        let _ = request_response(
+                            paths,
+                            CommandRequest::SelectPane {
+                                target: None,
+                                direction: Some(direction),
+                            },
+                        )?;
+                    }
+                    InputAction::ResizePane(direction, amount) => {
+                        let _ = request_response(
+                            paths,
+                            CommandRequest::ResizePane {
+                                target: session.to_string(),
+                                direction,
+                                amount,
+                            },
+                        )?;
+                    }
+                    InputAction::KillPane => {
+                        let _ = request_response(
+                            paths,
+                            CommandRequest::KillPane {
+                                target: session.to_string(),
+                            },
+                        )?;
                     }
                 },
-                Event::Paste(text) => {
-                    send_input_bytes(paths, session, text.as_bytes())?;
+                Event::Paste(text) => send_input_bytes(paths, session, text.as_bytes())?,
+                Event::Mouse(mouse) => {
+                    handle_mouse_event(
+                        paths,
+                        session,
+                        &snapshot,
+                        mouse,
+                        stdout,
+                        &mut selection_anchor,
+                        &mut active_selection,
+                        &mut resize_drag,
+                        &mut status_message,
+                    )?;
                 }
-                Event::Mouse(mouse) => match mouse.kind {
-                    MouseEventKind::Down(MouseButton::Left) if mouse.row < rows => {
-                        selection_anchor = Some((mouse.row, mouse.column));
-                        active_selection = Some(Selection::new(
-                            mouse.row,
-                            mouse.column,
-                            mouse.row,
-                            mouse.column,
-                        ));
-                    }
-                    MouseEventKind::Drag(MouseButton::Left) if mouse.row < rows => {
-                        if let Some((start_row, start_col)) = selection_anchor {
-                            active_selection = Some(
-                                Selection::new(start_row, start_col, mouse.row, mouse.column)
-                                    .normalized(),
-                            );
-                        }
-                    }
-                    MouseEventKind::Up(MouseButton::Left) if mouse.row < rows => {
-                        if let Some((start_row, start_col)) = selection_anchor.take() {
-                            let selection =
-                                Selection::new(start_row, start_col, mouse.row, mouse.column)
-                                    .normalized();
-                            let copied = request_response(
-                                paths,
-                                CommandRequest::CopySelection {
-                                    session: session.to_string(),
-                                    start_row: selection.start_row,
-                                    start_col: selection.start_col,
-                                    end_row: selection.end_row,
-                                    end_col: selection.end_col,
-                                },
-                            )?;
-                            match copied {
-                                CommandResponse::SelectionCopied { text } => {
-                                    let copied_chars = text.chars().count();
-                                    if copied_chars > 0 {
-                                        copy_via_osc52(stdout, &text)
-                                            .context("failed to send OSC52 clipboard copy")?;
-                                        status_message =
-                                            Some(format!("copied {copied_chars} chars"));
-                                    }
-                                }
-                                CommandResponse::Error { message } => {
-                                    return Err(anyhow!(message));
-                                }
-                                other => {
-                                    return Err(anyhow!(
-                                        "unexpected selection response: {other:?}"
-                                    ));
-                                }
-                            }
-                        }
-                        active_selection = None;
-                    }
-                    MouseEventKind::ScrollUp => {
-                        let _ = request_response(
-                            paths,
-                            CommandRequest::MouseScroll {
-                                session: session.to_string(),
-                                row: mouse.row,
-                                col: mouse.column,
-                                direction: crate::ipc::ScrollDirection::Up,
-                            },
-                        )?;
-                    }
-                    MouseEventKind::ScrollDown => {
-                        let _ = request_response(
-                            paths,
-                            CommandRequest::MouseScroll {
-                                session: session.to_string(),
-                                row: mouse.row,
-                                col: mouse.column,
-                                direction: crate::ipc::ScrollDirection::Down,
-                            },
-                        )?;
-                    }
-                    _ => {}
-                },
-                Event::Resize(_, _) => {}
-                Event::FocusGained | Event::FocusLost => {}
+                Event::Resize(_, _) | Event::FocusGained | Event::FocusLost => {}
             }
         }
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_mouse_event(
+    paths: &RuntimePaths,
+    session: &str,
+    snapshot: &RenderSnapshot,
+    mouse: MouseEvent,
+    stdout: &mut impl Write,
+    selection_anchor: &mut Option<SelectionAnchor>,
+    active_selection: &mut Option<PaneSelection>,
+    resize_drag: &mut Option<ResizeDrag>,
+    status_message: &mut Option<String>,
+) -> Result<()> {
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if let Some((pane, direction)) = border_hit(snapshot, mouse.row, mouse.column) {
+                *resize_drag = Some(ResizeDrag {
+                    pane_id: pane.pane_id,
+                    direction,
+                    last_row: mouse.row,
+                    last_col: mouse.column,
+                });
+            } else if let Some((pane, row, col)) = pane_content_hit(snapshot, mouse.row, mouse.column) {
+                let _ = request_response(
+                    paths,
+                    CommandRequest::SelectPane {
+                        target: Some(format!("{session}:{}.{}", snapshot.active_window_id, pane.pane_id)),
+                        direction: None,
+                    },
+                )?;
+                *selection_anchor = Some(SelectionAnchor {
+                    pane_id: pane.pane_id,
+                    row,
+                    col,
+                });
+                *active_selection = Some(PaneSelection {
+                    pane_id: pane.pane_id,
+                    selection: Selection::new(row, col, row, col),
+                });
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some(resize) = resize_drag.as_mut() {
+                let delta = match resize.direction {
+                    NavigationDirection::Left | NavigationDirection::Right => {
+                        mouse.column.abs_diff(resize.last_col)
+                    }
+                    NavigationDirection::Up | NavigationDirection::Down => {
+                        mouse.row.abs_diff(resize.last_row)
+                    }
+                };
+                if delta > 0 {
+                    let target = format!("{session}:{}.{}", snapshot.active_window_id, resize.pane_id);
+                    let _ = request_response(
+                        paths,
+                        CommandRequest::ResizePane {
+                            target,
+                            direction: resize.direction,
+                            amount: delta.saturating_mul(20),
+                        },
+                    )?;
+                    resize.last_row = mouse.row;
+                    resize.last_col = mouse.column;
+                }
+            } else if let Some(anchor) = selection_anchor.as_ref()
+                && let Some((pane, row, col)) = pane_content_hit(snapshot, mouse.row, mouse.column)
+                && pane.pane_id == anchor.pane_id
+            {
+                *active_selection = Some(PaneSelection {
+                    pane_id: pane.pane_id,
+                    selection: Selection::new(anchor.row, anchor.col, row, col).normalized(),
+                });
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            *resize_drag = None;
+            if let Some(anchor) = selection_anchor.take()
+                && let Some((pane, row, col)) = pane_content_hit(snapshot, mouse.row, mouse.column)
+                && pane.pane_id == anchor.pane_id
+            {
+                let selection = Selection::new(anchor.row, anchor.col, row, col).normalized();
+                let copied = request_response(
+                    paths,
+                    CommandRequest::CopySelection {
+                        session: session.to_string(),
+                        pane_id: Some(pane.pane_id),
+                        start_row: selection.start_row,
+                        start_col: selection.start_col,
+                        end_row: selection.end_row,
+                        end_col: selection.end_col,
+                    },
+                )?;
+                if let CommandResponse::SelectionCopied { text } = copied {
+                    let copied_chars = text.chars().count();
+                    if copied_chars > 0 {
+                        copy_via_osc52(stdout, &text)
+                            .context("failed to send OSC52 clipboard copy")?;
+                        *status_message = Some(format!("copied {copied_chars} chars"));
+                    }
+                }
+            }
+            *active_selection = None;
+        }
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            let direction = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                crate::ipc::ScrollDirection::Up
+            } else {
+                crate::ipc::ScrollDirection::Down
+            };
+            let _ = request_response(
+                paths,
+                CommandRequest::MouseScroll {
+                    session: session.to_string(),
+                    row: mouse.row,
+                    col: mouse.column,
+                    direction,
+                },
+            )?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn pane_content_hit(
+    snapshot: &RenderSnapshot,
+    row: u16,
+    col: u16,
+) -> Option<(&PaneRender, u16, u16)> {
+    snapshot.panes.iter().find_map(|pane| {
+        let content = pane.rect.content();
+        if content.contains(row, col) {
+            Some((pane, row - content.y, col - content.x))
+        } else {
+            None
+        }
+    })
+}
+
+fn border_hit(
+    snapshot: &RenderSnapshot,
+    row: u16,
+    col: u16,
+) -> Option<(&PaneRender, NavigationDirection)> {
+    snapshot.panes.iter().find_map(|pane| {
+        let rect = pane.rect;
+        if rect.width < 2 || rect.height < 2 || !rect.contains(row, col) {
+            return None;
+        }
+        if col == rect.x && rect.x > 0 {
+            Some((pane, NavigationDirection::Left))
+        } else if col + 1 == rect.right() {
+            Some((pane, NavigationDirection::Right))
+        } else if row == rect.y && rect.y > 0 {
+            Some((pane, NavigationDirection::Up))
+        } else if row + 1 == rect.bottom() {
+            Some((pane, NavigationDirection::Down))
+        } else {
+            None
+        }
+    })
+}
+
+fn fallback_snapshot(preview: String, width: u16, height: u16) -> RenderSnapshot {
+    let rows_plain = preview.lines().map(ToOwned::to_owned).collect::<Vec<_>>();
+    RenderSnapshot {
+        windows: vec![WindowSummary {
+            id: 1,
+            index: 0,
+            name: "shell".into(),
+            active: true,
+        }],
+        panes: vec![PaneRender {
+            pane_id: 1,
+            title: "shell".into(),
+            rect: Rect {
+                x: 0,
+                y: 0,
+                width,
+                height: height.saturating_sub(1).max(1),
+            },
+            focused: true,
+            rows_formatted: rows_plain.clone(),
+            rows_plain,
+            cursor: Some(PaneCursor { row: 0, col: 0 }),
+        }],
+        active_window_id: 1,
+        active_pane_id: 1,
+    }
 }
 
 fn send_input_bytes(paths: &RuntimePaths, session: &str, bytes: &[u8]) -> Result<()> {
