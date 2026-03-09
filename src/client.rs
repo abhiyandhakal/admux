@@ -154,6 +154,7 @@ fn print_response(paths: &RuntimePaths, response: CommandResponse) -> Result<()>
             session,
             preview,
             formatted_preview,
+            formatted_cursor: _,
         } => {
             if io::stdout().is_terminal() && std::env::var_os("ADMUX_NONINTERACTIVE").is_none() {
                 attach_interactive(paths, &session)?;
@@ -226,16 +227,17 @@ fn run_attach_loop(paths: &RuntimePaths, session: &str, stdout: &mut impl Write)
                 session: Some(session.to_string()),
             },
         )?;
-        let formatted_preview = match response {
+        let (formatted_preview, formatted_cursor) = match response {
             CommandResponse::Attached {
                 preview,
                 formatted_preview,
+                formatted_cursor,
                 ..
             } => {
                 if formatted_preview.is_empty() {
-                    preview
+                    (preview, String::new())
                 } else {
-                    formatted_preview
+                    (formatted_preview, formatted_cursor)
                 }
             }
             CommandResponse::Error { message } => return Err(anyhow!(message)),
@@ -246,6 +248,7 @@ fn run_attach_loop(paths: &RuntimePaths, session: &str, stdout: &mut impl Write)
             stdout,
             session,
             &formatted_preview,
+            &formatted_cursor,
             TerminalSize { width, height },
         )
         .context("failed to render session")?;

@@ -76,10 +76,16 @@ impl SessionStore {
                             .get(&session)
                             .map(|session| session.active_pane_formatted_preview())
                             .unwrap_or_default();
+                        let formatted_cursor = self
+                            .sessions
+                            .get(&session)
+                            .map(|session| session.active_pane_formatted_cursor())
+                            .unwrap_or_default();
                         CommandResponse::Attached {
                             session,
                             preview,
                             formatted_preview,
+                            formatted_cursor,
                         }
                     }
                     None => CommandResponse::Error {
@@ -245,7 +251,8 @@ mod tests {
             CommandResponse::Attached {
                 session,
                 preview,
-                formatted_preview: _
+                formatted_preview: _,
+                formatted_cursor: _
             } if session == "work" && preview.contains("attached")
         ));
     }

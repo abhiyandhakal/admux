@@ -49,6 +49,8 @@ pub enum CommandResponse {
         preview: String,
         #[serde(default)]
         formatted_preview: String,
+        #[serde(default)]
+        formatted_cursor: String,
     },
     SessionList {
         sessions: Vec<String>,
@@ -97,6 +99,7 @@ mod tests {
                 session: "work".into(),
                 preview: "plain output".into(),
                 formatted_preview: String::new(),
+                formatted_cursor: String::new(),
             }
         );
     }

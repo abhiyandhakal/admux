@@ -16,6 +16,7 @@ pub fn render_session<W: Write>(
     out: &mut W,
     session: &str,
     formatted_preview: &str,
+    formatted_cursor: &str,
     size: TerminalSize,
 ) -> std::io::Result<()> {
     queue!(out, Clear(ClearType::All), MoveTo(0, 0))?;
@@ -30,6 +31,7 @@ pub fn render_session<W: Write>(
         Print(truncate(&status, size.width)),
         SetAttribute(Attribute::Reset)
     )?;
+    out.write_all(formatted_cursor.as_bytes())?;
     out.flush()
 }
 
@@ -48,6 +50,7 @@ mod tests {
             &mut buf,
             "work",
             "\u{1b}[31mhello\u{1b}[0m\nworld",
+            "\u{1b}[2;3H",
             TerminalSize {
                 width: 40,
                 height: 6,
@@ -58,6 +61,7 @@ mod tests {
 
         assert!(rendered.contains("hello"));
         assert!(rendered.contains("\u{1b}[31m"));
+        assert!(rendered.contains("\u{1b}[2;3H"));
         assert!(rendered.contains("session: work"));
     }
 }

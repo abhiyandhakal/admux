@@ -94,6 +94,16 @@ impl PaneProcess {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
+    pub fn formatted_cursor(&self) -> String {
+        let bytes = self
+            .parser
+            .lock()
+            .expect("pane parser lock poisoned")
+            .screen()
+            .cursor_state_formatted();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
     pub fn resize(&self, rows: u16, cols: u16) -> Result<()> {
         self.master
             .lock()
