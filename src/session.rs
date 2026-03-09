@@ -55,6 +55,13 @@ impl Session {
             .unwrap_or_default()
     }
 
+    pub fn active_pane_formatted_preview(&self) -> String {
+        self.panes
+            .get(&self.layout.active)
+            .map(|pane| pane.process.formatted_preview())
+            .unwrap_or_default()
+    }
+
     pub fn active_pane_snapshot(&self) -> Option<PaneSnapshot> {
         self.panes
             .get(&self.layout.active)

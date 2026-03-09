@@ -71,7 +71,16 @@ impl SessionStore {
                             .get(&session)
                             .map(|session| session.active_pane_preview())
                             .unwrap_or_default();
-                        CommandResponse::Attached { session, preview }
+                        let formatted_preview = self
+                            .sessions
+                            .get(&session)
+                            .map(|session| session.active_pane_formatted_preview())
+                            .unwrap_or_default();
+                        CommandResponse::Attached {
+                            session,
+                            preview,
+                            formatted_preview,
+                        }
                     }
                     None => CommandResponse::Error {
                         message: "no sessions available".into(),
@@ -233,8 +242,11 @@ mod tests {
 
         assert!(matches!(
             attached,
-            CommandResponse::Attached { session, preview }
-                if session == "work" && preview.contains("attached")
+            CommandResponse::Attached {
+                session,
+                preview,
+                formatted_preview: _
+            } if session == "work" && preview.contains("attached")
         ));
     }
 }

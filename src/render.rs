@@ -15,18 +15,11 @@ pub struct TerminalSize {
 pub fn render_session<W: Write>(
     out: &mut W,
     session: &str,
-    preview: &str,
+    formatted_preview: &str,
     size: TerminalSize,
 ) -> std::io::Result<()> {
     queue!(out, Clear(ClearType::All), MoveTo(0, 0))?;
-    let content_height = size.height.saturating_sub(1) as usize;
-    for (row, line) in preview.lines().take(content_height).enumerate() {
-        queue!(
-            out,
-            MoveTo(0, row as u16),
-            Print(truncate(line, size.width))
-        )?;
-    }
+    out.write_all(formatted_preview.as_bytes())?;
 
     let status = format!(" admux | session: {session} | Ctrl-b d detach ");
     let status_row = size.height.saturating_sub(1);
@@ -54,7 +47,7 @@ mod tests {
         render_session(
             &mut buf,
             "work",
-            "hello\nworld",
+            "\u{1b}[31mhello\u{1b}[0m\nworld",
             TerminalSize {
                 width: 40,
                 height: 6,
@@ -64,6 +57,7 @@ mod tests {
         let rendered = String::from_utf8_lossy(&buf);
 
         assert!(rendered.contains("hello"));
+        assert!(rendered.contains("\u{1b}[31m"));
         assert!(rendered.contains("session: work"));
     }
 }

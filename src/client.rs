@@ -150,12 +150,20 @@ fn print_response(paths: &RuntimePaths, response: CommandResponse) -> Result<()>
         CommandResponse::SessionCreated { session, pane_id } => {
             println!("created {session} pane {pane_id}");
         }
-        CommandResponse::Attached { session, preview } => {
+        CommandResponse::Attached {
+            session,
+            preview,
+            formatted_preview,
+        } => {
             if io::stdout().is_terminal() && std::env::var_os("ADMUX_NONINTERACTIVE").is_none() {
                 attach_interactive(paths, &session)?;
             } else {
                 println!("attached {session}");
-                if !preview.is_empty() {
+                if io::stdout().is_terminal() {
+                    if !formatted_preview.is_empty() {
+                        print!("{formatted_preview}");
+                    }
+                } else if !preview.is_empty() {
                     print!("{preview}");
                 }
             }
@@ -218,14 +226,21 @@ fn run_attach_loop(paths: &RuntimePaths, session: &str, stdout: &mut impl Write)
                 session: Some(session.to_string()),
             },
         )?;
-        let preview = match response {
-            CommandResponse::Attached { preview, .. } => preview,
+        let formatted_preview = match response {
+            CommandResponse::Attached {
+                formatted_preview, ..
+            } => formatted_preview,
             CommandResponse::Error { message } => return Err(anyhow!(message)),
             other => return Err(anyhow!("unexpected attach response: {other:?}")),
         };
 
-        render_session(stdout, session, &preview, TerminalSize { width, height })
-            .context("failed to render session")?;
+        render_session(
+            stdout,
+            session,
+            &formatted_preview,
+            TerminalSize { width, height },
+        )
+        .context("failed to render session")?;
 
         if event::poll(Duration::from_millis(50)).context("failed to poll terminal events")? {
             match event::read().context("failed to read terminal event")? {
