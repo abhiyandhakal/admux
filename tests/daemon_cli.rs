@@ -42,7 +42,7 @@ fn daemon_backed_cli_can_manage_sessions() {
             "--",
             "sh",
             "-lc",
-            "printf work-ready",
+            "printf work-ready; sleep 1",
         ])
         .assert()
         .success()

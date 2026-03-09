@@ -34,6 +34,8 @@ pub struct SessionStore {
 
 impl SessionStore {
     pub fn handle(&mut self, request: CommandRequest) -> CommandResponse {
+        self.prune_dead_sessions();
+
         match request {
             CommandRequest::Hello { version } => self.handle_hello(version),
             CommandRequest::NewSession { name, cwd, command } => {
@@ -178,6 +180,15 @@ impl SessionStore {
         PaneId(self.next_pane_id)
     }
 
+    fn prune_dead_sessions(&mut self) {
+        self.sessions.retain(|_, session| session.is_alive());
+        if let Some(last) = self.last_session.as_ref()
+            && !self.sessions.contains_key(last)
+        {
+            self.last_session = self.sessions.keys().next_back().cloned();
+        }
+    }
+
     fn handle_hello(&self, version: ProtocolVersion) -> CommandResponse {
         if version == CURRENT_PROTOCOL_VERSION {
             CommandResponse::HelloAck { version }
@@ -271,7 +282,7 @@ mod tests {
         let _ = store.handle(CommandRequest::NewSession {
             name: Some("work".into()),
             cwd: None,
-            command: vec!["sh".into(), "-lc".into(), "printf attached".into()],
+            command: vec!["sh".into(), "-lc".into(), "printf attached; sleep 1".into()],
         });
         std::thread::sleep(std::time::Duration::from_millis(100));
 
@@ -285,6 +296,44 @@ mod tests {
                 formatted_preview: _,
                 formatted_cursor: _
             } if session == "work" && preview.contains("attached")
+        ));
+    }
+
+    #[test]
+    fn completed_session_is_pruned_from_store() {
+        let mut store = SessionStore::default();
+        let _ = store.handle(CommandRequest::NewSession {
+            name: Some("done".into()),
+            cwd: None,
+            command: vec!["sh".into(), "-lc".into(), "exit 0".into()],
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let listed = store.handle(CommandRequest::ListSessions);
+
+        assert_eq!(
+            listed,
+            CommandResponse::SessionList {
+                sessions: Vec::new()
+            }
+        );
+    }
+
+    #[test]
+    fn attach_rejects_exited_last_session() {
+        let mut store = SessionStore::default();
+        let _ = store.handle(CommandRequest::NewSession {
+            name: Some("done".into()),
+            cwd: None,
+            command: vec!["sh".into(), "-lc".into(), "exit 0".into()],
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let attached = store.handle(CommandRequest::Attach { session: None });
+
+        assert!(matches!(
+            attached,
+            CommandResponse::Error { message } if message == "no sessions available"
         ));
     }
 }

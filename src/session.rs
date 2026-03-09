@@ -128,4 +128,8 @@ impl Session {
         }
         Ok(())
     }
+
+    pub fn is_alive(&self) -> bool {
+        self.panes.values().any(|pane| pane.process.is_alive())
+    }
 }

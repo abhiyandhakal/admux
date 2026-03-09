@@ -194,6 +194,15 @@ impl PaneProcess {
             .context("failed to kill pane process")?;
         Ok(())
     }
+
+    pub fn is_alive(&self) -> bool {
+        self.child
+            .lock()
+            .expect("pane child lock poisoned")
+            .try_wait()
+            .map(|status| status.is_none())
+            .unwrap_or(false)
+    }
 }
 
 fn build_command(command: &[String]) -> CommandBuilder {
