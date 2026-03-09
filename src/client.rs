@@ -33,7 +33,8 @@ use crate::{
     pane::Rect,
     paths::RuntimePaths,
     render::{
-        BottomBar, PaneSelection, TerminalSize, TreeLine, render_choose_tree, render_session,
+        BottomBar, PaneSelection, TerminalSize, TreeLine, render_choose_tree, render_help_overlay,
+        render_session,
     },
     window::WindowSummary,
 };
@@ -68,6 +69,8 @@ struct ChooseTreeState {
     selected: usize,
     expanded_sessions: BTreeSet<String>,
     expanded_windows: BTreeSet<(String, u64)>,
+    search_input: Option<String>,
+    last_search: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +78,7 @@ enum OverlayState {
     None,
     Prompt(PromptState),
     ChooseTree(ChooseTreeState),
+    Help,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -510,6 +514,7 @@ fn run_attach_loop(
             }
             OverlayState::ChooseTree(tree) => {
                 let (title, preview_rows) = chooser_preview(paths, tree, &current_session)?;
+                let chooser_status = choose_tree_status(tree);
                 render_choose_tree(
                     stdout,
                     &current_session,
@@ -517,6 +522,16 @@ fn run_attach_loop(
                     &tree.lines,
                     &title,
                     &preview_rows,
+                    &chooser_status,
+                    TerminalSize { width, height },
+                )?;
+            }
+            OverlayState::Help => {
+                render_help_overlay(
+                    stdout,
+                    &current_session,
+                    &snapshot,
+                    &help_lines(),
                     TerminalSize { width, height },
                 )?;
             }
@@ -556,6 +571,10 @@ fn run_attach_loop(
                             overlay = OverlayState::ChooseTree(tree);
                         }
                     }
+                    OverlayState::Help => match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') => {}
+                        _ => overlay = OverlayState::Help,
+                    },
                     OverlayState::None => match state.handle_key(key) {
                         InputAction::Noop => {}
                         InputAction::Detach => break,
@@ -600,6 +619,9 @@ fn run_attach_loop(
                                 paths,
                                 &current_session,
                             )?);
+                        }
+                        InputAction::OpenHelp => {
+                            overlay = OverlayState::Help;
                         }
                         InputAction::NewWindow => {
                             let _ = request_response(
@@ -941,6 +963,8 @@ fn build_choose_tree(paths: &RuntimePaths, current_session: &str) -> Result<Choo
         selected: 0,
         expanded_sessions: sessions.iter().cloned().collect(),
         expanded_windows: BTreeSet::new(),
+        search_input: None,
+        last_search: None,
     };
     for session in &sessions {
         let windows = match request_response(
@@ -1093,6 +1117,36 @@ fn handle_choose_tree_key(
     key: crossterm::event::KeyEvent,
     current_session: &mut String,
 ) -> Result<bool> {
+    if let Some(query) = tree.search_input.as_mut() {
+        match key.code {
+            KeyCode::Esc => {
+                tree.search_input = None;
+                return Ok(true);
+            }
+            KeyCode::Enter => {
+                let committed = query.trim().to_string();
+                tree.search_input = None;
+                if committed.is_empty() {
+                    return Ok(true);
+                }
+                tree.last_search = Some(committed.clone());
+                apply_choose_tree_search(tree, &committed, true);
+                return Ok(true);
+            }
+            KeyCode::Backspace => {
+                query.pop();
+                return Ok(true);
+            }
+            KeyCode::Char(ch)
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                query.push(ch);
+                return Ok(true);
+            }
+            _ => return Ok(true),
+        }
+    }
+
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => return Ok(false),
         KeyCode::Up => {
@@ -1105,8 +1159,22 @@ fn handle_choose_tree_key(
                 tree.selected += 1;
             }
         }
+        KeyCode::Char('=') if key.modifiers.contains(KeyModifiers::ALT) => {
+            expand_all_choose_items(paths, tree)?
+        }
+        KeyCode::Char('+') if key.modifiers.contains(KeyModifiers::ALT) => {
+            expand_all_choose_items(paths, tree)?
+        }
+        KeyCode::Char('-') if key.modifiers.contains(KeyModifiers::ALT) => {
+            collapse_all_choose_items(tree)
+        }
         KeyCode::Char('+') => toggle_choose_item(tree, true),
         KeyCode::Char('-') => toggle_choose_item(tree, false),
+        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            tree.search_input = Some(String::new());
+        }
+        KeyCode::Char('n') => repeat_choose_tree_search(tree, true),
+        KeyCode::Char('N') => repeat_choose_tree_search(tree, false),
         KeyCode::Enter => {
             if let Some(item) = tree.items.get(tree.selected).cloned() {
                 match item {
@@ -1173,6 +1241,99 @@ fn toggle_choose_item(tree: &mut ChooseTreeState, expand: bool) {
             ChooseItem::Pane { .. } => {}
         }
     }
+}
+
+fn expand_all_choose_items(paths: &RuntimePaths, tree: &mut ChooseTreeState) -> Result<()> {
+    let sessions = match request_response(paths, CommandRequest::ListSessions)? {
+        CommandResponse::SessionList { sessions } => sessions,
+        other => return Err(anyhow!("unexpected session list response: {other:?}")),
+    };
+    tree.expanded_sessions = sessions.iter().cloned().collect();
+    tree.expanded_windows.clear();
+    for session in sessions {
+        let windows = match request_response(
+            paths,
+            CommandRequest::ListWindows {
+                session: session.clone(),
+            },
+        )? {
+            CommandResponse::WindowList { windows } => windows,
+            _ => Vec::new(),
+        };
+        for window in windows {
+            tree.expanded_windows.insert((session.clone(), window.id));
+        }
+    }
+    Ok(())
+}
+
+fn collapse_all_choose_items(tree: &mut ChooseTreeState) {
+    tree.expanded_sessions.clear();
+    tree.expanded_windows.clear();
+}
+
+fn apply_choose_tree_search(tree: &mut ChooseTreeState, query: &str, forward: bool) {
+    if tree.lines.is_empty() {
+        return;
+    }
+    let query = query.to_ascii_lowercase();
+    let len = tree.lines.len();
+    for step in 1..=len {
+        let index = if forward {
+            (tree.selected + step) % len
+        } else {
+            (tree.selected + len - (step % len)) % len
+        };
+        if tree.lines[index]
+            .label
+            .to_ascii_lowercase()
+            .contains(&query)
+        {
+            tree.selected = index;
+            for line in &mut tree.lines {
+                line.selected = false;
+            }
+            if let Some(line) = tree.lines.get_mut(index) {
+                line.selected = true;
+            }
+            break;
+        }
+    }
+}
+
+fn repeat_choose_tree_search(tree: &mut ChooseTreeState, forward: bool) {
+    if let Some(query) = tree.last_search.clone() {
+        apply_choose_tree_search(tree, &query, forward);
+    }
+}
+
+fn choose_tree_status(tree: &ChooseTreeState) -> String {
+    if let Some(query) = tree.search_input.as_ref() {
+        format!("search: {query}")
+    } else if let Some(query) = tree.last_search.as_ref() {
+        format!("choose-tree | C-s search | n/N repeat ({query}) | Enter select | q cancel")
+    } else {
+        "choose-tree | C-s search | n/N repeat | Alt-+ expand all | Alt-- collapse all | Enter select | q cancel".into()
+    }
+}
+
+fn help_lines() -> Vec<String> {
+    vec![
+        "admux help".into(),
+        String::new(),
+        "Ctrl-b %      split vertically".into(),
+        "Ctrl-b \"      split horizontally".into(),
+        "Ctrl-b 0..9   select window by index".into(),
+        "Ctrl-b h/j/k/l move pane focus".into(),
+        "Ctrl-b H/J/K/L resize active pane".into(),
+        "Ctrl-b c      new window".into(),
+        "Ctrl-b n/p    next/previous window".into(),
+        "Ctrl-b x      kill active pane".into(),
+        "Ctrl-b :      command prompt".into(),
+        "Ctrl-b s      choose-tree".into(),
+        "Ctrl-b d      detach".into(),
+        "Ctrl-b ?      help".into(),
+    ]
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1421,5 +1582,125 @@ mod tests {
             config_path: "/tmp/admux-test/config.toml".into(),
         };
         assert!(paths.socket_path.ends_with("socket"));
+    }
+
+    #[test]
+    fn choose_tree_search_moves_selection_forward() {
+        let mut tree = ChooseTreeState {
+            items: vec![
+                ChooseItem::Session("work".into()),
+                ChooseItem::Window {
+                    session: "work".into(),
+                    window_id: 1,
+                },
+                ChooseItem::Pane {
+                    session: "work".into(),
+                    window_id: 1,
+                    pane_id: 2,
+                },
+            ],
+            lines: vec![
+                TreeLine {
+                    depth: 0,
+                    label: "work".into(),
+                    selected: true,
+                    expanded: true,
+                    has_children: true,
+                },
+                TreeLine {
+                    depth: 1,
+                    label: "1:editor".into(),
+                    selected: false,
+                    expanded: true,
+                    has_children: true,
+                },
+                TreeLine {
+                    depth: 2,
+                    label: "2 (logs)".into(),
+                    selected: false,
+                    expanded: false,
+                    has_children: false,
+                },
+            ],
+            selected: 0,
+            expanded_sessions: BTreeSet::new(),
+            expanded_windows: BTreeSet::new(),
+            search_input: None,
+            last_search: None,
+        };
+
+        apply_choose_tree_search(&mut tree, "logs", true);
+
+        assert_eq!(tree.selected, 2);
+        assert!(tree.lines[2].selected);
+    }
+
+    #[test]
+    fn choose_tree_repeat_search_moves_backward() {
+        let mut tree = ChooseTreeState {
+            items: vec![
+                ChooseItem::Session("work".into()),
+                ChooseItem::Window {
+                    session: "work".into(),
+                    window_id: 1,
+                },
+                ChooseItem::Pane {
+                    session: "work".into(),
+                    window_id: 1,
+                    pane_id: 2,
+                },
+            ],
+            lines: vec![
+                TreeLine {
+                    depth: 0,
+                    label: "work".into(),
+                    selected: false,
+                    expanded: true,
+                    has_children: true,
+                },
+                TreeLine {
+                    depth: 1,
+                    label: "1:editor".into(),
+                    selected: false,
+                    expanded: true,
+                    has_children: true,
+                },
+                TreeLine {
+                    depth: 2,
+                    label: "2 (logs)".into(),
+                    selected: true,
+                    expanded: false,
+                    has_children: false,
+                },
+            ],
+            selected: 2,
+            expanded_sessions: BTreeSet::new(),
+            expanded_windows: BTreeSet::new(),
+            search_input: None,
+            last_search: Some("editor".into()),
+        };
+
+        repeat_choose_tree_search(&mut tree, false);
+
+        assert_eq!(tree.selected, 1);
+        assert!(tree.lines[1].selected);
+    }
+
+    #[test]
+    fn collapse_all_choose_items_clears_expansions() {
+        let mut tree = ChooseTreeState {
+            items: Vec::new(),
+            lines: Vec::new(),
+            selected: 0,
+            expanded_sessions: ["work".to_string()].into_iter().collect(),
+            expanded_windows: [("work".to_string(), 1)].into_iter().collect(),
+            search_input: None,
+            last_search: None,
+        };
+
+        collapse_all_choose_items(&mut tree);
+
+        assert!(tree.expanded_sessions.is_empty());
+        assert!(tree.expanded_windows.is_empty());
     }
 }

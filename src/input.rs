@@ -24,6 +24,7 @@ pub enum InputAction {
     KillPane,
     OpenPrompt,
     OpenSessions,
+    OpenHelp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +61,7 @@ impl InputState {
                     KeyCode::Char('"') => InputAction::SplitPane(SplitAxis::Horizontal),
                     KeyCode::Char(':') => InputAction::OpenPrompt,
                     KeyCode::Char('s') => InputAction::OpenSessions,
+                    KeyCode::Char('?') => InputAction::OpenHelp,
                     KeyCode::Char('c') => InputAction::NewWindow,
                     KeyCode::Char('n') => InputAction::NextWindow,
                     KeyCode::Char('p') => InputAction::PrevWindow,
@@ -151,6 +153,16 @@ mod tests {
         assert_eq!(
             state.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE)),
             InputAction::SelectWindowIndex(3)
+        );
+    }
+
+    #[test]
+    fn leader_question_opens_help() {
+        let mut state = InputState::default();
+        let _ = state.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        assert_eq!(
+            state.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT)),
+            InputAction::OpenHelp
         );
     }
 }

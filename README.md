@@ -30,14 +30,14 @@ Implemented now:
 - `Ctrl-b 0` through `Ctrl-b 9` for window index selection
 - `Ctrl-b :` for a tmux-style status-row command prompt with command completion
 - `Ctrl-b s` for a choose-tree-style session/window/pane picker with previews
+- `Ctrl-b ?` for a full-screen help overlay
+- chooser-local search with `Ctrl-s`, repeat with `n`/`N`, and expand/collapse-all with `Alt-+` / `Alt--`
 - mouse focus, drag-selection copy, wheel scroll, and border resize
 - unit, integration, and binary smoke coverage
 
 Not finished yet:
 
-- help overlay
 - copy-mode UI beyond drag-selection
-- choose-tree search and expand-all/collapse-all shortcuts
 - restart recovery or persistent session metadata
 
 ## Build and run
@@ -67,6 +67,7 @@ Interactive defaults:
 - `Ctrl-b 0` through `Ctrl-b 9` select windows by index
 - `Ctrl-b :` open the command prompt
 - `Ctrl-b s` open the session chooser
+- `Ctrl-b ?` open help
 - `Ctrl-b d` detach
 
 Run the daemon explicitly:

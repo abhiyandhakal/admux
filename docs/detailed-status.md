@@ -47,6 +47,8 @@
   - `Ctrl-b 0` through `Ctrl-b 9` window index selection
   - `Ctrl-b :` status-row command prompt with tmux-style command names and completion
   - `Ctrl-b s` choose-tree-style session/window/pane picker with previews
+  - `Ctrl-b ?` full-screen help overlay
+  - chooser-local search on `Ctrl-s`, repeat on `n` / `N`, and expand/collapse-all on `Alt-+` / `Alt--`
   - direct key forwarding to the active PTY
   - control-key forwarding such as `Ctrl-l`
   - arrow/home/end/delete forwarding
@@ -74,6 +76,7 @@
 - binary smoke tests that execute `admux` and `admuxd`
 - direct binary smoke for split-pane and new-window command flow
 - prompt command parser and completion tests
+- chooser search helper tests
 
 ### Manual
 
@@ -102,13 +105,12 @@ Observed result:
 - `9b9eb6e` `feat: add config loading and ipc foundations`
 - `29eb401` `feat: add daemon lifecycle and core cli commands`
 - `da946e8` `feat: add pty-backed sessions and interactive attach`
-- pending prompt/chooser UI commit in current worktree
+- `a15bf48` `feat: add tmux-style prompt and chooser`
+- pending help/chooser navigation commit in current worktree
 
 ## Known gaps
 
 - copy mode is still drag-selection focused rather than a full modal copy-mode UI
-- no help overlay yet
-- choose-tree search and expand-all/collapse-all shortcuts are not implemented yet
 - session state is in-memory only while `admuxd` is alive
 
 ## Module map

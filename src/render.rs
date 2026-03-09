@@ -79,6 +79,7 @@ pub fn render_choose_tree<W: Write>(
     lines: &[TreeLine],
     preview_title: &str,
     preview_rows: &[String],
+    bottom_message: &str,
     size: TerminalSize,
 ) -> std::io::Result<()> {
     queue!(out, Clear(ClearType::All), MoveTo(0, 0))?;
@@ -135,7 +136,40 @@ pub fn render_choose_tree<W: Write>(
         session,
         snapshot,
         BottomBar::Status {
-            message: Some("choose-tree | Enter select | q cancel"),
+            message: Some(bottom_message),
+        },
+        size,
+    )?;
+    out.flush()
+}
+
+pub fn render_help_overlay<W: Write>(
+    out: &mut W,
+    session: &str,
+    snapshot: &RenderSnapshot,
+    lines: &[String],
+    size: TerminalSize,
+) -> std::io::Result<()> {
+    queue!(out, Clear(ClearType::All), MoveTo(0, 0))?;
+    let body_height = size.height.saturating_sub(1);
+
+    for (index, line) in lines.iter().enumerate() {
+        if index as u16 >= body_height {
+            break;
+        }
+        queue!(
+            out,
+            MoveTo(0, index as u16),
+            Print(fit_width(line, size.width))
+        )?;
+    }
+
+    render_bottom_bar(
+        out,
+        session,
+        snapshot,
+        BottomBar::Status {
+            message: Some("help | q cancel"),
         },
         size,
     )?;
@@ -490,5 +524,26 @@ mod tests {
         let completions = vec!["split-window".to_string(), "switch-client".to_string()];
         let line = render_prompt_line("sp", &completions, 0, 40);
         assert!(line.contains(":sp [split-window] switch-client"));
+    }
+
+    #[test]
+    fn help_overlay_renders_content() {
+        let mut buf = Vec::new();
+        render_help_overlay(
+            &mut buf,
+            "work",
+            &sample_snapshot(),
+            &["Keys".into(), "Ctrl-b ?".into()],
+            TerminalSize {
+                width: 80,
+                height: 6,
+            },
+        )
+        .expect("render help");
+        let rendered = String::from_utf8_lossy(&buf);
+
+        assert!(rendered.contains("Keys"));
+        assert!(rendered.contains("Ctrl-b ?"));
+        assert!(rendered.contains("help | q cancel"));
     }
 }

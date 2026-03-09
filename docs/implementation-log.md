@@ -137,5 +137,26 @@ This document records each completed implementation slice in detail, including t
   - second window creation succeeded without outer pane borders in the normal renderer
   - `list-windows` showed `1 shell` and active `2 logs`
   - `list-panes` showed the active pane in the new window
+- Commit: `a15bf48` `feat: add tmux-style prompt and chooser`
+- Status: complete
+
+## Help and chooser navigation slice
+
+- Goal: add the missing `Ctrl-b ?` help overlay plus chooser-local search and expand/collapse-all shortcuts.
+- Files changed:
+  - interaction and overlays: `src/client.rs`, `src/input.rs`, `src/render.rs`
+  - docs: `README.md`, `docs/detailed-status.md`
+- Verification:
+  - `cargo build`
+  - `cargo test`
+  - direct binary smoke:
+    - `target/debug/admux new -d --name overlay-smoke`
+    - `target/debug/admux new-window overlay-smoke --name logs`
+    - `target/debug/admux list-windows overlay-smoke`
+    - `target/debug/admux kill overlay-smoke`
+- Observed output:
+  - `list-windows` showed `1 shell` and active `2 logs`
+  - render tests covered the help overlay
+  - chooser tests covered forward search, repeat search, and collapse-all state handling
 - Commit: pending current worktree
 - Status: complete
