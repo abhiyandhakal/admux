@@ -139,6 +139,21 @@ impl SessionStore {
                     message: format!("unknown session {session}"),
                 },
             },
+            CommandRequest::CopySelection {
+                session,
+                start_row,
+                start_col,
+                end_row,
+                end_col,
+            } => match self.sessions.get(&session) {
+                Some(session) => CommandResponse::SelectionCopied {
+                    text: session
+                        .active_pane_selection_text(start_row, start_col, end_row, end_col),
+                },
+                None => CommandResponse::Error {
+                    message: format!("unknown session {session}"),
+                },
+            },
             CommandRequest::Resize {
                 session,
                 rows,

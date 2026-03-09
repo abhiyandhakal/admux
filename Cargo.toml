@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.100"
+base64 = "0.22.1"
 clap = { version = "4.5.45", features = ["derive"] }
 crossterm = "0.28.1"
 portable-pty = "0.9.0"

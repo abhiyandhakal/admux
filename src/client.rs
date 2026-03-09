@@ -1,15 +1,17 @@
 use crate::{
     cli::{AdmuxCli, ClientCommand},
+    copy_mode::Selection,
     input::{InputAction, InputState},
     ipc::{CommandRequest, CommandResponse},
     paths::RuntimePaths,
     render::{TerminalSize, render_session},
 };
 use anyhow::{Context, Result, anyhow, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::Parser;
 use crossterm::{
     cursor::{Hide, Show},
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, MouseEventKind},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, MouseButton, MouseEventKind},
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -202,6 +204,7 @@ fn print_response(paths: &RuntimePaths, response: CommandResponse) -> Result<()>
         CommandResponse::KeysSent => {
             println!("keys sent");
         }
+        CommandResponse::SelectionCopied { .. } => {}
         CommandResponse::Scrolled => {}
         CommandResponse::Resized => {}
         CommandResponse::ConfigReloaded => {
@@ -228,6 +231,8 @@ fn attach_interactive(paths: &RuntimePaths, session: &str) -> Result<()> {
 fn run_attach_loop(paths: &RuntimePaths, session: &str, stdout: &mut impl Write) -> Result<()> {
     let mut state = InputState::default();
     let mut last_size = (0, 0);
+    let mut selection_anchor: Option<(u16, u16)> = None;
+    let mut status_message: Option<String> = None;
 
     loop {
         let (width, height) = terminal::size().context("failed to read terminal size")?;
@@ -273,9 +278,11 @@ fn run_attach_loop(paths: &RuntimePaths, session: &str, stdout: &mut impl Write)
             session,
             &formatted_preview,
             &formatted_cursor,
+            status_message.as_deref(),
             TerminalSize { width, height },
         )
         .context("failed to render session")?;
+        status_message = None;
 
         if event::poll(Duration::from_millis(50)).context("failed to poll terminal events")? {
             match event::read().context("failed to read terminal event")? {
@@ -294,6 +301,46 @@ fn run_attach_loop(paths: &RuntimePaths, session: &str, stdout: &mut impl Write)
                     }
                 },
                 Event::Mouse(mouse) => match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left) if mouse.row < rows => {
+                        selection_anchor = Some((mouse.row, mouse.column));
+                    }
+                    MouseEventKind::Drag(MouseButton::Left) if mouse.row < rows => {}
+                    MouseEventKind::Up(MouseButton::Left) if mouse.row < rows => {
+                        if let Some((start_row, start_col)) = selection_anchor.take() {
+                            let selection =
+                                Selection::new(start_row, start_col, mouse.row, mouse.column)
+                                    .normalized();
+                            let copied = request_response(
+                                paths,
+                                CommandRequest::CopySelection {
+                                    session: session.to_string(),
+                                    start_row: selection.start_row,
+                                    start_col: selection.start_col,
+                                    end_row: selection.end_row,
+                                    end_col: selection.end_col,
+                                },
+                            )?;
+                            match copied {
+                                CommandResponse::SelectionCopied { text } => {
+                                    let copied_chars = text.chars().count();
+                                    if copied_chars > 0 {
+                                        copy_via_osc52(stdout, &text)
+                                            .context("failed to send OSC52 clipboard copy")?;
+                                        status_message =
+                                            Some(format!("copied {copied_chars} chars"));
+                                    }
+                                }
+                                CommandResponse::Error { message } => {
+                                    return Err(anyhow!(message));
+                                }
+                                other => {
+                                    return Err(anyhow!(
+                                        "unexpected selection response: {other:?}"
+                                    ));
+                                }
+                            }
+                        }
+                    }
                     MouseEventKind::ScrollUp => {
                         let _ = request_response(
                             paths,
@@ -323,6 +370,13 @@ fn run_attach_loop(paths: &RuntimePaths, session: &str, stdout: &mut impl Write)
             }
         }
     }
+    Ok(())
+}
+
+fn copy_via_osc52(out: &mut impl Write, text: &str) -> Result<()> {
+    let encoded = STANDARD.encode(text.as_bytes());
+    write!(out, "\x1b]52;c;{encoded}\x07").context("failed to write OSC52 sequence")?;
+    out.flush().context("failed to flush OSC52 sequence")?;
     Ok(())
 }
 

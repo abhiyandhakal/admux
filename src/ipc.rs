@@ -33,6 +33,13 @@ pub enum CommandRequest {
         col: u16,
         direction: ScrollDirection,
     },
+    CopySelection {
+        session: String,
+        start_row: u16,
+        start_col: u16,
+        end_row: u16,
+        end_col: u16,
+    },
     Resize {
         session: String,
         rows: u16,
@@ -65,6 +72,9 @@ pub enum CommandResponse {
         session: String,
     },
     KeysSent,
+    SelectionCopied {
+        text: String,
+    },
     Scrolled,
     Resized,
     ConfigReloaded,

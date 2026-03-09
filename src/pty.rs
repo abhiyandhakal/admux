@@ -105,6 +105,20 @@ impl PaneProcess {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
+    pub fn selection_text(
+        &self,
+        start_row: u16,
+        start_col: u16,
+        end_row: u16,
+        end_col: u16,
+    ) -> String {
+        self.parser
+            .lock()
+            .expect("pane parser lock poisoned")
+            .screen()
+            .contents_between(start_row, start_col, end_row, end_col)
+    }
+
     pub fn resize(&self, rows: u16, cols: u16) -> Result<()> {
         self.master
             .lock()

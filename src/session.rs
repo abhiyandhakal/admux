@@ -70,6 +70,22 @@ impl Session {
             .unwrap_or_default()
     }
 
+    pub fn active_pane_selection_text(
+        &self,
+        start_row: u16,
+        start_col: u16,
+        end_row: u16,
+        end_col: u16,
+    ) -> String {
+        self.panes
+            .get(&self.layout.active)
+            .map(|pane| {
+                pane.process
+                    .selection_text(start_row, start_col, end_row, end_col)
+            })
+            .unwrap_or_default()
+    }
+
     pub fn active_pane_snapshot(&self) -> Option<PaneSnapshot> {
         self.panes
             .get(&self.layout.active)
