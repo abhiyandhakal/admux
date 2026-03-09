@@ -53,8 +53,8 @@ mod tests {
             cwd: Some(PathBuf::from("/tmp")),
             command: vec!["bash".into()],
         };
-        let encoded = toml::to_string(&request).expect("encode request");
-        let decoded: CommandRequest = toml::from_str(&encoded).expect("decode request");
+        let encoded = serde_json::to_vec(&request).expect("encode request");
+        let decoded: CommandRequest = serde_json::from_slice(&encoded).expect("decode request");
         assert_eq!(decoded, request);
     }
 

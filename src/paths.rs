@@ -18,6 +18,15 @@ impl RuntimePaths {
     where
         F: FnMut(&str) -> Option<PathBuf>,
     {
+        if let Some(socket_path) = get_var("ADMUX_SOCKET") {
+            let config_path =
+                get_var("ADMUX_CONFIG").unwrap_or_else(|| PathBuf::from("config.toml"));
+            return Self {
+                socket_path,
+                config_path,
+            };
+        }
+
         let config_root = get_var("XDG_CONFIG_HOME")
             .or_else(|| get_var("HOME").map(|home| home.join(".config")))
             .unwrap_or_else(|| PathBuf::from("."));
@@ -82,5 +91,15 @@ mod tests {
             paths.config_path,
             PathBuf::from("/home/tester/.config/admux/config.toml")
         );
+    }
+
+    #[test]
+    fn explicit_socket_override_wins() {
+        let env = HashMap::from([("ADMUX_SOCKET", PathBuf::from("/tmp/custom-admux.sock"))]);
+
+        let paths = RuntimePaths::resolve_from_env(|key| env.get(key).cloned());
+
+        assert_eq!(paths.socket_path, PathBuf::from("/tmp/custom-admux.sock"));
+        assert_eq!(paths.config_path, PathBuf::from("config.toml"));
     }
 }

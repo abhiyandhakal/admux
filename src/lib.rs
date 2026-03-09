@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod client;
 pub mod clipboard;
 pub mod config;
 pub mod copy_mode;

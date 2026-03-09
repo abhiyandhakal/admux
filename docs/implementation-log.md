@@ -29,3 +29,14 @@ This document records each completed implementation slice in detail, including t
   - `cargo test`
   - `cargo run --bin admux -- --help`
 - Status: complete
+
+## Slice 3
+
+- Goal: add a working daemon, client request/response flow, and black-box session lifecycle coverage for the `admux` and `admuxd` binaries.
+- Files changed: `src/client.rs`, `src/server.rs`, `src/bin/admux.rs`, `src/bin/admuxd.rs`, `src/ipc.rs`, `src/paths.rs`, `src/test_support.rs`
+- Files added: `tests/daemon_cli.rs`
+- Verification:
+  - `cargo fmt`
+  - `cargo test`
+  - `cargo test --test daemon_cli -- --nocapture`
+- Status: complete
