@@ -1,7 +1,7 @@
 use std::io::Write;
 
 use crossterm::{
-    cursor::MoveTo,
+    cursor::{MoveTo, Show},
     queue,
     style::{Attribute, Print, SetAttribute},
     terminal::{Clear, ClearType},
@@ -137,6 +137,7 @@ fn render_cursor<W: Write>(out: &mut W, snapshot: &RenderSnapshot) -> std::io::R
         let content = pane.rect.content();
         queue!(
             out,
+            Show,
             MoveTo(content.x + cursor.col, content.y + cursor.row)
         )?;
     }
@@ -270,6 +271,7 @@ mod tests {
         assert!(rendered.contains("hello"));
         assert!(rendered.contains("\u{1b}[31m"));
         assert!(rendered.contains("copied 5 chars"));
+        assert!(rendered.contains("\u{1b}[?25h"));
     }
 
     #[test]
