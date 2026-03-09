@@ -11,6 +11,7 @@ This document records each completed implementation slice in detail, including t
   - `cargo fmt`
   - `cargo test`
   - `cargo run --bin admux -- --help`
+- Commit: `afdc324` `chore: bootstrap admux cargo project`
 - Status: complete
 
 ## Slice 1 correction
@@ -18,6 +19,7 @@ This document records each completed implementation slice in detail, including t
 - Goal: stop tracking Cargo build artifacts and add a repository ignore rule.
 - Files added: `.gitignore`
 - Verification: git index cleanup and follow-up commit
+- Commit: `cd41cc2` `chore: ignore cargo build artifacts`
 - Status: complete
 
 ## Slice 2
@@ -28,6 +30,7 @@ This document records each completed implementation slice in detail, including t
   - `cargo fmt`
   - `cargo test`
   - `cargo run --bin admux -- --help`
+- Commit: `9b9eb6e` `feat: add config loading and ipc foundations`
 - Status: complete
 
 ## Slice 3
@@ -39,6 +42,7 @@ This document records each completed implementation slice in detail, including t
   - `cargo fmt`
   - `cargo test`
   - `cargo test --test daemon_cli -- --nocapture`
+- Commit: `29eb401` `feat: add daemon lifecycle and core cli commands`
 - Status: complete
 
 ## Slice 4
@@ -49,6 +53,7 @@ This document records each completed implementation slice in detail, including t
   - `cargo fmt`
   - `cargo test`
   - `cargo test --test daemon_cli -- --nocapture`
+- Commit: `da946e8` `feat: add pty-backed sessions and interactive attach`
 - Status: complete
 
 ## Slice 5
@@ -59,4 +64,16 @@ This document records each completed implementation slice in detail, including t
   - `cargo fmt`
   - `cargo test`
   - `cargo test --test daemon_cli -- --nocapture`
+- Commit: `da946e8` `feat: add pty-backed sessions and interactive attach`
 - Status: complete
+
+## Direct binary smoke run
+
+- Command pattern:
+  - start `target/debug/admuxd serve --socket <temp-socket>`
+  - run `target/debug/admux new --name demo -- sh -lc "printf demo-ok"`
+  - run `target/debug/admux attach demo` until output is observed
+- Observed output:
+  - `created demo pane 1`
+  - `attached demo`
+  - `demo-ok`
