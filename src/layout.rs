@@ -305,8 +305,7 @@ fn split_rect(area: Rect, axis: SplitAxis, ratio: u16) -> (Rect, Rect) {
     match axis {
         SplitAxis::Vertical => {
             let usable = area.width.saturating_sub(1);
-            let first_width =
-                ((u32::from(usable) * u32::from(ratio)) / 1000).max(1) as u16;
+            let first_width = ((u32::from(usable) * u32::from(ratio)) / 1000).max(1) as u16;
             let second_width = usable.saturating_sub(first_width);
             (
                 Rect {
@@ -325,8 +324,7 @@ fn split_rect(area: Rect, axis: SplitAxis, ratio: u16) -> (Rect, Rect) {
         }
         SplitAxis::Horizontal => {
             let usable = area.height.saturating_sub(1);
-            let first_height =
-                ((u32::from(usable) * u32::from(ratio)) / 1000).max(1) as u16;
+            let first_height = ((u32::from(usable) * u32::from(ratio)) / 1000).max(1) as u16;
             let second_height = usable.saturating_sub(first_height);
             (
                 Rect {
