@@ -11,7 +11,10 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::Parser;
 use crossterm::{
     cursor::{Hide, Show},
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, MouseButton, MouseEventKind},
+    event::{
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, MouseButton, MouseEventKind,
+    },
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -218,12 +221,24 @@ fn print_response(paths: &RuntimePaths, response: CommandResponse) -> Result<()>
 fn attach_interactive(paths: &RuntimePaths, session: &str) -> Result<()> {
     let mut stdout = io::stdout();
     terminal::enable_raw_mode().context("failed to enable raw mode")?;
-    execute!(stdout, EnterAlternateScreen, Hide, EnableMouseCapture)
-        .context("failed to enter alternate screen")?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        Hide,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )
+    .context("failed to enter alternate screen")?;
 
     let result = run_attach_loop(paths, session, &mut stdout);
 
-    let _ = execute!(stdout, DisableMouseCapture, Show, LeaveAlternateScreen);
+    let _ = execute!(
+        stdout,
+        DisableBracketedPaste,
+        DisableMouseCapture,
+        Show,
+        LeaveAlternateScreen
+    );
     let _ = terminal::disable_raw_mode();
     result
 }
@@ -293,16 +308,12 @@ fn run_attach_loop(paths: &RuntimePaths, session: &str, stdout: &mut impl Write)
                     InputAction::Noop => {}
                     InputAction::Detach => break,
                     InputAction::SendBytes(bytes) => {
-                        let keys = vec![String::from_utf8_lossy(&bytes).to_string()];
-                        let _ = request_response(
-                            paths,
-                            CommandRequest::SendKeys {
-                                target: session.to_string(),
-                                keys,
-                            },
-                        )?;
+                        send_input_bytes(paths, session, &bytes)?;
                     }
                 },
+                Event::Paste(text) => {
+                    send_input_bytes(paths, session, text.as_bytes())?;
+                }
                 Event::Mouse(mouse) => match mouse.kind {
                     MouseEventKind::Down(MouseButton::Left) if mouse.row < rows => {
                         selection_anchor = Some((mouse.row, mouse.column));
@@ -383,10 +394,26 @@ fn run_attach_loop(paths: &RuntimePaths, session: &str, stdout: &mut impl Write)
                     _ => {}
                 },
                 Event::Resize(_, _) => {}
-                Event::FocusGained | Event::FocusLost | Event::Paste(_) => {}
+                Event::FocusGained | Event::FocusLost => {}
             }
         }
     }
+    Ok(())
+}
+
+fn send_input_bytes(paths: &RuntimePaths, session: &str, bytes: &[u8]) -> Result<()> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+
+    let keys = vec![String::from_utf8_lossy(bytes).into_owned()];
+    let _ = request_response(
+        paths,
+        CommandRequest::SendKeys {
+            target: session.to_string(),
+            keys,
+        },
+    )?;
     Ok(())
 }
 
