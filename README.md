@@ -25,11 +25,11 @@ Implemented now:
 - daemon autostart from `admux`
 - session state stored in the daemon
 - PTY-backed command execution per pane
-- multi-pane `crossterm` rendering with internal split separators and per-pane cursors
+- multi-pane `crossterm` rendering with no persistent pane borders in normal mode and per-pane cursors
 - leader-key commands for split, window navigation, pane focus, pane resize, and detach
 - `Ctrl-b 0` through `Ctrl-b 9` for window index selection
 - `Ctrl-b :` for a tmux-style status-row command prompt with command completion
-- `Ctrl-b s` for a choose-tree-style session/window/pane picker with previews
+- `Ctrl-b s` for a tmux-like session/window chooser with stacked pane previews
 - `Ctrl-b ?` for a full-screen help overlay
 - chooser-local search with `Ctrl-s`, repeat with `n`/`N`, and expand/collapse-all with `Alt-+` / `Alt--`
 - mouse focus, drag-selection copy, wheel scroll, and border resize
@@ -103,7 +103,7 @@ The repository is developed in small TDD-oriented slices. Current verification i
 
 - `cargo test`
 - integration tests that execute `admux` and `admuxd`
-- a direct shell-level smoke flow covering session creation, pane splits, and window creation recorded in [`docs/implementation-log.md`](/home/abhiyan/coding/projects/admux/docs/implementation-log.md)
+- a direct shell-level smoke flow covering nested pane splits and window creation recorded in [`docs/implementation-log.md`](/home/abhiyan/coding/projects/admux/docs/implementation-log.md)
 
 ## More detail
 

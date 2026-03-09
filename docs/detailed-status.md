@@ -41,12 +41,12 @@
 - interactive `crossterm` attach path with:
   - alternate screen entry
   - multi-pane redraws from daemon snapshots
-  - internal split separators only, with no outer pane boxes or title rows
+  - no persistent pane borders in normal mode
   - reverse-video status line with window list
   - `Ctrl-b d` detach
   - `Ctrl-b 0` through `Ctrl-b 9` window index selection
   - `Ctrl-b :` status-row command prompt with tmux-style command names and completion
-  - `Ctrl-b s` choose-tree-style session/window/pane picker with previews
+  - `Ctrl-b s` tmux-like chooser with a stacked session list and pane preview grid
   - `Ctrl-b ?` full-screen help overlay
   - chooser-local search on `Ctrl-s`, repeat on `n` / `N`, and expand/collapse-all on `Alt-+` / `Alt--`
   - direct key forwarding to the active PTY
@@ -75,6 +75,7 @@
 - render tests
 - binary smoke tests that execute `admux` and `admuxd`
 - direct binary smoke for split-pane and new-window command flow
+- direct binary smoke for nested mixed-axis splits
 - prompt command parser and completion tests
 - chooser search helper tests
 
@@ -106,7 +107,8 @@ Observed result:
 - `29eb401` `feat: add daemon lifecycle and core cli commands`
 - `da946e8` `feat: add pty-backed sessions and interactive attach`
 - `a15bf48` `feat: add tmux-style prompt and chooser`
-- pending help/chooser navigation commit in current worktree
+- `f5b5f46` `feat: add help overlay and chooser search`
+- pending layout regression fix commit in current worktree
 
 ## Known gaps
 

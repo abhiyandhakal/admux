@@ -143,12 +143,30 @@ impl LayoutNode {
                 ratio: current_ratio,
                 first,
                 second,
-            } => LayoutNode::Split {
-                axis: current_axis,
-                ratio: current_ratio,
-                first: Box::new(first.split(target, axis, ratio, new_pane)),
-                second,
-            },
+            } => {
+                if first.contains(target) {
+                    LayoutNode::Split {
+                        axis: current_axis,
+                        ratio: current_ratio,
+                        first: Box::new(first.split(target, axis, ratio, new_pane)),
+                        second,
+                    }
+                } else if second.contains(target) {
+                    LayoutNode::Split {
+                        axis: current_axis,
+                        ratio: current_ratio,
+                        first,
+                        second: Box::new(second.split(target, axis, ratio, new_pane)),
+                    }
+                } else {
+                    LayoutNode::Split {
+                        axis: current_axis,
+                        ratio: current_ratio,
+                        first,
+                        second,
+                    }
+                }
+            }
         }
     }
 
@@ -413,5 +431,26 @@ mod tests {
 
         assert_eq!(active, Some(PaneId(1)));
         assert_eq!(tree.panes(), vec![PaneId(1)]);
+    }
+
+    #[test]
+    fn splitting_nested_second_branch_preserves_mixed_axis_layout() {
+        let mut tree = LayoutTree::new(PaneId(1));
+        tree.split_active(SplitAxis::Vertical, PaneId(2));
+        tree.active = PaneId(2);
+
+        tree.split_active(SplitAxis::Horizontal, PaneId(3));
+
+        let rects = tree.pane_rects(Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 20,
+        });
+
+        assert_eq!(tree.panes(), vec![PaneId(1), PaneId(2), PaneId(3)]);
+        assert_eq!(rects[&PaneId(1)].x, 0);
+        assert_eq!(rects[&PaneId(2)].x, rects[&PaneId(3)].x);
+        assert!(rects[&PaneId(2)].y < rects[&PaneId(3)].y);
     }
 }

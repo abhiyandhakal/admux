@@ -10,6 +10,7 @@ use crossterm::{
 use crate::{
     copy_mode::Selection,
     ipc::{PaneRender, RenderSnapshot},
+    pane::Rect,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,66 +76,67 @@ pub fn render_session<W: Write>(
 pub fn render_choose_tree<W: Write>(
     out: &mut W,
     session: &str,
-    snapshot: &RenderSnapshot,
+    current_snapshot: &RenderSnapshot,
     lines: &[TreeLine],
     preview_title: &str,
-    preview_rows: &[String],
+    preview_snapshot: &RenderSnapshot,
     bottom_message: &str,
     size: TerminalSize,
 ) -> std::io::Result<()> {
     queue!(out, Clear(ClearType::All), MoveTo(0, 0))?;
 
-    let tree_width = (size.width / 3).max(24);
-    let preview_x = tree_width.saturating_add(1);
-    let preview_width = size.width.saturating_sub(preview_x);
     let body_height = size.height.saturating_sub(1);
+    let list_height = body_height.min((lines.len() as u16).saturating_add(1).min(8));
 
     for (index, line) in lines.iter().enumerate() {
-        if index as u16 >= body_height {
+        if index as u16 >= list_height {
             break;
         }
         let row = index as u16;
-        let prefix = if line.has_children {
+        let prefix = if line.has_children && line.depth == 0 {
             if line.expanded { "-" } else { "+" }
         } else {
             " "
         };
-        let marker = if line.selected { ">" } else { " " };
-        let content = format!(
-            "{}{}{} {}",
-            marker,
-            "  ".repeat(line.depth),
-            prefix,
-            line.label
-        );
-        queue!(out, MoveTo(0, row), Print(fit_width(&content, tree_width)))?;
-    }
-
-    for row in 0..body_height {
-        queue!(out, MoveTo(tree_width, row), Print(':'))?;
+        let content = format!("{}{}{}", "  ".repeat(line.depth), prefix, line.label);
+        queue!(out, MoveTo(0, row))?;
+        if line.selected {
+            queue!(
+                out,
+                SetAttribute(Attribute::Reverse),
+                Print(fit_width(&content, size.width)),
+                SetAttribute(Attribute::Reset)
+            )?;
+        } else {
+            queue!(out, Print(fit_width(&content, size.width)))?;
+        }
     }
 
     queue!(
         out,
-        MoveTo(preview_x, 0),
-        Print(fit_width(preview_title, preview_width))
+        MoveTo(0, list_height),
+        Print(fit_width(
+            &format!(
+                " {preview_title} {}",
+                "-".repeat(size.width.saturating_sub(preview_title.len() as u16 + 2) as usize)
+            ),
+            size.width,
+        ))
     )?;
-    for (index, row) in preview_rows.iter().enumerate() {
-        let target_row = index as u16 + 1;
-        if target_row >= body_height {
-            break;
-        }
-        queue!(
-            out,
-            MoveTo(preview_x, target_row),
-            Print(truncate(row, preview_width))
-        )?;
+    let preview_area = Rect {
+        x: 0,
+        y: list_height.saturating_add(1),
+        width: size.width,
+        height: body_height.saturating_sub(list_height.saturating_add(1)),
+    };
+    if preview_area.height > 0 {
+        render_preview_snapshot(out, preview_snapshot, preview_area)?;
     }
 
     render_bottom_bar(
         out,
         session,
-        snapshot,
+        current_snapshot,
         BottomBar::Status {
             message: Some(bottom_message),
         },
@@ -188,47 +190,130 @@ fn render_pane<W: Write>(out: &mut W, pane: &PaneRender) -> std::io::Result<()> 
 }
 
 fn render_split_separators<W: Write>(
+    _out: &mut W,
+    _snapshot: &RenderSnapshot,
+) -> std::io::Result<()> {
+    Ok(())
+}
+
+fn render_preview_snapshot<W: Write>(
     out: &mut W,
     snapshot: &RenderSnapshot,
+    area: Rect,
 ) -> std::io::Result<()> {
-    let panes = &snapshot.panes;
-    let mut vertical = Vec::new();
-    let mut horizontal = Vec::new();
+    if snapshot.panes.is_empty() || area.width < 8 || area.height < 4 {
+        return Ok(());
+    }
 
-    for left in panes {
-        for right in panes {
-            if left.pane_id == right.pane_id {
-                continue;
+    let source_width = snapshot
+        .panes
+        .iter()
+        .map(|pane| pane.rect.right())
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let source_height = snapshot
+        .panes
+        .iter()
+        .map(|pane| pane.rect.bottom())
+        .max()
+        .unwrap_or(1)
+        .max(1);
+
+    for pane in &snapshot.panes {
+        let scaled = scale_rect(pane.rect, area, source_width, source_height);
+        if scaled.width < 6 || scaled.height < 4 {
+            continue;
+        }
+        draw_preview_box(out, scaled, pane.focused, &pane.title)?;
+        let content = scaled.content();
+        for (offset, row) in pane.rows_plain.iter().enumerate() {
+            if offset as u16 >= content.height {
+                break;
             }
-            if left.rect.x + left.rect.width + 1 == right.rect.x {
-                let start = left.rect.y.max(right.rect.y);
-                let end = (left.rect.y + left.rect.height).min(right.rect.y + right.rect.height);
-                for row in start..end {
-                    vertical.push((left.rect.x + left.rect.width, row));
-                }
-            }
-            if left.rect.y + left.rect.height + 1 == right.rect.y {
-                let start = left.rect.x.max(right.rect.x);
-                let end = (left.rect.x + left.rect.width).min(right.rect.x + right.rect.width);
-                for col in start..end {
-                    horizontal.push((col, left.rect.y + left.rect.height));
-                }
-            }
+            queue!(
+                out,
+                MoveTo(content.x, content.y + offset as u16),
+                Print(truncate(row, content.width))
+            )?;
         }
     }
 
-    for (x, y) in &vertical {
-        let ch = if horizontal.iter().any(|(hx, hy)| hx == x && hy == y) {
-            '+'
-        } else {
-            ':'
-        };
-        queue!(out, MoveTo(*x, *y), Print(ch))?;
+    Ok(())
+}
+
+fn scale_rect(source: Rect, area: Rect, source_width: u16, source_height: u16) -> Rect {
+    let mut x =
+        area.x + ((u32::from(source.x) * u32::from(area.width)) / u32::from(source_width)) as u16;
+    let mut y =
+        area.y + ((u32::from(source.y) * u32::from(area.height)) / u32::from(source_height)) as u16;
+    let mut width = ((u32::from(source.width.max(1)) * u32::from(area.width))
+        / u32::from(source_width))
+    .max(6) as u16;
+    let mut height = ((u32::from(source.height.max(1)) * u32::from(area.height))
+        / u32::from(source_height))
+    .max(4) as u16;
+
+    if x >= area.right() {
+        x = area.right().saturating_sub(1);
     }
-    for (x, y) in &horizontal {
-        if !vertical.iter().any(|(vx, vy)| vx == x && vy == y) {
-            queue!(out, MoveTo(*x, *y), Print('-'))?;
-        }
+    if y >= area.bottom() {
+        y = area.bottom().saturating_sub(1);
+    }
+    width = width.min(area.right().saturating_sub(x));
+    height = height.min(area.bottom().saturating_sub(y));
+
+    Rect {
+        x,
+        y,
+        width,
+        height,
+    }
+}
+
+fn draw_preview_box<W: Write>(
+    out: &mut W,
+    rect: Rect,
+    focused: bool,
+    title: &str,
+) -> std::io::Result<()> {
+    if rect.width < 2 || rect.height < 2 {
+        return Ok(());
+    }
+    let border_attr = if focused {
+        Attribute::Bold
+    } else {
+        Attribute::Dim
+    };
+    let top = format!("+{}+", "-".repeat(rect.width.saturating_sub(2) as usize));
+    let bottom = top.clone();
+    queue!(
+        out,
+        SetAttribute(border_attr),
+        MoveTo(rect.x, rect.y),
+        Print(top)
+    )?;
+    for row in rect.y.saturating_add(1)..rect.bottom().saturating_sub(1) {
+        queue!(
+            out,
+            MoveTo(rect.x, row),
+            Print("|"),
+            MoveTo(rect.right().saturating_sub(1), row),
+            Print("|")
+        )?;
+    }
+    queue!(
+        out,
+        MoveTo(rect.x, rect.bottom().saturating_sub(1)),
+        Print(bottom),
+        SetAttribute(Attribute::Reset)
+    )?;
+    if rect.width > 4 {
+        queue!(
+            out,
+            MoveTo(rect.x.saturating_add(2), rect.y),
+            Print(truncate(title, rect.width.saturating_sub(4)))
+        )?;
     }
     Ok(())
 }
@@ -514,7 +599,6 @@ mod tests {
         .expect("render session");
         let rendered = String::from_utf8_lossy(&buf);
 
-        assert!(rendered.contains(":"));
         assert!(!rendered.contains("#"));
         assert!(!rendered.contains("="));
     }

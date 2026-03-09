@@ -160,3 +160,27 @@ This document records each completed implementation slice in detail, including t
   - chooser tests covered forward search, repeat search, and collapse-all state handling
 - Commit: pending current worktree
 - Status: complete
+
+## Layout regression fix slice
+
+- Goal: fix reverse drag resizing, lock in mixed-axis nested pane splits with regression coverage, and restyle the chooser toward tmux's stacked session list plus pane preview layout.
+- Files changed:
+  - runtime and interaction: `src/client.rs`, `src/layout.rs`
+  - rendering: `src/render.rs`
+  - docs: `README.md`, `docs/detailed-status.md`
+- Verification:
+  - `cargo fmt`
+  - `cargo test`
+  - direct binary smoke:
+    - `target/debug/admux new -d --name layout-smoke`
+    - `target/debug/admux split-pane --vertical layout-smoke`
+    - `target/debug/admux select-pane --right`
+    - `target/debug/admux split-pane --horizontal layout-smoke`
+    - `target/debug/admux list-panes layout-smoke`
+    - `target/debug/admux kill layout-smoke`
+- Observed output:
+  - the binary smoke created three panes with the final active pane in the nested split branch
+  - the client tests covered reverse drag direction handling
+  - the layout tests covered mixed-axis nested split geometry
+- Commit: pending current worktree
+- Status: complete

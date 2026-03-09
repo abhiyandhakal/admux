@@ -69,6 +69,7 @@ struct ChooseTreeState {
     selected: usize,
     expanded_sessions: BTreeSet<String>,
     expanded_windows: BTreeSet<(String, u64)>,
+    attached_session: String,
     search_input: Option<String>,
     last_search: Option<String>,
 }
@@ -513,7 +514,7 @@ fn run_attach_loop(
                 )?;
             }
             OverlayState::ChooseTree(tree) => {
-                let (title, preview_rows) = chooser_preview(paths, tree, &current_session)?;
+                let (title, preview_snapshot) = chooser_preview(paths, tree)?;
                 let chooser_status = choose_tree_status(tree);
                 render_choose_tree(
                     stdout,
@@ -521,7 +522,7 @@ fn run_attach_loop(
                     &snapshot,
                     &tree.lines,
                     &title,
-                    &preview_rows,
+                    &preview_snapshot,
                     &chooser_status,
                     TerminalSize { width, height },
                 )?;
@@ -963,6 +964,7 @@ fn build_choose_tree(paths: &RuntimePaths, current_session: &str) -> Result<Choo
         selected: 0,
         expanded_sessions: sessions.iter().cloned().collect(),
         expanded_windows: BTreeSet::new(),
+        attached_session: current_session.to_string(),
         search_input: None,
         last_search: None,
     };
@@ -997,9 +999,22 @@ fn rebuild_choose_tree(paths: &RuntimePaths, state: &mut ChooseTreeState) -> Res
     for session in sessions {
         let expanded = state.expanded_sessions.contains(&session);
         items.push(ChooseItem::Session(session.clone()));
+        let window_count = match request_response(
+            paths,
+            CommandRequest::ListWindows {
+                session: session.clone(),
+            },
+        )? {
+            CommandResponse::WindowList { windows } => windows.len(),
+            _ => 0,
+        };
         lines.push(TreeLine {
             depth: 0,
-            label: session.clone(),
+            label: if session == state.attached_session {
+                format!("{session}: {window_count} windows (attached)")
+            } else {
+                format!("{session}: {window_count} windows")
+            },
             selected: false,
             expanded,
             has_children: true,
@@ -1076,10 +1091,12 @@ fn rebuild_choose_tree(paths: &RuntimePaths, state: &mut ChooseTreeState) -> Res
 fn chooser_preview(
     paths: &RuntimePaths,
     tree: &ChooseTreeState,
-    current_session: &str,
-) -> Result<(String, Vec<String>)> {
+) -> Result<(String, RenderSnapshot)> {
     let Some(item) = tree.items.get(tree.selected) else {
-        return Ok(("no sessions".into(), Vec::new()));
+        return Ok((
+            "no sessions".into(),
+            fallback_snapshot(String::new(), 80, 24),
+        ));
     };
     let session = match item {
         ChooseItem::Session(session)
@@ -1097,18 +1114,7 @@ fn chooser_preview(
         } => snapshot.unwrap_or_else(|| fallback_snapshot(preview, 80, 24)),
         _ => fallback_snapshot(String::new(), 80, 24),
     };
-    let title = if session == current_session {
-        format!("{session} (current)")
-    } else {
-        session
-    };
-    let mut rows = Vec::new();
-    for pane in snapshot.panes {
-        rows.push(format!("pane {}:", pane.pane_id));
-        rows.extend(pane.rows_plain.into_iter().take(6));
-        rows.push(String::new());
-    }
-    Ok((title, rows))
+    Ok((session, snapshot))
 }
 
 fn handle_choose_tree_key(
@@ -1180,6 +1186,7 @@ fn handle_choose_tree_key(
                 match item {
                     ChooseItem::Session(session) => {
                         *current_session = session;
+                        tree.attached_session = current_session.clone();
                     }
                     ChooseItem::Window { session, window_id } => {
                         let _ = request_response(
@@ -1189,6 +1196,7 @@ fn handle_choose_tree_key(
                             },
                         )?;
                         *current_session = session;
+                        tree.attached_session = current_session.clone();
                     }
                     ChooseItem::Pane {
                         session,
@@ -1209,6 +1217,7 @@ fn handle_choose_tree_key(
                             },
                         )?;
                         *current_session = session;
+                        tree.attached_session = current_session.clone();
                     }
                 }
                 return Ok(false);
@@ -1383,22 +1392,14 @@ fn handle_mouse_event(
         }
         MouseEventKind::Drag(MouseButton::Left) => {
             if let Some(resize) = resize_drag.as_mut() {
-                let delta = match resize.direction {
-                    NavigationDirection::Left | NavigationDirection::Right => {
-                        mouse.column.abs_diff(resize.last_col)
-                    }
-                    NavigationDirection::Up | NavigationDirection::Down => {
-                        mouse.row.abs_diff(resize.last_row)
-                    }
-                };
-                if delta > 0 {
+                if let Some((direction, delta)) = resize_drag_request(*resize, mouse) {
                     let target =
                         format!("{session}:{}.{}", snapshot.active_window_id, resize.pane_id);
                     let _ = request_response(
                         paths,
                         CommandRequest::ResizePane {
                             target,
-                            direction: resize.direction,
+                            direction,
                             amount: delta.saturating_mul(20),
                         },
                     )?;
@@ -1506,6 +1507,35 @@ fn separator_hit(
         }
     }
     None
+}
+
+fn resize_drag_request(
+    resize: ResizeDrag,
+    mouse: MouseEvent,
+) -> Option<(NavigationDirection, u16)> {
+    match resize.direction {
+        NavigationDirection::Right => {
+            let delta = mouse.column.abs_diff(resize.last_col);
+            if delta == 0 {
+                None
+            } else if mouse.column > resize.last_col {
+                Some((NavigationDirection::Left, delta))
+            } else {
+                Some((NavigationDirection::Right, delta))
+            }
+        }
+        NavigationDirection::Down => {
+            let delta = mouse.row.abs_diff(resize.last_row);
+            if delta == 0 {
+                None
+            } else if mouse.row > resize.last_row {
+                Some((NavigationDirection::Up, delta))
+            } else {
+                Some((NavigationDirection::Down, delta))
+            }
+        }
+        NavigationDirection::Left | NavigationDirection::Up => None,
+    }
 }
 
 fn fallback_snapshot(preview: String, width: u16, height: u16) -> RenderSnapshot {
@@ -1625,6 +1655,7 @@ mod tests {
             selected: 0,
             expanded_sessions: BTreeSet::new(),
             expanded_windows: BTreeSet::new(),
+            attached_session: "work".into(),
             search_input: None,
             last_search: None,
         };
@@ -1676,6 +1707,7 @@ mod tests {
             selected: 2,
             expanded_sessions: BTreeSet::new(),
             expanded_windows: BTreeSet::new(),
+            attached_session: "work".into(),
             search_input: None,
             last_search: Some("editor".into()),
         };
@@ -1694,6 +1726,7 @@ mod tests {
             selected: 0,
             expanded_sessions: ["work".to_string()].into_iter().collect(),
             expanded_windows: [("work".to_string(), 1)].into_iter().collect(),
+            attached_session: "work".into(),
             search_input: None,
             last_search: None,
         };
@@ -1702,5 +1735,49 @@ mod tests {
 
         assert!(tree.expanded_sessions.is_empty());
         assert!(tree.expanded_windows.is_empty());
+    }
+
+    #[test]
+    fn resize_drag_request_reverses_direction_for_leftward_motion() {
+        let resize = ResizeDrag {
+            pane_id: 1,
+            direction: NavigationDirection::Right,
+            last_row: 0,
+            last_col: 10,
+        };
+
+        let request = resize_drag_request(
+            resize,
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: 7,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+
+        assert_eq!(request, Some((NavigationDirection::Right, 3)));
+    }
+
+    #[test]
+    fn resize_drag_request_grows_left_pane_when_dragging_right() {
+        let resize = ResizeDrag {
+            pane_id: 1,
+            direction: NavigationDirection::Right,
+            last_row: 0,
+            last_col: 10,
+        };
+
+        let request = resize_drag_request(
+            resize,
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: 13,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+
+        assert_eq!(request, Some((NavigationDirection::Left, 3)));
     }
 }
