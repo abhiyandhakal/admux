@@ -1,5 +1,134 @@
+use anyhow::{Context, Result};
+use portable_pty::{Child, CommandBuilder, PtySize, native_pty_system};
+use std::{
+    io::{Read, Write},
+    path::Path,
+    sync::{Arc, Mutex},
+    thread,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PtyState {
     Detached,
     Attached,
+}
+
+pub struct PaneProcess {
+    output: Arc<Mutex<String>>,
+    writer: Mutex<Box<dyn Write + Send>>,
+    child: Mutex<Box<dyn Child + Send>>,
+}
+
+impl PaneProcess {
+    pub fn spawn(command: &[String], cwd: Option<&Path>) -> Result<Self> {
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .context("failed to create PTY pair")?;
+
+        let mut builder = build_command(command);
+        if let Some(cwd) = cwd {
+            builder.cwd(cwd);
+        }
+
+        let child = pair
+            .slave
+            .spawn_command(builder)
+            .context("failed to spawn pane command")?;
+        let mut reader = pair
+            .master
+            .try_clone_reader()
+            .context("failed to clone PTY reader")?;
+        let writer = pair
+            .master
+            .take_writer()
+            .context("failed to acquire PTY writer")?;
+        let output = Arc::new(Mutex::new(String::new()));
+        let captured = Arc::clone(&output);
+
+        thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(size) => {
+                        let text = String::from_utf8_lossy(&buf[..size]);
+                        if let Ok(mut output) = captured.lock() {
+                            output.push_str(&text);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Ok(Self {
+            output,
+            writer: Mutex::new(writer),
+            child: Mutex::new(child),
+        })
+    }
+
+    pub fn preview(&self) -> String {
+        self.output
+            .lock()
+            .expect("pane output lock poisoned")
+            .clone()
+    }
+
+    pub fn send_keys(&self, keys: &[String]) -> Result<()> {
+        let mut writer = self.writer.lock().expect("pane writer lock poisoned");
+        for key in keys {
+            writer
+                .write_all(key.as_bytes())
+                .context("failed to write key bytes")?;
+        }
+        writer.flush().context("failed to flush PTY writer")?;
+        Ok(())
+    }
+
+    pub fn kill(&self) -> Result<()> {
+        self.child
+            .lock()
+            .expect("pane child lock poisoned")
+            .kill()
+            .context("failed to kill pane process")?;
+        Ok(())
+    }
+}
+
+fn build_command(command: &[String]) -> CommandBuilder {
+    if command.is_empty() {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        CommandBuilder::new(shell)
+    } else {
+        let mut builder = CommandBuilder::new(&command[0]);
+        for arg in &command[1..] {
+            builder.arg(arg);
+        }
+        builder
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{thread, time::Duration};
+
+    #[test]
+    fn pane_process_captures_command_output() {
+        let pane = PaneProcess::spawn(
+            &["sh".into(), "-lc".into(), "printf 'hello from pane'".into()],
+            None,
+        )
+        .expect("spawn pane");
+
+        thread::sleep(Duration::from_millis(100));
+        assert!(pane.preview().contains("hello from pane"));
+    }
 }

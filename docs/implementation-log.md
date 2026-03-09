@@ -40,3 +40,23 @@ This document records each completed implementation slice in detail, including t
   - `cargo test`
   - `cargo test --test daemon_cli -- --nocapture`
 - Status: complete
+
+## Slice 4
+
+- Goal: add real session/layout state and PTY-backed pane execution so `attach` can surface pane output instead of only session names.
+- Files changed: `src/ipc.rs`, `src/layout.rs`, `src/pane.rs`, `src/pty.rs`, `src/session.rs`, `src/server.rs`, `src/client.rs`, `tests/daemon_cli.rs`
+- Verification:
+  - `cargo fmt`
+  - `cargo test`
+  - `cargo test --test daemon_cli -- --nocapture`
+- Status: complete
+
+## Slice 5
+
+- Goal: introduce a `crossterm`-driven interactive attach path with status-line rendering and leader-key detach behavior while keeping non-TTY attach stable for tests.
+- Files changed: `Cargo.toml`, `src/client.rs`, `src/render.rs`, `src/input.rs`, `src/copy_mode.rs`
+- Verification:
+  - `cargo fmt`
+  - `cargo test`
+  - `cargo test --test daemon_cli -- --nocapture`
+- Status: complete

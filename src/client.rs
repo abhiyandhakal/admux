@@ -1,12 +1,20 @@
 use crate::{
     cli::{AdmuxCli, ClientCommand},
+    input::{InputAction, InputState},
     ipc::{CommandRequest, CommandResponse},
     paths::RuntimePaths,
+    render::{TerminalSize, render_session},
 };
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
+use crossterm::{
+    cursor::{Hide, Show},
+    event::{self, Event},
+    execute,
+    terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
+};
 use std::{
-    io::{Read, Write},
+    io::{self, IsTerminal, Read, Write},
     os::unix::net::UnixStream,
     process::{Command, Stdio},
     thread,
@@ -41,7 +49,7 @@ pub fn run(cli: AdmuxCli) -> Result<()> {
 
     let paths = RuntimePaths::resolve();
     let response = request_response(&paths, request)?;
-    print_response(response)
+    print_response(&paths, response)
 }
 
 pub fn request_response(paths: &RuntimePaths, request: CommandRequest) -> Result<CommandResponse> {
@@ -134,16 +142,23 @@ fn read_message(stream: &mut UnixStream) -> Result<CommandResponse> {
     Ok(response)
 }
 
-fn print_response(response: CommandResponse) -> Result<()> {
+fn print_response(paths: &RuntimePaths, response: CommandResponse) -> Result<()> {
     match response {
         CommandResponse::HelloAck { version } => {
             println!("protocol {}", version.0);
         }
-        CommandResponse::SessionCreated { session } => {
-            println!("created {session}");
+        CommandResponse::SessionCreated { session, pane_id } => {
+            println!("created {session} pane {pane_id}");
         }
-        CommandResponse::Attached { session } => {
-            println!("attached {session}");
+        CommandResponse::Attached { session, preview } => {
+            if io::stdout().is_terminal() && std::env::var_os("ADMUX_NONINTERACTIVE").is_none() {
+                attach_interactive(paths, &session)?;
+            } else {
+                println!("attached {session}");
+                if !preview.is_empty() {
+                    print!("{preview}");
+                }
+            }
         }
         CommandResponse::SessionList { sessions } => {
             for session in sessions {
@@ -164,6 +179,62 @@ fn print_response(response: CommandResponse) -> Result<()> {
     Ok(())
 }
 
+fn attach_interactive(paths: &RuntimePaths, session: &str) -> Result<()> {
+    let mut stdout = io::stdout();
+    terminal::enable_raw_mode().context("failed to enable raw mode")?;
+    execute!(stdout, EnterAlternateScreen, Hide).context("failed to enter alternate screen")?;
+
+    let result = run_attach_loop(paths, session, &mut stdout);
+
+    let _ = execute!(stdout, Show, LeaveAlternateScreen);
+    let _ = terminal::disable_raw_mode();
+    result
+}
+
+fn run_attach_loop(paths: &RuntimePaths, session: &str, stdout: &mut impl Write) -> Result<()> {
+    let mut state = InputState::default();
+    loop {
+        let response = request_response(
+            paths,
+            CommandRequest::Attach {
+                session: Some(session.to_string()),
+            },
+        )?;
+        let preview = match response {
+            CommandResponse::Attached { preview, .. } => preview,
+            CommandResponse::Error { message } => return Err(anyhow!(message)),
+            other => return Err(anyhow!("unexpected attach response: {other:?}")),
+        };
+
+        let (width, height) = terminal::size().context("failed to read terminal size")?;
+        render_session(stdout, session, &preview, TerminalSize { width, height })
+            .context("failed to render session")?;
+
+        if event::poll(Duration::from_millis(50)).context("failed to poll terminal events")? {
+            match event::read().context("failed to read terminal event")? {
+                Event::Key(key) => match state.handle_key(key) {
+                    InputAction::Noop => {}
+                    InputAction::Detach => break,
+                    InputAction::SendBytes(bytes) => {
+                        let keys = vec![String::from_utf8_lossy(&bytes).to_string()];
+                        let _ = request_response(
+                            paths,
+                            CommandRequest::SendKeys {
+                                target: session.to_string(),
+                                keys,
+                            },
+                        )?;
+                    }
+                },
+                Event::Mouse(_) => {}
+                Event::Resize(_, _) => {}
+                Event::FocusGained | Event::FocusLost | Event::Paste(_) => {}
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,6 +244,7 @@ mod tests {
     fn writes_and_reads_protocol_messages() {
         let response = CommandResponse::SessionCreated {
             session: "work".into(),
+            pane_id: 1,
         };
         let encoded = serde_json::to_vec(&response).expect("encode response");
         let decoded: CommandResponse = serde_json::from_slice(&encoded).expect("decode response");

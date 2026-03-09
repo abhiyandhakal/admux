@@ -33,8 +33,8 @@ pub enum CommandRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommandResponse {
     HelloAck { version: ProtocolVersion },
-    SessionCreated { session: String },
-    Attached { session: String },
+    SessionCreated { session: String, pane_id: u64 },
+    Attached { session: String, preview: String },
     SessionList { sessions: Vec<String> },
     SessionKilled { session: String },
     KeysSent,

@@ -1,11 +1,15 @@
-use crate::ipc::{CURRENT_PROTOCOL_VERSION, CommandRequest, CommandResponse, ProtocolVersion};
+use crate::{
+    ipc::{CURRENT_PROTOCOL_VERSION, CommandRequest, CommandResponse, ProtocolVersion},
+    pane::PaneId,
+    session::Session,
+};
 use anyhow::{Context, Result, bail};
 use std::{
     collections::BTreeMap,
     fs,
     io::{Read, Write},
     os::unix::net::{UnixListener, UnixStream},
-    path::{Path, PathBuf},
+    path::Path,
     sync::{Arc, Mutex},
 };
 
@@ -18,14 +22,14 @@ pub enum ServerState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRecord {
     pub name: String,
-    pub cwd: Option<PathBuf>,
-    pub command: Vec<String>,
+    pub active_pane: PaneId,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct SessionStore {
-    sessions: BTreeMap<String, SessionRecord>,
+    sessions: BTreeMap<String, Session>,
     last_session: Option<String>,
+    next_pane_id: u64,
 }
 
 impl SessionStore {
@@ -34,16 +38,20 @@ impl SessionStore {
             CommandRequest::Hello { version } => self.handle_hello(version),
             CommandRequest::NewSession { name, cwd, command } => {
                 let name = name.unwrap_or_else(|| format!("session-{}", self.sessions.len() + 1));
-                self.sessions.insert(
-                    name.clone(),
-                    SessionRecord {
-                        name: name.clone(),
-                        cwd,
-                        command,
+                let pane_id = self.next_pane();
+                match Session::new(name.clone(), cwd, command, pane_id) {
+                    Ok(session) => {
+                        self.sessions.insert(name.clone(), session);
+                        self.last_session = Some(name.clone());
+                        CommandResponse::SessionCreated {
+                            session: name,
+                            pane_id: pane_id.0,
+                        }
+                    }
+                    Err(error) => CommandResponse::Error {
+                        message: error.to_string(),
                     },
-                );
-                self.last_session = Some(name.clone());
-                CommandResponse::SessionCreated { session: name }
+                }
             }
             CommandRequest::Attach { session } => {
                 let resolved = match session {
@@ -55,8 +63,16 @@ impl SessionStore {
                     }
                     None => self.last_session.clone(),
                 };
+
                 match resolved {
-                    Some(session) => CommandResponse::Attached { session },
+                    Some(session) => {
+                        let preview = self
+                            .sessions
+                            .get(&session)
+                            .map(|session| session.active_pane_preview())
+                            .unwrap_or_default();
+                        CommandResponse::Attached { session, preview }
+                    }
                     None => CommandResponse::Error {
                         message: "no sessions available".into(),
                     },
@@ -66,7 +82,8 @@ impl SessionStore {
                 sessions: self.sessions.keys().cloned().collect(),
             },
             CommandRequest::KillSession { session } => {
-                if self.sessions.remove(&session).is_some() {
+                if let Some(removed) = self.sessions.remove(&session) {
+                    let _ = removed.kill();
                     if self.last_session.as_deref() == Some(session.as_str()) {
                         self.last_session = self.sessions.keys().next_back().cloned();
                     }
@@ -77,9 +94,27 @@ impl SessionStore {
                     }
                 }
             }
-            CommandRequest::SendKeys { .. } => CommandResponse::KeysSent,
+            CommandRequest::SendKeys { target, keys } => {
+                let session_name = target.split(':').next().unwrap_or(target.as_str());
+                match self.sessions.get(session_name) {
+                    Some(session) => match session.send_keys(&keys) {
+                        Ok(_) => CommandResponse::KeysSent,
+                        Err(error) => CommandResponse::Error {
+                            message: error.to_string(),
+                        },
+                    },
+                    None => CommandResponse::Error {
+                        message: format!("unknown session {session_name}"),
+                    },
+                }
+            }
             CommandRequest::ReloadConfig => CommandResponse::ConfigReloaded,
         }
+    }
+
+    fn next_pane(&mut self) -> PaneId {
+        self.next_pane_id += 1;
+        PaneId(self.next_pane_id)
     }
 
     fn handle_hello(&self, version: ProtocolVersion) -> CommandResponse {
@@ -150,14 +185,15 @@ mod tests {
         let created = store.handle(CommandRequest::NewSession {
             name: Some("work".into()),
             cwd: None,
-            command: Vec::new(),
+            command: vec!["sh".into(), "-lc".into(), "printf test".into()],
         });
-        assert_eq!(
+        assert!(matches!(
             created,
             CommandResponse::SessionCreated {
-                session: "work".into()
-            }
-        );
+                session,
+                pane_id: 1
+            } if session == "work"
+        ));
 
         let listed = store.handle(CommandRequest::ListSessions);
         assert_eq!(
@@ -174,16 +210,16 @@ mod tests {
         let _ = store.handle(CommandRequest::NewSession {
             name: Some("work".into()),
             cwd: None,
-            command: Vec::new(),
+            command: vec!["sh".into(), "-lc".into(), "printf attached".into()],
         });
+        std::thread::sleep(std::time::Duration::from_millis(100));
 
         let attached = store.handle(CommandRequest::Attach { session: None });
 
-        assert_eq!(
+        assert!(matches!(
             attached,
-            CommandResponse::Attached {
-                session: "work".into()
-            }
-        );
+            CommandResponse::Attached { session, preview }
+                if session == "work" && preview.contains("attached")
+        ));
     }
 }
