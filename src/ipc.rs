@@ -68,6 +68,10 @@ pub enum CommandRequest {
         direction: NavigationDirection,
         amount: u16,
     },
+    RenameWindow {
+        target: String,
+        name: String,
+    },
     MouseScroll {
         session: String,
         row: u16,

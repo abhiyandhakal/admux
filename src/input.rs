@@ -15,12 +15,15 @@ pub enum InputAction {
     Detach,
     SendBytes(Vec<u8>),
     SplitPane(SplitAxis),
+    SelectWindowIndex(u8),
     NewWindow,
     NextWindow,
     PrevWindow,
     FocusPane(NavigationDirection),
     ResizePane(NavigationDirection, u16),
     KillPane,
+    OpenPrompt,
+    OpenSessions,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,9 +58,14 @@ impl InputState {
                     KeyCode::Char('d') => InputAction::Detach,
                     KeyCode::Char('%') => InputAction::SplitPane(SplitAxis::Vertical),
                     KeyCode::Char('"') => InputAction::SplitPane(SplitAxis::Horizontal),
+                    KeyCode::Char(':') => InputAction::OpenPrompt,
+                    KeyCode::Char('s') => InputAction::OpenSessions,
                     KeyCode::Char('c') => InputAction::NewWindow,
                     KeyCode::Char('n') => InputAction::NextWindow,
                     KeyCode::Char('p') => InputAction::PrevWindow,
+                    KeyCode::Char(ch) if ch.is_ascii_digit() => {
+                        InputAction::SelectWindowIndex(ch as u8 - b'0')
+                    }
                     KeyCode::Char('h') => InputAction::FocusPane(NavigationDirection::Left),
                     KeyCode::Char('j') => InputAction::FocusPane(NavigationDirection::Down),
                     KeyCode::Char('k') => InputAction::FocusPane(NavigationDirection::Up),
@@ -133,6 +141,16 @@ mod tests {
         assert_eq!(
             state.handle_key(KeyEvent::new(KeyCode::Char('%'), KeyModifiers::NONE)),
             InputAction::SplitPane(SplitAxis::Vertical)
+        );
+    }
+
+    #[test]
+    fn leader_digit_selects_window_index() {
+        let mut state = InputState::default();
+        let _ = state.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        assert_eq!(
+            state.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE)),
+            InputAction::SelectWindowIndex(3)
         );
     }
 }

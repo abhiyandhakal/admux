@@ -41,9 +41,12 @@
 - interactive `crossterm` attach path with:
   - alternate screen entry
   - multi-pane redraws from daemon snapshots
-  - pane borders and titles
-  - balanced reverse-video status line with window list
+  - internal split separators only, with no outer pane boxes or title rows
+  - reverse-video status line with window list
   - `Ctrl-b d` detach
+  - `Ctrl-b 0` through `Ctrl-b 9` window index selection
+  - `Ctrl-b :` status-row command prompt with tmux-style command names and completion
+  - `Ctrl-b s` choose-tree-style session/window/pane picker with previews
   - direct key forwarding to the active PTY
   - control-key forwarding such as `Ctrl-l`
   - arrow/home/end/delete forwarding
@@ -70,6 +73,7 @@
 - render tests
 - binary smoke tests that execute `admux` and `admuxd`
 - direct binary smoke for split-pane and new-window command flow
+- prompt command parser and completion tests
 
 ### Manual
 
@@ -89,6 +93,7 @@ Observed result:
 - pane list showed two panes in the first window
 - second window creation succeeded
 - window list showed the new active `logs` window
+- prompt parser and separator-only renderer tests passed under `cargo test`
 
 ## Commit history so far
 
@@ -97,19 +102,20 @@ Observed result:
 - `9b9eb6e` `feat: add config loading and ipc foundations`
 - `29eb401` `feat: add daemon lifecycle and core cli commands`
 - `da946e8` `feat: add pty-backed sessions and interactive attach`
-- pending new multipane/window commit in current worktree
+- pending prompt/chooser UI commit in current worktree
 
 ## Known gaps
 
 - copy mode is still drag-selection focused rather than a full modal copy-mode UI
-- no rename-window command yet
 - no help overlay yet
+- choose-tree search and expand-all/collapse-all shortcuts are not implemented yet
 - session state is in-memory only while `admuxd` is alive
 
 ## Module map
 
 - `src/cli.rs`: clap CLI definitions
 - `src/client.rs`: client request flow, autostart, attach behavior
+- `src/commands.rs`: tmux-style interactive command parsing and completion
 - `src/config.rs`: TOML config types and loaders
 - `src/ipc.rs`: request/response protocol
 - `src/paths.rs`: runtime/config path resolution

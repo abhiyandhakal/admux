@@ -15,6 +15,7 @@ dependencies = [
  "predicates",
  "serde",
  "serde_json",
+ "shell-words",
  "tempfile",
  "toml",
  "vt100",

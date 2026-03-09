@@ -157,13 +157,10 @@ impl Session {
             .filter_map(|pane_id| {
                 let pane = window.panes.get(&pane_id)?;
                 let rect = *rects.get(&pane_id)?;
-                let content = rect.content();
-                let rows_plain = pane.process.visible_rows(content.width, content.height);
-                let rows_formatted = pane
-                    .process
-                    .visible_rows_formatted(content.width, content.height);
+                let rows_plain = pane.process.visible_rows(rect.width, rect.height);
+                let rows_formatted = pane.process.visible_rows_formatted(rect.width, rect.height);
                 let (cursor_row, cursor_col) = pane.process.cursor_position();
-                let cursor = clamp_cursor(content, cursor_row, cursor_col);
+                let cursor = clamp_cursor(rect, cursor_row, cursor_col);
 
                 Some(PaneRender {
                     pane_id: pane.id.0,
@@ -225,7 +222,12 @@ impl Session {
             .unwrap_or_default()
     }
 
-    pub fn send_keys(&self, window_id: Option<WindowId>, pane_id: Option<PaneId>, keys: &[String]) -> Result<()> {
+    pub fn send_keys(
+        &self,
+        window_id: Option<WindowId>,
+        pane_id: Option<PaneId>,
+        keys: &[String],
+    ) -> Result<()> {
         let window = self
             .window(window_id)
             .ok_or_else(|| anyhow!("unknown window"))?;
@@ -361,7 +363,9 @@ impl Session {
         let window = self
             .window_mut(window_id)
             .ok_or_else(|| anyhow!("unknown window"))?;
-        let _ = window.layout.resize_active(convert_direction(direction), amount);
+        let _ = window
+            .layout
+            .resize_active(convert_direction(direction), amount);
         Ok(())
     }
 
@@ -390,7 +394,11 @@ impl Session {
         Ok(())
     }
 
-    pub fn kill_pane(&mut self, window_id: Option<WindowId>, pane_id: Option<PaneId>) -> Result<Option<KillResult>> {
+    pub fn kill_pane(
+        &mut self,
+        window_id: Option<WindowId>,
+        pane_id: Option<PaneId>,
+    ) -> Result<Option<KillResult>> {
         let window_id = window_id.unwrap_or(self.active_window);
         let window = match self.windows.get_mut(&window_id) {
             Some(window) => window,
@@ -482,7 +490,8 @@ impl Session {
     }
 
     pub fn window_mut(&mut self, window_id: Option<WindowId>) -> Option<&mut WindowRuntime> {
-        self.windows.get_mut(&window_id.unwrap_or(self.active_window))
+        self.windows
+            .get_mut(&window_id.unwrap_or(self.active_window))
     }
 
     fn sync_pane_sizes(&mut self) -> Result<()> {
@@ -490,13 +499,8 @@ impl Session {
         for window in self.windows.values() {
             let rects = window.layout.pane_rects(area);
             for (pane_id, pane) in &window.panes {
-                let rect = rects
-                    .get(pane_id)
-                    .copied()
-                    .unwrap_or(area)
-                    .content();
-                pane.process
-                    .resize(rect.height.max(1), rect.width.max(1))?;
+                let rect = rects.get(pane_id).copied().unwrap_or(area);
+                pane.process.resize(rect.height.max(1), rect.width.max(1))?;
             }
         }
         Ok(())
@@ -604,8 +608,8 @@ mod tests {
         let pane = window.panes.get(&created.pane_id).expect("pane");
         let (rows, cols) = pane.process.screen_size();
 
-        assert_eq!(rows, 27);
-        assert_eq!(cols, 118);
+        assert_eq!(rows, 29);
+        assert_eq!(cols, 120);
     }
 
     #[test]
@@ -616,14 +620,13 @@ mod tests {
                 y: 0,
                 width: 10,
                 height: 5,
-            }
-            .content(),
+            },
             20,
             20,
         )
         .expect("cursor");
 
-        assert_eq!(cursor.row, 2);
-        assert_eq!(cursor.col, 7);
+        assert_eq!(cursor.row, 4);
+        assert_eq!(cursor.col, 9);
     }
 }

@@ -1,6 +1,7 @@
 pub mod cli;
 pub mod client;
 pub mod clipboard;
+pub mod commands;
 pub mod config;
 pub mod copy_mode;
 pub mod input;

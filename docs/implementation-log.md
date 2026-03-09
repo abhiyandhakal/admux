@@ -114,3 +114,28 @@ This document records each completed implementation slice in detail, including t
   - pane list showed panes `1` and `2` in window `1`
   - `created work:2 pane 3`
   - window list showed window `1` and active window `2 logs`
+
+## Prompt and chooser slice
+
+- Goal: realign the interactive UI toward tmux by removing outer pane borders, keeping only internal split separators, adding `Ctrl-b 0..9` window selection, a status-row command prompt on `Ctrl-b :`, and a choose-tree-style session picker on `Ctrl-b s`.
+- Files added: `src/commands.rs`
+- Files changed:
+  - interaction and rendering: `src/client.rs`, `src/input.rs`, `src/render.rs`
+  - runtime and protocol: `src/ipc.rs`, `src/server.rs`, `src/session.rs`, `src/lib.rs`, `Cargo.toml`
+  - docs: `README.md`, `docs/detailed-status.md`
+- Verification:
+  - `cargo build`
+  - `cargo test`
+  - direct binary smoke:
+    - `target/debug/admux new -d --name smoke-session`
+    - `target/debug/admux split-pane --vertical smoke-session`
+    - `target/debug/admux new-window smoke-session --name logs`
+    - `target/debug/admux list-windows smoke-session`
+    - `target/debug/admux list-panes smoke-session`
+    - `target/debug/admux kill smoke-session`
+- Observed output:
+  - second window creation succeeded without outer pane borders in the normal renderer
+  - `list-windows` showed `1 shell` and active `2 logs`
+  - `list-panes` showed the active pane in the new window
+- Commit: pending current worktree
+- Status: complete

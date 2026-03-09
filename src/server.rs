@@ -156,8 +156,7 @@ impl SessionStore {
                 let window_id = self.next_window();
                 let pane_id = self.next_pane();
                 match self.sessions.get_mut(&session) {
-                Some(session) => {
-                    match session.new_window(window_id, pane_id, name, &command) {
+                    Some(session) => match session.new_window(window_id, pane_id, name, &command) {
                         Ok(created) => CommandResponse::WindowCreated {
                             session: session.name.clone(),
                             window_id: created.window_id.0,
@@ -166,45 +165,54 @@ impl SessionStore {
                         Err(error) => CommandResponse::Error {
                             message: error.to_string(),
                         },
-                    }
+                    },
+                    None => CommandResponse::Error {
+                        message: format!("unknown session {session}"),
+                    },
                 }
-                None => CommandResponse::Error {
-                    message: format!("unknown session {session}"),
-                },
             }
-            },
             CommandRequest::SelectPane { target, direction } => self.select_pane(target, direction),
             CommandRequest::SelectWindow { target } => match parse_target(&target) {
                 Ok(target) => self.select_window(target),
                 Err(message) => CommandResponse::Error { message },
             },
-            CommandRequest::CycleWindow { session, direction } => match self.sessions.get_mut(&session) {
-                Some(session) => match session.cycle_window(matches!(direction, CycleDirection::Next)) {
-                    Ok(_) => CommandResponse::FocusChanged,
-                    Err(error) => CommandResponse::Error {
-                        message: error.to_string(),
+            CommandRequest::CycleWindow { session, direction } => {
+                match self.sessions.get_mut(&session) {
+                    Some(session) => {
+                        match session.cycle_window(matches!(direction, CycleDirection::Next)) {
+                            Ok(_) => CommandResponse::FocusChanged,
+                            Err(error) => CommandResponse::Error {
+                                message: error.to_string(),
+                            },
+                        }
+                    }
+                    None => CommandResponse::Error {
+                        message: format!("unknown session {session}"),
                     },
-                },
-                None => CommandResponse::Error {
-                    message: format!("unknown session {session}"),
-                },
-            },
+                }
+            }
             CommandRequest::ResizePane {
                 target,
                 direction,
                 amount,
             } => match parse_target(&target) {
                 Ok(target) => match self.sessions.get_mut(&target.session) {
-                    Some(session) => match session.resize_active_pane(target.window, direction, amount) {
-                        Ok(_) => CommandResponse::Resized,
-                        Err(error) => CommandResponse::Error {
-                            message: error.to_string(),
-                        },
-                    },
+                    Some(session) => {
+                        match session.resize_active_pane(target.window, direction, amount) {
+                            Ok(_) => CommandResponse::Resized,
+                            Err(error) => CommandResponse::Error {
+                                message: error.to_string(),
+                            },
+                        }
+                    }
                     None => CommandResponse::Error {
                         message: format!("unknown session {}", target.session),
                     },
                 },
+                Err(message) => CommandResponse::Error { message },
+            },
+            CommandRequest::RenameWindow { target, name } => match parse_target(&target) {
+                Ok(target) => self.rename_window(target, name),
                 Err(message) => CommandResponse::Error { message },
             },
             CommandRequest::MouseScroll {
@@ -216,7 +224,12 @@ impl SessionStore {
                 Some(session) => {
                     let pane_id = session
                         .render_snapshot(session.pane_area())
-                        .and_then(|snapshot| snapshot.panes.into_iter().find(|pane| pane.rect.contains(row, col)))
+                        .and_then(|snapshot| {
+                            snapshot
+                                .panes
+                                .into_iter()
+                                .find(|pane| pane.rect.contains(row, col))
+                        })
                         .map(|pane| PaneId(pane.pane_id));
                     match session.handle_mouse_scroll(pane_id, direction, row, col) {
                         Ok(_) => CommandResponse::Scrolled,
@@ -281,7 +294,9 @@ impl SessionStore {
 
     fn prune_dead_sessions(&mut self) {
         self.sessions.retain(|_, session| session.prune_dead());
-        if let Some(last) = self.last_session.as_ref() && !self.sessions.contains_key(last) {
+        if let Some(last) = self.last_session.as_ref()
+            && !self.sessions.contains_key(last)
+        {
             self.last_session = self.sessions.keys().next_back().cloned();
         }
     }
@@ -457,6 +472,29 @@ impl SessionStore {
             },
         }
     }
+
+    fn rename_window(&mut self, target: TargetRef, name: String) -> CommandResponse {
+        match self.sessions.get_mut(&target.session) {
+            Some(session) => {
+                if let Some(window_id) = target.window {
+                    if let Err(error) = session.select_window(window_id) {
+                        return CommandResponse::Error {
+                            message: error.to_string(),
+                        };
+                    }
+                }
+                match session.rename_active_window(name) {
+                    Ok(_) => CommandResponse::FocusChanged,
+                    Err(error) => CommandResponse::Error {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            None => CommandResponse::Error {
+                message: format!("unknown session {}", target.session),
+            },
+        }
+    }
 }
 
 pub fn serve(socket_path: &Path) -> Result<()> {
@@ -620,5 +658,35 @@ mod tests {
                 ..
             } if session == "work" && preview.contains("attached")
         ));
+    }
+
+    #[test]
+    fn rename_window_updates_active_window_name() {
+        let mut store = SessionStore::default();
+        let _ = store.handle(CommandRequest::NewSession {
+            name: Some("work".into()),
+            cwd: None,
+            command: vec!["sh".into()],
+        });
+
+        let response = store.handle(CommandRequest::RenameWindow {
+            target: "work:1".into(),
+            name: "editor".into(),
+        });
+
+        assert_eq!(response, CommandResponse::FocusChanged);
+        assert_eq!(
+            store.handle(CommandRequest::ListWindows {
+                session: "work".into(),
+            }),
+            CommandResponse::WindowList {
+                windows: vec![crate::window::WindowSummary {
+                    id: 1,
+                    index: 0,
+                    name: "editor".into(),
+                    active: true,
+                }]
+            }
+        );
     }
 }

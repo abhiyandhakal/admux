@@ -10,7 +10,6 @@ use crossterm::{
 use crate::{
     copy_mode::Selection,
     ipc::{PaneRender, RenderSnapshot},
-    pane::Rect,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,11 +18,39 @@ pub struct TerminalSize {
     pub height: u16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneSelection {
+    pub pane_id: u64,
+    pub selection: Selection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BottomBar<'a> {
+    Status {
+        message: Option<&'a str>,
+    },
+    Prompt {
+        buffer: &'a str,
+        completions: &'a [String],
+        selected: usize,
+        cursor: usize,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeLine {
+    pub depth: usize,
+    pub label: String,
+    pub selected: bool,
+    pub expanded: bool,
+    pub has_children: bool,
+}
+
 pub fn render_session<W: Write>(
     out: &mut W,
     session: &str,
     snapshot: &RenderSnapshot,
-    status_message: Option<&str>,
+    bottom_bar: BottomBar<'_>,
     selection: Option<PaneSelection>,
     size: TerminalSize,
 ) -> std::io::Result<()> {
@@ -32,113 +59,212 @@ pub fn render_session<W: Write>(
     for pane in &snapshot.panes {
         render_pane(out, pane)?;
     }
+    render_split_separators(out, snapshot)?;
     if let Some(selection) = selection {
         render_selection_overlay(out, snapshot, selection)?;
     }
-    render_statusline(out, session, snapshot, status_message, size)?;
-    render_cursor(out, snapshot)?;
+    let prompt_cursor = render_bottom_bar(out, session, snapshot, bottom_bar, size)?;
+    if let Some(col) = prompt_cursor {
+        queue!(out, Show, MoveTo(col, size.height.saturating_sub(1)))?;
+    } else {
+        render_cursor(out, snapshot)?;
+    }
     out.flush()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PaneSelection {
-    pub pane_id: u64,
-    pub selection: Selection,
+pub fn render_choose_tree<W: Write>(
+    out: &mut W,
+    session: &str,
+    snapshot: &RenderSnapshot,
+    lines: &[TreeLine],
+    preview_title: &str,
+    preview_rows: &[String],
+    size: TerminalSize,
+) -> std::io::Result<()> {
+    queue!(out, Clear(ClearType::All), MoveTo(0, 0))?;
+
+    let tree_width = (size.width / 3).max(24);
+    let preview_x = tree_width.saturating_add(1);
+    let preview_width = size.width.saturating_sub(preview_x);
+    let body_height = size.height.saturating_sub(1);
+
+    for (index, line) in lines.iter().enumerate() {
+        if index as u16 >= body_height {
+            break;
+        }
+        let row = index as u16;
+        let prefix = if line.has_children {
+            if line.expanded { "-" } else { "+" }
+        } else {
+            " "
+        };
+        let marker = if line.selected { ">" } else { " " };
+        let content = format!(
+            "{}{}{} {}",
+            marker,
+            "  ".repeat(line.depth),
+            prefix,
+            line.label
+        );
+        queue!(out, MoveTo(0, row), Print(fit_width(&content, tree_width)))?;
+    }
+
+    for row in 0..body_height {
+        queue!(out, MoveTo(tree_width, row), Print(':'))?;
+    }
+
+    queue!(
+        out,
+        MoveTo(preview_x, 0),
+        Print(fit_width(preview_title, preview_width))
+    )?;
+    for (index, row) in preview_rows.iter().enumerate() {
+        let target_row = index as u16 + 1;
+        if target_row >= body_height {
+            break;
+        }
+        queue!(
+            out,
+            MoveTo(preview_x, target_row),
+            Print(truncate(row, preview_width))
+        )?;
+    }
+
+    render_bottom_bar(
+        out,
+        session,
+        snapshot,
+        BottomBar::Status {
+            message: Some("choose-tree | Enter select | q cancel"),
+        },
+        size,
+    )?;
+    out.flush()
 }
 
 fn render_pane<W: Write>(out: &mut W, pane: &PaneRender) -> std::io::Result<()> {
-    let border = if pane.focused { '#' } else { '|' };
-    let horizontal = if pane.focused { '=' } else { '-' };
-    draw_box(out, pane.rect, border, horizontal, &pane.title)?;
-    let content = pane.rect.content();
     for (offset, row) in pane.rows_formatted.iter().enumerate() {
-        if offset as u16 >= content.height {
+        if offset as u16 >= pane.rect.height {
             break;
         }
-        queue!(out, MoveTo(content.x, content.y + offset as u16))?;
+        queue!(out, MoveTo(pane.rect.x, pane.rect.y + offset as u16))?;
         out.write_all(row.as_bytes())?;
     }
     Ok(())
 }
 
-fn draw_box<W: Write>(
+fn render_split_separators<W: Write>(
     out: &mut W,
-    rect: Rect,
-    border: char,
-    horizontal: char,
-    title: &str,
+    snapshot: &RenderSnapshot,
 ) -> std::io::Result<()> {
-    if rect.width < 2 || rect.height < 2 {
-        return Ok(());
+    let panes = &snapshot.panes;
+    let mut vertical = Vec::new();
+    let mut horizontal = Vec::new();
+
+    for left in panes {
+        for right in panes {
+            if left.pane_id == right.pane_id {
+                continue;
+            }
+            if left.rect.x + left.rect.width + 1 == right.rect.x {
+                let start = left.rect.y.max(right.rect.y);
+                let end = (left.rect.y + left.rect.height).min(right.rect.y + right.rect.height);
+                for row in start..end {
+                    vertical.push((left.rect.x + left.rect.width, row));
+                }
+            }
+            if left.rect.y + left.rect.height + 1 == right.rect.y {
+                let start = left.rect.x.max(right.rect.x);
+                let end = (left.rect.x + left.rect.width).min(right.rect.x + right.rect.width);
+                for col in start..end {
+                    horizontal.push((col, left.rect.y + left.rect.height));
+                }
+            }
+        }
     }
 
-    let top = format!(
-        "{border}{}{border}",
-        fit_center(title, rect.width.saturating_sub(2), horizontal)
-    );
-    let bottom = format!("{border}{}{border}", horizontal.to_string().repeat(rect.width.saturating_sub(2) as usize));
-    queue!(out, MoveTo(rect.x, rect.y), Print(top))?;
-    for row in rect.y.saturating_add(1)..rect.y.saturating_add(rect.height.saturating_sub(1)) {
-        queue!(
-            out,
-            MoveTo(rect.x, row),
-            Print(border),
-            MoveTo(rect.x + rect.width.saturating_sub(1), row),
-            Print(border)
-        )?;
+    for (x, y) in &vertical {
+        let ch = if horizontal.iter().any(|(hx, hy)| hx == x && hy == y) {
+            '+'
+        } else {
+            ':'
+        };
+        queue!(out, MoveTo(*x, *y), Print(ch))?;
     }
-    queue!(
-        out,
-        MoveTo(rect.x, rect.y + rect.height.saturating_sub(1)),
-        Print(bottom)
-    )?;
+    for (x, y) in &horizontal {
+        if !vertical.iter().any(|(vx, vy)| vx == x && vy == y) {
+            queue!(out, MoveTo(*x, *y), Print('-'))?;
+        }
+    }
     Ok(())
 }
 
-fn render_statusline<W: Write>(
+fn render_bottom_bar<W: Write>(
     out: &mut W,
     session: &str,
     snapshot: &RenderSnapshot,
-    status_message: Option<&str>,
+    bottom_bar: BottomBar<'_>,
     size: TerminalSize,
-) -> std::io::Result<()> {
-    let left = format!(" admux | {session} | ");
-    let windows = snapshot
-        .windows
-        .iter()
-        .map(|window| {
-            if window.active {
-                format!("[{}:{}]", window.index, window.name)
-            } else {
-                format!(" {}:{} ", window.index, window.name)
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("");
-    let right = match status_message {
-        Some(message) => format!(" {message} "),
-        None => format!(" pane {} | Ctrl-b d ", snapshot.active_pane_id),
+) -> std::io::Result<Option<u16>> {
+    let content = match bottom_bar {
+        BottomBar::Status { message } => {
+            let left = format!(" admux | {session} | ");
+            let windows = snapshot
+                .windows
+                .iter()
+                .map(|window| {
+                    if window.active {
+                        format!("[{}:{}]", window.index, window.name)
+                    } else {
+                        format!(" {}:{} ", window.index, window.name)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            let right = match message {
+                Some(message) => format!(" {message} "),
+                None => format!(" pane {} | Ctrl-b d ", snapshot.active_pane_id),
+            };
+            fit_status_segments(&left, &windows, &right, size.width)
+        }
+        BottomBar::Prompt {
+            buffer,
+            completions,
+            selected,
+            cursor,
+        } => {
+            let line = render_prompt_line(buffer, completions, selected, size.width);
+            queue!(
+                out,
+                MoveTo(0, size.height.saturating_sub(1)),
+                SetAttribute(Attribute::Reverse),
+                Print(line),
+                SetAttribute(Attribute::Reset)
+            )?;
+            return Ok(Some(
+                (1 + cursor).min(size.width.saturating_sub(1) as usize) as u16,
+            ));
+        }
     };
-    let status = fit_status_segments(&left, &windows, &right, size.width);
+
     queue!(
         out,
         MoveTo(0, size.height.saturating_sub(1)),
         SetAttribute(Attribute::Reverse),
-        Print(status),
+        Print(content),
         SetAttribute(Attribute::Reset)
     )?;
-    Ok(())
+    Ok(None)
 }
 
 fn render_cursor<W: Write>(out: &mut W, snapshot: &RenderSnapshot) -> std::io::Result<()> {
     if let Some(pane) = snapshot.panes.iter().find(|pane| pane.focused)
         && let Some(cursor) = &pane.cursor
     {
-        let content = pane.rect.content();
         queue!(
             out,
             Show,
-            MoveTo(content.x + cursor.col, content.y + cursor.row)
+            MoveTo(pane.rect.x + cursor.col, pane.rect.y + cursor.row)
         )?;
     }
     Ok(())
@@ -149,13 +275,16 @@ fn render_selection_overlay<W: Write>(
     snapshot: &RenderSnapshot,
     selection: PaneSelection,
 ) -> std::io::Result<()> {
-    let Some(pane) = snapshot.panes.iter().find(|pane| pane.pane_id == selection.pane_id) else {
+    let Some(pane) = snapshot
+        .panes
+        .iter()
+        .find(|pane| pane.pane_id == selection.pane_id)
+    else {
         return Ok(());
     };
-    let content = pane.rect.content();
     let selection = selection.selection.normalized();
     for row in selection.start_row..=selection.end_row {
-        if row >= content.height {
+        if row >= pane.rect.height {
             break;
         }
         let line = pane.rows_plain.get(row as usize);
@@ -167,15 +296,15 @@ fn render_selection_overlay<W: Write>(
         let end_col = if row == selection.end_row {
             selection.end_col
         } else {
-            content.width.saturating_sub(1)
+            pane.rect.width.saturating_sub(1)
         };
-        for col in start_col..=end_col.min(content.width.saturating_sub(1)) {
+        for col in start_col..=end_col.min(pane.rect.width.saturating_sub(1)) {
             let ch = line
                 .and_then(|line| line.chars().nth(col as usize))
                 .unwrap_or(' ');
             queue!(
                 out,
-                MoveTo(content.x + col, content.y + row),
+                MoveTo(pane.rect.x + col, pane.rect.y + row),
                 SetAttribute(Attribute::Reverse),
                 Print(ch)
             )?;
@@ -202,26 +331,45 @@ fn fit_status_segments(left: &str, center: &str, right: &str, width: u16) -> Str
     status.chars().take(width).collect()
 }
 
-fn fit_center(title: &str, width: u16, fill: char) -> String {
-    let title = title.chars().take(width as usize).collect::<String>();
-    if title.chars().count() >= width as usize {
-        return title;
+fn render_prompt_line(buffer: &str, completions: &[String], selected: usize, width: u16) -> String {
+    let mut line = format!(":{}", buffer);
+    if !completions.is_empty() {
+        let rendered = completions
+            .iter()
+            .enumerate()
+            .map(|(index, completion)| {
+                if index == selected {
+                    format!("[{completion}]")
+                } else {
+                    completion.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        line.push(' ');
+        line.push_str(&rendered);
     }
-    let padding = width as usize - title.chars().count();
-    let left = padding / 2;
-    let right = padding - left;
-    format!(
-        "{}{}{}",
-        fill.to_string().repeat(left),
-        title,
-        fill.to_string().repeat(right)
-    )
+    fit_width(&line, width)
+}
+
+fn fit_width(value: &str, width: u16) -> String {
+    let mut fitted: String = value.chars().take(width as usize).collect();
+    let current = fitted.chars().count();
+    if current < width as usize {
+        fitted.push_str(&" ".repeat(width as usize - current));
+    }
+    fitted
+}
+
+fn truncate(value: &str, width: u16) -> String {
+    value.chars().take(width as usize).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ipc::{PaneCursor, PaneRender, RenderSnapshot};
+    use crate::pane::Rect;
     use crate::window::WindowSummary;
 
     fn sample_snapshot() -> RenderSnapshot {
@@ -258,7 +406,9 @@ mod tests {
             &mut buf,
             "work",
             &sample_snapshot(),
-            Some("copied 5 chars"),
+            BottomBar::Status {
+                message: Some("copied 5 chars"),
+            },
             None,
             TerminalSize {
                 width: 40,
@@ -281,7 +431,7 @@ mod tests {
             &mut buf,
             "work",
             &sample_snapshot(),
-            None,
+            BottomBar::Status { message: None },
             Some(PaneSelection {
                 pane_id: 1,
                 selection: Selection::new(0, 1, 0, 3),
@@ -295,12 +445,50 @@ mod tests {
         let rendered = String::from_utf8_lossy(&buf);
 
         assert!(rendered.contains("\u{1b}[7m"));
-        assert!(rendered.contains("\u{1b}[2;3H"));
+        assert!(rendered.contains("\u{1b}[1;2H"));
     }
 
     #[test]
-    fn status_line_pads_to_terminal_width() {
-        let status = fit_status_segments("left", "center", "right", 20);
-        assert_eq!(status.chars().count(), 20);
+    fn render_uses_only_internal_separators() {
+        let mut snapshot = sample_snapshot();
+        snapshot.panes.push(PaneRender {
+            pane_id: 2,
+            title: "right".into(),
+            rect: Rect {
+                x: 11,
+                y: 0,
+                width: 10,
+                height: 4,
+            },
+            focused: false,
+            rows_formatted: vec!["world".into()],
+            rows_plain: vec!["world".into()],
+            cursor: None,
+        });
+        let mut buf = Vec::new();
+        render_session(
+            &mut buf,
+            "work",
+            &snapshot,
+            BottomBar::Status { message: None },
+            None,
+            TerminalSize {
+                width: 40,
+                height: 8,
+            },
+        )
+        .expect("render session");
+        let rendered = String::from_utf8_lossy(&buf);
+
+        assert!(rendered.contains(":"));
+        assert!(!rendered.contains("#"));
+        assert!(!rendered.contains("="));
+    }
+
+    #[test]
+    fn prompt_line_includes_completion_list() {
+        let completions = vec!["split-window".to_string(), "switch-client".to_string()];
+        let line = render_prompt_line("sp", &completions, 0, 40);
+        assert!(line.contains(":sp [split-window] switch-client"));
     }
 }

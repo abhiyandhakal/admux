@@ -11,7 +11,7 @@ The repository currently contains a working foundation with:
 - PTY-backed pane and window processes
 - ratio-based split layouts
 - VT100-backed screen parsing and clipped pane rendering
-- a `crossterm` interactive attach loop with pane borders, a rich status line, and tmux-style leader keys
+- a `crossterm` interactive attach loop with split separators, a status-row command prompt, a choose-tree session view, and tmux-style leader keys
 
 ## Current scope
 
@@ -21,18 +21,23 @@ Implemented now:
 - split panes horizontally and vertically
 - create, list, cycle, and select windows
 - list panes within the active window
+- rename the active window from the interactive prompt
 - daemon autostart from `admux`
 - session state stored in the daemon
 - PTY-backed command execution per pane
-- multi-pane `crossterm` rendering with borders and per-pane cursors
+- multi-pane `crossterm` rendering with internal split separators and per-pane cursors
 - leader-key commands for split, window navigation, pane focus, pane resize, and detach
+- `Ctrl-b 0` through `Ctrl-b 9` for window index selection
+- `Ctrl-b :` for a tmux-style status-row command prompt with command completion
+- `Ctrl-b s` for a choose-tree-style session/window/pane picker with previews
 - mouse focus, drag-selection copy, wheel scroll, and border resize
 - unit, integration, and binary smoke coverage
 
 Not finished yet:
 
-- rename-window command and help overlay
+- help overlay
 - copy-mode UI beyond drag-selection
+- choose-tree search and expand-all/collapse-all shortcuts
 - restart recovery or persistent session metadata
 
 ## Build and run
@@ -54,6 +59,15 @@ cargo run --bin admux -- list-windows work
 cargo run --bin admux -- attach work
 cargo run --bin admux -- kill work
 ```
+
+Interactive defaults:
+
+- `Ctrl-b %` vertical split
+- `Ctrl-b "` horizontal split
+- `Ctrl-b 0` through `Ctrl-b 9` select windows by index
+- `Ctrl-b :` open the command prompt
+- `Ctrl-b s` open the session chooser
+- `Ctrl-b d` detach
 
 Run the daemon explicitly:
 
@@ -88,7 +102,7 @@ The repository is developed in small TDD-oriented slices. Current verification i
 
 - `cargo test`
 - integration tests that execute `admux` and `admuxd`
-- a direct shell-level smoke flow recorded in [`docs/implementation-log.md`](/home/abhiyan/coding/projects/admux/docs/implementation-log.md)
+- a direct shell-level smoke flow covering session creation, pane splits, and window creation recorded in [`docs/implementation-log.md`](/home/abhiyan/coding/projects/admux/docs/implementation-log.md)
 
 ## More detail
 
