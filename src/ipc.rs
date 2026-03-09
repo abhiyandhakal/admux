@@ -47,6 +47,7 @@ pub enum CommandResponse {
     Attached {
         session: String,
         preview: String,
+        #[serde(default)]
         formatted_preview: String,
     },
     SessionList {
@@ -82,5 +83,21 @@ mod tests {
     #[test]
     fn protocol_version_is_non_zero() {
         assert!(CURRENT_PROTOCOL_VERSION.0 > 0);
+    }
+
+    #[test]
+    fn attached_response_accepts_older_payload_without_formatted_preview() {
+        let payload = br#"{"Attached":{"session":"work","preview":"plain output"}}"#;
+        let decoded: CommandResponse =
+            serde_json::from_slice(payload).expect("decode legacy attached response");
+
+        assert_eq!(
+            decoded,
+            CommandResponse::Attached {
+                session: "work".into(),
+                preview: "plain output".into(),
+                formatted_preview: String::new(),
+            }
+        );
     }
 }
