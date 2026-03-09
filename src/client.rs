@@ -228,8 +228,16 @@ fn run_attach_loop(paths: &RuntimePaths, session: &str, stdout: &mut impl Write)
         )?;
         let formatted_preview = match response {
             CommandResponse::Attached {
-                formatted_preview, ..
-            } => formatted_preview,
+                preview,
+                formatted_preview,
+                ..
+            } => {
+                if formatted_preview.is_empty() {
+                    preview
+                } else {
+                    formatted_preview
+                }
+            }
             CommandResponse::Error { message } => return Err(anyhow!(message)),
             other => return Err(anyhow!("unexpected attach response: {other:?}")),
         };
