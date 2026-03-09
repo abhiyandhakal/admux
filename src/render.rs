@@ -39,15 +39,20 @@ pub fn render_session<W: Write>(
         out,
         MoveTo(0, status_row),
         SetAttribute(Attribute::Reverse),
-        Print(truncate(&status, size.width)),
+        Print(fit_width(&status, size.width)),
         SetAttribute(Attribute::Reset)
     )?;
     out.write_all(formatted_cursor.as_bytes())?;
     out.flush()
 }
 
-fn truncate(value: &str, width: u16) -> String {
-    value.chars().take(width as usize).collect()
+fn fit_width(value: &str, width: u16) -> String {
+    let mut fitted: String = value.chars().take(width as usize).collect();
+    let current_width = fitted.chars().count();
+    if current_width < width as usize {
+        fitted.push_str(&" ".repeat(width as usize - current_width));
+    }
+    fitted
 }
 
 fn render_selection_overlay<W: Write>(
@@ -146,5 +151,13 @@ mod tests {
         assert!(rendered.contains("\u{1b}[7m"));
         assert!(rendered.contains("\u{1b}[1;2H"));
         assert!(rendered.contains("\u{1b}[1;4H"));
+    }
+
+    #[test]
+    fn render_pads_status_line_to_terminal_width() {
+        let fitted = fit_width("status", 10);
+
+        assert_eq!(fitted, "status    ");
+        assert_eq!(fitted.chars().count(), 10);
     }
 }
