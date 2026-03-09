@@ -232,6 +232,7 @@ fn run_attach_loop(paths: &RuntimePaths, session: &str, stdout: &mut impl Write)
     let mut state = InputState::default();
     let mut last_size = (0, 0);
     let mut selection_anchor: Option<(u16, u16)> = None;
+    let mut active_selection: Option<Selection> = None;
     let mut status_message: Option<String> = None;
 
     loop {
@@ -256,7 +257,7 @@ fn run_attach_loop(paths: &RuntimePaths, session: &str, stdout: &mut impl Write)
                 session: Some(session.to_string()),
             },
         )?;
-        let (formatted_preview, formatted_cursor) = match response {
+        let (preview, formatted_preview, formatted_cursor) = match response {
             CommandResponse::Attached {
                 preview,
                 formatted_preview,
@@ -264,9 +265,9 @@ fn run_attach_loop(paths: &RuntimePaths, session: &str, stdout: &mut impl Write)
                 ..
             } => {
                 if formatted_preview.is_empty() {
-                    (preview, String::new())
+                    (preview.clone(), preview, String::new())
                 } else {
-                    (formatted_preview, formatted_cursor)
+                    (preview, formatted_preview, formatted_cursor)
                 }
             }
             CommandResponse::Error { message } => return Err(anyhow!(message)),
@@ -276,9 +277,11 @@ fn run_attach_loop(paths: &RuntimePaths, session: &str, stdout: &mut impl Write)
         render_session(
             stdout,
             session,
+            &preview,
             &formatted_preview,
             &formatted_cursor,
             status_message.as_deref(),
+            active_selection,
             TerminalSize { width, height },
         )
         .context("failed to render session")?;
@@ -303,8 +306,21 @@ fn run_attach_loop(paths: &RuntimePaths, session: &str, stdout: &mut impl Write)
                 Event::Mouse(mouse) => match mouse.kind {
                     MouseEventKind::Down(MouseButton::Left) if mouse.row < rows => {
                         selection_anchor = Some((mouse.row, mouse.column));
+                        active_selection = Some(Selection::new(
+                            mouse.row,
+                            mouse.column,
+                            mouse.row,
+                            mouse.column,
+                        ));
                     }
-                    MouseEventKind::Drag(MouseButton::Left) if mouse.row < rows => {}
+                    MouseEventKind::Drag(MouseButton::Left) if mouse.row < rows => {
+                        if let Some((start_row, start_col)) = selection_anchor {
+                            active_selection = Some(
+                                Selection::new(start_row, start_col, mouse.row, mouse.column)
+                                    .normalized(),
+                            );
+                        }
+                    }
                     MouseEventKind::Up(MouseButton::Left) if mouse.row < rows => {
                         if let Some((start_row, start_col)) = selection_anchor.take() {
                             let selection =
@@ -340,6 +356,7 @@ fn run_attach_loop(paths: &RuntimePaths, session: &str, stdout: &mut impl Write)
                                 }
                             }
                         }
+                        active_selection = None;
                     }
                     MouseEventKind::ScrollUp => {
                         let _ = request_response(
