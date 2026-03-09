@@ -36,6 +36,7 @@ fn daemon_backed_cli_can_manage_sessions() {
         .env("ADMUX_CONFIG", &config)
         .args([
             "new",
+            "-d",
             "--name",
             "work",
             "--",

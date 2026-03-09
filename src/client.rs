@@ -27,12 +27,35 @@ pub fn run_from_env() -> Result<()> {
 }
 
 pub fn run(cli: AdmuxCli) -> Result<()> {
+    let paths = RuntimePaths::resolve();
     let request = match cli.command {
-        ClientCommand::New(args) => CommandRequest::NewSession {
-            name: args.name,
-            cwd: args.cwd,
-            command: args.command,
-        },
+        ClientCommand::New(args) => {
+            let requested_name = args.name.clone();
+            let response = request_response(
+                &paths,
+                CommandRequest::NewSession {
+                    name: args.name,
+                    cwd: args.cwd,
+                    command: args.command,
+                },
+            )?;
+            let created_session = match &response {
+                CommandResponse::SessionCreated { session, .. } => Some(session.clone()),
+                _ => None,
+            };
+            print_response(&paths, response)?;
+
+            if !args.detach
+                && io::stdout().is_terminal()
+                && std::env::var_os("ADMUX_NONINTERACTIVE").is_none()
+            {
+                let session = created_session.or(requested_name).ok_or_else(|| {
+                    anyhow!("new session response did not include a session name")
+                })?;
+                attach_interactive(&paths, &session)?;
+            }
+            return Ok(());
+        }
         ClientCommand::Attach(args) => CommandRequest::Attach {
             session: args.session,
         },
@@ -47,7 +70,6 @@ pub fn run(cli: AdmuxCli) -> Result<()> {
         ClientCommand::ReloadConfig => CommandRequest::ReloadConfig,
     };
 
-    let paths = RuntimePaths::resolve();
     let response = request_response(&paths, request)?;
     print_response(&paths, response)
 }

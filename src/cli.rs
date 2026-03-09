@@ -20,6 +20,8 @@ pub enum ClientCommand {
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
 pub struct NewArgs {
+    #[arg(short = 'd', long)]
+    pub detach: bool,
     #[arg(long)]
     pub name: Option<String>,
     #[arg(long)]
@@ -74,6 +76,7 @@ mod tests {
         assert_eq!(
             cli.command,
             ClientCommand::New(NewArgs {
+                detach: false,
                 name: Some("work".into()),
                 cwd: None,
                 command: vec!["bash".into()],

@@ -36,7 +36,7 @@ impl PaneProcess {
         if let Some(cwd) = cwd {
             builder.cwd(cwd);
         }
-        builder.env("TERM", "xterm-256color");
+        builder.env("TERM", "screen-256color");
 
         let child = pair
             .slave
