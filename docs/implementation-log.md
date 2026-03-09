@@ -12,3 +12,20 @@ This document records each completed implementation slice in detail, including t
   - `cargo test`
   - `cargo run --bin admux -- --help`
 - Status: complete
+
+## Slice 1 correction
+
+- Goal: stop tracking Cargo build artifacts and add a repository ignore rule.
+- Files added: `.gitignore`
+- Verification: git index cleanup and follow-up commit
+- Status: complete
+
+## Slice 2
+
+- Goal: add real TOML config handling, runtime path resolution, and typed IPC request/response models.
+- Files changed: `Cargo.toml`, `src/config.rs`, `src/ipc.rs`, `src/paths.rs`
+- Verification:
+  - `cargo fmt`
+  - `cargo test`
+  - `cargo run --bin admux -- --help`
+- Status: complete
