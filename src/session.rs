@@ -72,6 +72,13 @@ impl Session {
         Ok(())
     }
 
+    pub fn resize(&self, rows: u16, cols: u16) -> Result<()> {
+        if let Some(pane) = self.panes.get(&self.layout.active) {
+            pane.process.resize(rows, cols)?;
+        }
+        Ok(())
+    }
+
     pub fn kill(self) -> Result<()> {
         for pane in self.panes.into_values() {
             pane.process.kill()?;

@@ -77,3 +77,16 @@ This document records each completed implementation slice in detail, including t
   - `created demo pane 1`
   - `attached demo`
   - `demo-ok`
+
+## Post-review terminal fix
+
+- Goal: replace raw PTY text buffering with VT100 screen parsing and forward control-key input such as `Ctrl-l`.
+- Files changed: `Cargo.toml`, `src/client.rs`, `src/input.rs`, `src/ipc.rs`, `src/pty.rs`, `src/server.rs`, `src/session.rs`, `README.md`, `docs/detailed-status.md`
+- Verification:
+  - `cargo fmt`
+  - `cargo test`
+  - direct binary smoke with `printf '\\033[2J\\033[Hafter'` followed by `admux attach`
+- Observed output:
+  - `created demo pane 1`
+  - `attached demo`
+  - `after`

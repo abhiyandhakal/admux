@@ -9,6 +9,7 @@ The repository currently contains a working foundation with:
 - TOML config loading from `~/.config/admux/config.toml`
 - Unix socket client/daemon IPC
 - PTY-backed pane processes
+- VT100-backed screen parsing for PTY output
 - non-interactive attach previews
 - a `crossterm` interactive attach loop with a status line and `Ctrl-b d` detach
 
@@ -20,6 +21,7 @@ Implemented now:
 - daemon autostart from `admux`
 - session state stored in the daemon
 - PTY-backed command execution per session
+- VT-style screen updates interpreted before rendering
 - custom `crossterm` rendering for interactive attach
 - leader-key input state and detach handling
 - unit, integration, and binary smoke coverage

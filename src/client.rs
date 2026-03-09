@@ -171,6 +171,7 @@ fn print_response(paths: &RuntimePaths, response: CommandResponse) -> Result<()>
         CommandResponse::KeysSent => {
             println!("keys sent");
         }
+        CommandResponse::Resized => {}
         CommandResponse::ConfigReloaded => {
             println!("config reloaded");
         }
@@ -193,7 +194,24 @@ fn attach_interactive(paths: &RuntimePaths, session: &str) -> Result<()> {
 
 fn run_attach_loop(paths: &RuntimePaths, session: &str, stdout: &mut impl Write) -> Result<()> {
     let mut state = InputState::default();
+    let mut last_size = (0, 0);
+
     loop {
+        let (width, height) = terminal::size().context("failed to read terminal size")?;
+        let rows = height.saturating_sub(1).max(1);
+        let cols = width.max(1);
+        if last_size != (rows, cols) {
+            let _ = request_response(
+                paths,
+                CommandRequest::Resize {
+                    session: session.to_string(),
+                    rows,
+                    cols,
+                },
+            )?;
+            last_size = (rows, cols);
+        }
+
         let response = request_response(
             paths,
             CommandRequest::Attach {
@@ -206,7 +224,6 @@ fn run_attach_loop(paths: &RuntimePaths, session: &str, stdout: &mut impl Write)
             other => return Err(anyhow!("unexpected attach response: {other:?}")),
         };
 
-        let (width, height) = terminal::size().context("failed to read terminal size")?;
         render_session(stdout, session, &preview, TerminalSize { width, height })
             .context("failed to render session")?;
 

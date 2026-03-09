@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use portable_pty::{Child, CommandBuilder, PtySize, native_pty_system};
+use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::{
     io::{Read, Write},
     path::Path,
@@ -14,8 +14,9 @@ pub enum PtyState {
 }
 
 pub struct PaneProcess {
-    output: Arc<Mutex<String>>,
+    parser: Arc<Mutex<vt100::Parser>>,
     writer: Mutex<Box<dyn Write + Send>>,
+    master: Mutex<Box<dyn MasterPty + Send>>,
     child: Mutex<Box<dyn Child + Send>>,
 }
 
@@ -35,6 +36,7 @@ impl PaneProcess {
         if let Some(cwd) = cwd {
             builder.cwd(cwd);
         }
+        builder.env("TERM", "xterm-256color");
 
         let child = pair
             .slave
@@ -48,18 +50,17 @@ impl PaneProcess {
             .master
             .take_writer()
             .context("failed to acquire PTY writer")?;
-        let output = Arc::new(Mutex::new(String::new()));
-        let captured = Arc::clone(&output);
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 10_000)));
+        let parser_clone = Arc::clone(&parser);
 
         thread::spawn(move || {
-            let mut buf = [0u8; 1024];
+            let mut buf = [0u8; 4096];
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(size) => {
-                        let text = String::from_utf8_lossy(&buf[..size]);
-                        if let Ok(mut output) = captured.lock() {
-                            output.push_str(&text);
+                        if let Ok(mut parser) = parser_clone.lock() {
+                            parser.process(&buf[..size]);
                         }
                     }
                     Err(_) => break,
@@ -68,17 +69,38 @@ impl PaneProcess {
         });
 
         Ok(Self {
-            output,
+            parser,
             writer: Mutex::new(writer),
+            master: Mutex::new(pair.master),
             child: Mutex::new(child),
         })
     }
 
     pub fn preview(&self) -> String {
-        self.output
+        self.parser
             .lock()
-            .expect("pane output lock poisoned")
-            .clone()
+            .expect("pane parser lock poisoned")
+            .screen()
+            .contents()
+    }
+
+    pub fn resize(&self, rows: u16, cols: u16) -> Result<()> {
+        self.master
+            .lock()
+            .expect("pane master lock poisoned")
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .context("failed to resize PTY")?;
+        self.parser
+            .lock()
+            .expect("pane parser lock poisoned")
+            .screen_mut()
+            .set_size(rows, cols);
+        Ok(())
     }
 
     pub fn send_keys(&self, keys: &[String]) -> Result<()> {
@@ -130,5 +152,23 @@ mod tests {
 
         thread::sleep(Duration::from_millis(100));
         assert!(pane.preview().contains("hello from pane"));
+    }
+
+    #[test]
+    fn pane_process_handles_clear_screen_sequences() {
+        let pane = PaneProcess::spawn(
+            &[
+                "sh".into(),
+                "-lc".into(),
+                "printf 'before'; printf '\\033[2J\\033[Hafter'".into(),
+            ],
+            None,
+        )
+        .expect("spawn pane");
+
+        thread::sleep(Duration::from_millis(100));
+        let preview = pane.preview();
+        assert!(preview.contains("after"));
+        assert!(!preview.contains("beforeafter"));
     }
 }

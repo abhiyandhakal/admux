@@ -22,8 +22,10 @@
 
 - session store in the daemon
 - PTY-backed command spawning through `portable-pty`
-- pane output capture for attach previews
+- VT100-backed screen parsing of PTY output
+- pane output capture for attach previews from parsed screen state
 - kill path that terminates pane processes when a session is removed
+- resize path from the client into the active PTY
 
 ### Layout and pane foundations
 
@@ -40,6 +42,9 @@
   - reverse-video status line
   - `Ctrl-b d` detach
   - direct key forwarding to the active PTY
+  - control-key forwarding such as `Ctrl-l`
+  - arrow/home/end/delete forwarding
+  - resize propagation from the current terminal into the active PTY
 
 ### Input and copy-mode foundations
 

@@ -27,6 +27,11 @@ pub enum CommandRequest {
         target: String,
         keys: Vec<String>,
     },
+    Resize {
+        session: String,
+        rows: u16,
+        cols: u16,
+    },
     ReloadConfig,
 }
 
@@ -38,6 +43,7 @@ pub enum CommandResponse {
     SessionList { sessions: Vec<String> },
     SessionKilled { session: String },
     KeysSent,
+    Resized,
     ConfigReloaded,
     Error { message: String },
 }

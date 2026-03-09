@@ -108,6 +108,21 @@ impl SessionStore {
                     },
                 }
             }
+            CommandRequest::Resize {
+                session,
+                rows,
+                cols,
+            } => match self.sessions.get(&session) {
+                Some(session) => match session.resize(rows, cols) {
+                    Ok(_) => CommandResponse::Resized,
+                    Err(error) => CommandResponse::Error {
+                        message: error.to_string(),
+                    },
+                },
+                None => CommandResponse::Error {
+                    message: format!("unknown session {session}"),
+                },
+            },
             CommandRequest::ReloadConfig => CommandResponse::ConfigReloaded,
         }
     }
