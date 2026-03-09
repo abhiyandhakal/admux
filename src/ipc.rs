@@ -27,6 +27,12 @@ pub enum CommandRequest {
         target: String,
         keys: Vec<String>,
     },
+    MouseScroll {
+        session: String,
+        row: u16,
+        col: u16,
+        direction: ScrollDirection,
+    },
     Resize {
         session: String,
         rows: u16,
@@ -59,11 +65,18 @@ pub enum CommandResponse {
         session: String,
     },
     KeysSent,
+    Scrolled,
     Resized,
     ConfigReloaded,
     Error {
         message: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScrollDirection {
+    Up,
+    Down,
 }
 
 #[cfg(test)]

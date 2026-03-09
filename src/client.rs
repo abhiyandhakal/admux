@@ -9,7 +9,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use crossterm::{
     cursor::{Hide, Show},
-    event::{self, Event},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, MouseEventKind},
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -202,6 +202,7 @@ fn print_response(paths: &RuntimePaths, response: CommandResponse) -> Result<()>
         CommandResponse::KeysSent => {
             println!("keys sent");
         }
+        CommandResponse::Scrolled => {}
         CommandResponse::Resized => {}
         CommandResponse::ConfigReloaded => {
             println!("config reloaded");
@@ -214,11 +215,12 @@ fn print_response(paths: &RuntimePaths, response: CommandResponse) -> Result<()>
 fn attach_interactive(paths: &RuntimePaths, session: &str) -> Result<()> {
     let mut stdout = io::stdout();
     terminal::enable_raw_mode().context("failed to enable raw mode")?;
-    execute!(stdout, EnterAlternateScreen, Hide).context("failed to enter alternate screen")?;
+    execute!(stdout, EnterAlternateScreen, Hide, EnableMouseCapture)
+        .context("failed to enter alternate screen")?;
 
     let result = run_attach_loop(paths, session, &mut stdout);
 
-    let _ = execute!(stdout, Show, LeaveAlternateScreen);
+    let _ = execute!(stdout, DisableMouseCapture, Show, LeaveAlternateScreen);
     let _ = terminal::disable_raw_mode();
     result
 }
@@ -291,7 +293,31 @@ fn run_attach_loop(paths: &RuntimePaths, session: &str, stdout: &mut impl Write)
                         )?;
                     }
                 },
-                Event::Mouse(_) => {}
+                Event::Mouse(mouse) => match mouse.kind {
+                    MouseEventKind::ScrollUp => {
+                        let _ = request_response(
+                            paths,
+                            CommandRequest::MouseScroll {
+                                session: session.to_string(),
+                                row: mouse.row,
+                                col: mouse.column,
+                                direction: crate::ipc::ScrollDirection::Up,
+                            },
+                        )?;
+                    }
+                    MouseEventKind::ScrollDown => {
+                        let _ = request_response(
+                            paths,
+                            CommandRequest::MouseScroll {
+                                session: session.to_string(),
+                                row: mouse.row,
+                                col: mouse.column,
+                                direction: crate::ipc::ScrollDirection::Down,
+                            },
+                        )?;
+                    }
+                    _ => {}
+                },
                 Event::Resize(_, _) => {}
                 Event::FocusGained | Event::FocusLost | Event::Paste(_) => {}
             }

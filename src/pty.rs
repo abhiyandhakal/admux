@@ -1,3 +1,4 @@
+use crate::ipc::ScrollDirection;
 use anyhow::{Context, Result};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::{
@@ -120,6 +121,43 @@ impl PaneProcess {
             .expect("pane parser lock poisoned")
             .screen_mut()
             .set_size(rows, cols);
+        Ok(())
+    }
+
+    pub fn handle_mouse_scroll(
+        &self,
+        direction: ScrollDirection,
+        row: u16,
+        col: u16,
+    ) -> Result<()> {
+        let mouse_mode = self
+            .parser
+            .lock()
+            .expect("pane parser lock poisoned")
+            .screen()
+            .mouse_protocol_mode();
+
+        if mouse_mode == vt100::MouseProtocolMode::None {
+            let mut parser = self.parser.lock().expect("pane parser lock poisoned");
+            let current = parser.screen().scrollback();
+            let next = match direction {
+                ScrollDirection::Up => current.saturating_add(3),
+                ScrollDirection::Down => current.saturating_sub(3),
+            };
+            parser.screen_mut().set_scrollback(next);
+            return Ok(());
+        }
+
+        let code = match direction {
+            ScrollDirection::Up => 64,
+            ScrollDirection::Down => 65,
+        };
+        let sgr = format!("\x1b[<{};{};{}M", code, col + 1, row + 1);
+        let mut writer = self.writer.lock().expect("pane writer lock poisoned");
+        writer
+            .write_all(sgr.as_bytes())
+            .context("failed to write mouse scroll bytes")?;
+        writer.flush().context("failed to flush PTY writer")?;
         Ok(())
     }
 

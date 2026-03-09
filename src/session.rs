@@ -1,4 +1,5 @@
 use crate::{
+    ipc::ScrollDirection,
     layout::LayoutTree,
     pane::{PaneId, PaneSnapshot},
     pty::PaneProcess,
@@ -89,6 +90,18 @@ impl Session {
     pub fn resize(&self, rows: u16, cols: u16) -> Result<()> {
         if let Some(pane) = self.panes.get(&self.layout.active) {
             pane.process.resize(rows, cols)?;
+        }
+        Ok(())
+    }
+
+    pub fn handle_mouse_scroll(
+        &self,
+        direction: ScrollDirection,
+        row: u16,
+        col: u16,
+    ) -> Result<()> {
+        if let Some(pane) = self.panes.get(&self.layout.active) {
+            pane.process.handle_mouse_scroll(direction, row, col)?;
         }
         Ok(())
     }

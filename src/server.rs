@@ -123,6 +123,22 @@ impl SessionStore {
                     },
                 }
             }
+            CommandRequest::MouseScroll {
+                session,
+                row,
+                col,
+                direction,
+            } => match self.sessions.get(&session) {
+                Some(session) => match session.handle_mouse_scroll(direction, row, col) {
+                    Ok(_) => CommandResponse::Scrolled,
+                    Err(error) => CommandResponse::Error {
+                        message: error.to_string(),
+                    },
+                },
+                None => CommandResponse::Error {
+                    message: format!("unknown session {session}"),
+                },
+            },
             CommandRequest::Resize {
                 session,
                 rows,
