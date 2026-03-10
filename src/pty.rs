@@ -157,6 +157,9 @@ impl PaneProcess {
     }
 
     pub fn resize(&self, rows: u16, cols: u16) -> Result<()> {
+        let mut parser = self.parser.lock().expect("pane parser lock poisoned");
+        let previous = parser.screen().contents_formatted();
+        let cursor = parser.screen().cursor_state_formatted();
         self.master
             .lock()
             .expect("pane master lock poisoned")
@@ -167,11 +170,13 @@ impl PaneProcess {
                 pixel_height: 0,
             })
             .context("failed to resize PTY")?;
-        self.parser
-            .lock()
-            .expect("pane parser lock poisoned")
-            .screen_mut()
-            .set_size(rows, cols);
+        parser.screen_mut().set_size(rows, cols);
+        if !previous.is_empty() {
+            parser.process(&previous);
+        }
+        if !cursor.is_empty() {
+            parser.process(&cursor);
+        }
         Ok(())
     }
 

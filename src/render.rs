@@ -98,7 +98,7 @@ pub fn render_choose_tree<W: Write>(
             break;
         }
         let row = index as u16;
-        let prefix = if line.has_children && line.depth == 0 {
+        let prefix = if line.has_children {
             if line.expanded { "-" } else { "+" }
         } else {
             " "

@@ -954,36 +954,16 @@ fn resolve_window_target(snapshot: &RenderSnapshot, session: &str, target: &str)
 }
 
 fn build_choose_tree(paths: &RuntimePaths, current_session: &str) -> Result<ChooseTreeState> {
-    let sessions = match request_response(paths, CommandRequest::ListSessions)? {
-        CommandResponse::SessionList { sessions } => sessions,
-        other => return Err(anyhow!("unexpected session list response: {other:?}")),
-    };
     let mut state = ChooseTreeState {
         items: Vec::new(),
         lines: Vec::new(),
         selected: 0,
-        expanded_sessions: sessions.iter().cloned().collect(),
+        expanded_sessions: BTreeSet::new(),
         expanded_windows: BTreeSet::new(),
         attached_session: current_session.to_string(),
         search_input: None,
         last_search: None,
     };
-    for session in &sessions {
-        let windows = match request_response(
-            paths,
-            CommandRequest::ListWindows {
-                session: session.clone(),
-            },
-        )? {
-            CommandResponse::WindowList { windows } => windows,
-            _ => Vec::new(),
-        };
-        if session == current_session {
-            for window in &windows {
-                state.expanded_windows.insert((session.clone(), window.id));
-            }
-        }
-    }
     rebuild_choose_tree(paths, &mut state)?;
     Ok(state)
 }
@@ -1165,6 +1145,7 @@ fn handle_choose_tree_key(
                 tree.selected += 1;
             }
         }
+        KeyCode::Tab => toggle_choose_selected(tree),
         KeyCode::Char('=') if key.modifiers.contains(KeyModifiers::ALT) => {
             expand_all_choose_items(paths, tree)?
         }
@@ -1245,6 +1226,29 @@ fn toggle_choose_item(tree: &mut ChooseTreeState, expand: bool) {
                     tree.expanded_windows.insert(key);
                 } else {
                     tree.expanded_windows.remove(&key);
+                }
+            }
+            ChooseItem::Pane { .. } => {}
+        }
+    }
+}
+
+fn toggle_choose_selected(tree: &mut ChooseTreeState) {
+    if let Some(item) = tree.items.get(tree.selected) {
+        match item {
+            ChooseItem::Session(session) => {
+                if tree.expanded_sessions.contains(session) {
+                    tree.expanded_sessions.remove(session);
+                } else {
+                    tree.expanded_sessions.insert(session.clone());
+                }
+            }
+            ChooseItem::Window { session, window_id } => {
+                let key = (session.clone(), *window_id);
+                if tree.expanded_windows.contains(&key) {
+                    tree.expanded_windows.remove(&key);
+                } else {
+                    tree.expanded_windows.insert(key);
                 }
             }
             ChooseItem::Pane { .. } => {}
