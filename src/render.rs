@@ -201,51 +201,49 @@ fn render_split_separators<W: Write>(
 ) -> std::io::Result<()> {
     use std::collections::BTreeSet;
 
-    let panes = &snapshot.panes;
     let mut occupied = BTreeSet::<(u16, u16)>::new();
-    let mut horizontal_spans = Vec::<(u16, u16, u16)>::new();
-    let mut vertical_spans = Vec::<(u16, u16, u16)>::new();
+    let max_x = snapshot
+        .panes
+        .iter()
+        .map(|pane| pane.rect.right())
+        .max()
+        .unwrap_or(0);
+    let max_y = snapshot
+        .panes
+        .iter()
+        .map(|pane| pane.rect.bottom())
+        .max()
+        .unwrap_or(0);
 
-    for left in panes {
-        for right in panes {
-            if left.pane_id == right.pane_id {
+    for y in 0..max_y {
+        for x in 0..max_x {
+            if snapshot.panes.iter().any(|pane| pane.rect.contains(y, x)) {
                 continue;
             }
-            if left.rect.x + left.rect.width + 1 == right.rect.x {
-                let start = left.rect.y.max(right.rect.y);
-                let end = (left.rect.y + left.rect.height).min(right.rect.y + right.rect.height);
-                let x = left.rect.x + left.rect.width;
-                vertical_spans.push((x, start, end));
-                for row in start..end {
-                    occupied.insert((x, row));
-                }
-            }
-            if left.rect.y + left.rect.height + 1 == right.rect.y {
-                let start = left.rect.x.max(right.rect.x);
-                let end = (left.rect.x + left.rect.width).min(right.rect.x + right.rect.width);
-                let y = left.rect.y + left.rect.height;
-                horizontal_spans.push((y, start, end));
-                for col in start..end {
-                    occupied.insert((col, y));
-                }
-            }
-        }
-    }
+            let left = x > 0
+                && snapshot
+                    .panes
+                    .iter()
+                    .any(|pane| pane.rect.contains(y, x - 1));
+            let right = x + 1 < max_x
+                && snapshot
+                    .panes
+                    .iter()
+                    .any(|pane| pane.rect.contains(y, x + 1));
+            let up = y > 0
+                && snapshot
+                    .panes
+                    .iter()
+                    .any(|pane| pane.rect.contains(y - 1, x));
+            let down = y + 1 < max_y
+                && snapshot
+                    .panes
+                    .iter()
+                    .any(|pane| pane.rect.contains(y + 1, x));
 
-    for (y, start, end) in horizontal_spans {
-        if start > 0 && occupied.contains(&(start - 1, y)) {
-            occupied.insert((start - 1, y));
-        }
-        if occupied.contains(&(end, y)) {
-            occupied.insert((end, y));
-        }
-    }
-    for (x, start, end) in vertical_spans {
-        if start > 0 && occupied.contains(&(x, start - 1)) {
-            occupied.insert((x, start - 1));
-        }
-        if occupied.contains(&(x, end)) {
-            occupied.insert((x, end));
+            if (left && right) || (up && down) {
+                occupied.insert((x, y));
+            }
         }
     }
 
