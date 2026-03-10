@@ -29,7 +29,11 @@ pub struct PaneProcess {
 }
 
 impl PaneProcess {
-    pub fn spawn(command: &[String], cwd: Option<&Path>) -> Result<Self> {
+    pub fn spawn(
+        command: &[String],
+        cwd: Option<&Path>,
+        admux_context: Option<(&str, crate::pane::PaneId)>,
+    ) -> Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -40,7 +44,7 @@ impl PaneProcess {
             })
             .context("failed to create PTY pair")?;
 
-        let mut builder = build_command(command);
+        let mut builder = build_command(command, admux_context);
         if let Some(cwd) = cwd {
             builder.cwd(cwd);
         }
@@ -271,12 +275,26 @@ impl PaneProcess {
     }
 }
 
-fn build_command(command: &[String]) -> CommandBuilder {
+fn build_command(
+    command: &[String],
+    admux_context: Option<(&str, crate::pane::PaneId)>,
+) -> CommandBuilder {
     if command.is_empty() {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-        CommandBuilder::new(shell)
+        let mut builder = CommandBuilder::new(shell);
+        if let Some((session_name, pane_id)) = admux_context {
+            builder.env("ADMUX", "1");
+            builder.env("ADMUX_SESSION", session_name);
+            builder.env("ADMUX_PANE", pane_id.0.to_string());
+        }
+        builder
     } else {
         let mut builder = CommandBuilder::new(&command[0]);
+        if let Some((session_name, pane_id)) = admux_context {
+            builder.env("ADMUX", "1");
+            builder.env("ADMUX_SESSION", session_name);
+            builder.env("ADMUX_PANE", pane_id.0.to_string());
+        }
         for arg in &command[1..] {
             builder.arg(arg);
         }
@@ -294,6 +312,7 @@ mod tests {
         let pane = PaneProcess::spawn(
             &["sh".into(), "-lc".into(), "printf 'hello from pane'".into()],
             None,
+            None,
         )
         .expect("spawn pane");
 
@@ -309,6 +328,7 @@ mod tests {
                 "-lc".into(),
                 "printf 'before'; printf '\\033[2J\\033[Hafter'".into(),
             ],
+            None,
             None,
         )
         .expect("spawn pane");
@@ -327,6 +347,7 @@ mod tests {
                 "-lc".into(),
                 "printf 'one two three four five six seven eight nine ten'".into(),
             ],
+            None,
             None,
         )
         .expect("spawn pane");

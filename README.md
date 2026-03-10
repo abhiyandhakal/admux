@@ -72,6 +72,8 @@ Interactive defaults:
 - `Ctrl-b ?` open help
 - `Ctrl-b d` detach
 
+Inside an existing `admux` pane, running `admux new` creates a sibling session and switches the current client to it on the next attach poll. It does not nest a second fullscreen `admux` UI inside the pane unless `-d` is used.
+
 Run the daemon explicitly:
 
 ```bash

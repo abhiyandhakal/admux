@@ -27,7 +27,7 @@ use crate::{
     input::{InputAction, InputState},
     ipc::{
         CommandRequest, CommandResponse, CycleDirection, NavigationDirection, PaneCursor,
-        PaneRender, RenderSnapshot,
+        PaneRender, RenderSnapshot, SwitchSource,
     },
     layout::SplitAxis,
     pane::Rect,
@@ -114,23 +114,32 @@ pub fn run(cli: AdmuxCli) -> Result<()> {
     let request = match cli.command {
         ClientCommand::New(args) => {
             let requested_name = args.name.clone();
+            let nested_switch = (!args.detach
+                && io::stdout().is_terminal()
+                && std::env::var_os("ADMUX_NONINTERACTIVE").is_none())
+            .then(nested_switch_source)
+            .flatten();
             let response = request_response(
                 &paths,
                 CommandRequest::NewSession {
                     name: args.name,
                     cwd: args.cwd,
                     command: args.command,
+                    switch_from: nested_switch.clone(),
                 },
             )?;
             let created_session = match &response {
                 CommandResponse::SessionCreated { session, .. } => Some(session.clone()),
                 _ => None,
             };
-            print_response(&paths, response)?;
+            if nested_switch.is_none() {
+                print_response(&paths, response)?;
+            }
 
             if !args.detach
                 && io::stdout().is_terminal()
                 && std::env::var_os("ADMUX_NONINTERACTIVE").is_none()
+                && nested_switch.is_none()
             {
                 let session = created_session.or(requested_name).ok_or_else(|| {
                     anyhow!("new session response did not include a session name")
@@ -190,6 +199,12 @@ pub fn run(cli: AdmuxCli) -> Result<()> {
 
     let response = request_response(&paths, request)?;
     print_response(&paths, response)
+}
+
+fn nested_switch_source() -> Option<SwitchSource> {
+    let session = std::env::var("ADMUX_SESSION").ok()?;
+    let pane_id = std::env::var("ADMUX_PANE").ok()?.parse().ok()?;
+    Some(SwitchSource { session, pane_id })
 }
 
 pub fn request_response(paths: &RuntimePaths, request: CommandRequest) -> Result<CommandResponse> {

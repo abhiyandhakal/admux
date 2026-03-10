@@ -22,6 +22,7 @@ pub enum CommandRequest {
         name: Option<String>,
         cwd: Option<PathBuf>,
         command: Vec<String>,
+        switch_from: Option<SwitchSource>,
     },
     Attach {
         session: Option<String>,
@@ -182,6 +183,12 @@ pub enum CycleDirection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwitchSource {
+    pub session: String,
+    pub pane_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneCursor {
     pub row: u16,
     pub col: u16,
@@ -226,6 +233,7 @@ mod tests {
             name: Some("work".into()),
             cwd: Some(PathBuf::from("/tmp")),
             command: vec!["bash".into()],
+            switch_from: None,
         };
         let encoded = serde_json::to_vec(&request).expect("encode request");
         let decoded: CommandRequest = serde_json::from_slice(&encoded).expect("decode request");

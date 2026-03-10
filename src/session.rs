@@ -71,6 +71,7 @@ impl Session {
                 cwd.clone(),
                 &command,
                 pane_id,
+                &name,
             )?,
         );
 
@@ -223,6 +224,12 @@ impl Session {
             .unwrap_or_default()
     }
 
+    pub fn contains_pane(&self, pane_id: PaneId) -> bool {
+        self.windows
+            .values()
+            .any(|window| window.panes.contains_key(&pane_id))
+    }
+
     pub fn send_keys(
         &self,
         window_id: Option<WindowId>,
@@ -292,7 +299,11 @@ impl Session {
             .windows
             .get_mut(&active_window)
             .ok_or_else(|| anyhow!("unknown window"))?;
-        let process = PaneProcess::spawn(&default_command, cwd.as_deref())?;
+        let process = PaneProcess::spawn(
+            &default_command,
+            cwd.as_deref(),
+            Some((&self.name, pane_id)),
+        )?;
         let pane = PaneRuntime {
             id: pane_id,
             title: default_window_name(&default_command),
@@ -325,6 +336,7 @@ impl Session {
             self.cwd.clone(),
             &command,
             pane_id,
+            &self.name,
         )?;
         self.windows.insert(window_id, window);
         self.window_order.push(window_id);
@@ -528,8 +540,9 @@ impl WindowRuntime {
         cwd: Option<PathBuf>,
         command: &[String],
         pane_id: PaneId,
+        session_name: &str,
     ) -> Result<Self> {
-        let process = PaneProcess::spawn(command, cwd.as_deref())?;
+        let process = PaneProcess::spawn(command, cwd.as_deref(), Some((session_name, pane_id)))?;
         let pane = PaneRuntime {
             id: pane_id,
             title: default_window_name(command),

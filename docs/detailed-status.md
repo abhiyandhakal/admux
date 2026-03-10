@@ -57,6 +57,7 @@
   - split/window/focus/resize leader-key actions
   - resize propagation from the current terminal into pane PTYs
   - mouse focus, selection copy, wheel scroll, and border resize
+  - nested `admux new` redirects the outer client to the new session instead of nesting another fullscreen client in the pane
 
 ### Input and copy-mode foundations
 
@@ -113,6 +114,7 @@ Observed result:
 - `f5b5f46` `feat: add help overlay and chooser search`
 - pending layout regression fix commit in current worktree
 - pending resize and divider stability commit in current worktree
+- pending nested session redirect commit in current worktree
 
 ## Known gaps
 

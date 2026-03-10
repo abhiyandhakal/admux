@@ -27,6 +27,7 @@ pub enum ServerState {
 #[derive(Default)]
 pub struct SessionStore {
     sessions: BTreeMap<String, Session>,
+    pending_switches: BTreeMap<String, String>,
     last_session: Option<String>,
     next_pane_id: u64,
     next_window_id: u64,
@@ -45,7 +46,12 @@ impl SessionStore {
 
         match request {
             CommandRequest::Hello { version } => self.handle_hello(version),
-            CommandRequest::NewSession { name, cwd, command } => {
+            CommandRequest::NewSession {
+                name,
+                cwd,
+                command,
+                switch_from,
+            } => {
                 let name = name.unwrap_or_else(|| format!("session-{}", self.sessions.len() + 1));
                 let window_id = self.next_window();
                 let pane_id = self.next_pane();
@@ -53,6 +59,13 @@ impl SessionStore {
                     Ok(session) => {
                         self.sessions.insert(name.clone(), session);
                         self.last_session = Some(name.clone());
+                        if let Some(source) = switch_from
+                            && self.sessions.get(&source.session).is_some_and(|session| {
+                                session.contains_pane(PaneId(source.pane_id))
+                            })
+                        {
+                            self.pending_switches.insert(source.session, name.clone());
+                        }
                         CommandResponse::SessionCreated {
                             session: name,
                             pane_id: pane_id.0,
@@ -69,6 +82,11 @@ impl SessionStore {
                         message: "no sessions available".into(),
                     };
                 };
+                let session_name = self
+                    .pending_switches
+                    .remove(&session_name)
+                    .filter(|target| self.sessions.contains_key(target))
+                    .unwrap_or(session_name);
                 let Some(session) = self.sessions.get(&session_name) else {
                     return CommandResponse::Error {
                         message: format!("unknown session {session_name}"),
@@ -299,6 +317,9 @@ impl SessionStore {
 
     fn prune_dead_sessions(&mut self) {
         self.sessions.retain(|_, session| session.prune_dead());
+        self.pending_switches.retain(|source, target| {
+            self.sessions.contains_key(source) && self.sessions.contains_key(target)
+        });
         if let Some(last) = self.last_session.as_ref()
             && !self.sessions.contains_key(last)
         {
@@ -591,7 +612,10 @@ fn write_response(stream: &mut UnixStream, response: &CommandResponse) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ipc::CommandRequest, layout::SplitAxis};
+    use crate::{
+        ipc::{CommandRequest, SwitchSource},
+        layout::SplitAxis,
+    };
 
     #[test]
     fn store_creates_and_lists_sessions() {
@@ -600,6 +624,7 @@ mod tests {
             name: Some("work".into()),
             cwd: None,
             command: vec!["sh".into(), "-lc".into(), "printf test".into()],
+            switch_from: None,
         });
         assert!(matches!(
             created,
@@ -625,6 +650,7 @@ mod tests {
             name: Some("work".into()),
             cwd: None,
             command: vec!["sh".into()],
+            switch_from: None,
         });
 
         let response = store.handle(CommandRequest::SplitPane {
@@ -650,6 +676,7 @@ mod tests {
             name: Some("work".into()),
             cwd: None,
             command: vec!["sh".into(), "-lc".into(), "printf attached; sleep 1".into()],
+            switch_from: None,
         });
         std::thread::sleep(std::time::Duration::from_millis(100));
 
@@ -672,6 +699,7 @@ mod tests {
             name: Some("work".into()),
             cwd: None,
             command: vec!["sh".into()],
+            switch_from: None,
         });
 
         let response = store.handle(CommandRequest::RenameWindow {
@@ -693,5 +721,42 @@ mod tests {
                 }]
             }
         );
+    }
+
+    #[test]
+    fn nested_new_session_redirects_next_attach() {
+        let mut store = SessionStore::default();
+        let created = store.handle(CommandRequest::NewSession {
+            name: Some("work".into()),
+            cwd: None,
+            command: vec!["sh".into()],
+            switch_from: None,
+        });
+        let pane_id = match created {
+            CommandResponse::SessionCreated { pane_id, .. } => pane_id,
+            other => panic!("unexpected response: {other:?}"),
+        };
+
+        let response = store.handle(CommandRequest::NewSession {
+            name: Some("logs".into()),
+            cwd: None,
+            command: vec!["sh".into()],
+            switch_from: Some(SwitchSource {
+                session: "work".into(),
+                pane_id,
+            }),
+        });
+        assert!(matches!(
+            response,
+            CommandResponse::SessionCreated { session, .. } if session == "logs"
+        ));
+
+        let attached = store.handle(CommandRequest::Attach {
+            session: Some("work".into()),
+        });
+        assert!(matches!(
+            attached,
+            CommandResponse::Attached { session, .. } if session == "logs"
+        ));
     }
 }

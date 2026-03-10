@@ -201,3 +201,19 @@ This document records each completed implementation slice in detail, including t
   - mixed-axis divider tests now cover right-branch and bottom-branch junction glyphs in both layout and renderer paths
 - Commit: pending current worktree
 - Status: complete
+
+## Nested session redirect slice
+
+- Goal: make `admux new` inside an existing `admux` pane create a sibling session and switch the outer client instead of nesting a second fullscreen client inside the pane.
+- Files changed:
+  - client and protocol: `src/client.rs`, `src/ipc.rs`
+  - daemon/session/process runtime: `src/server.rs`, `src/session.rs`, `src/pty.rs`
+  - docs: `README.md`
+- Verification:
+  - `cargo test`
+- Observed result:
+  - pane processes now export `ADMUX_SESSION` and `ADMUX_PANE`
+  - nested `admux new` requests mark the source session for a one-shot redirect
+  - the next interactive attach poll switches the outer client to the newly created session
+- Commit: pending current worktree
+- Status: complete
