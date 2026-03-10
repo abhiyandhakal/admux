@@ -35,6 +35,7 @@ pub enum BottomBar<'a> {
     Status {
         message: Option<&'a str>,
     },
+    CopyMode,
     Prompt {
         buffer: &'a str,
         completions: &'a [String],
@@ -378,6 +379,10 @@ fn render_bottom_bar<W: Write>(
             };
             fit_status_segments(&left, &windows, &right, size.width)
         }
+        BottomBar::CopyMode => fit_width(
+            " COPY MODE | h j k l move | 0/$ line | g/G top/bottom | PgUp/PgDn scroll | Space select | y copy | q quit ",
+            size.width,
+        ),
         BottomBar::Prompt {
             buffer,
             completions,
@@ -665,6 +670,27 @@ mod tests {
     fn connection_mask_produces_joined_tee() {
         let mask = CONNECT_UP | CONNECT_DOWN | CONNECT_RIGHT;
         assert_eq!(connection_glyph(mask), '├');
+    }
+
+    #[test]
+    fn copy_mode_bottom_bar_renders_help_text() {
+        let mut buf = Vec::new();
+        render_session(
+            &mut buf,
+            "work",
+            &sample_snapshot(),
+            BottomBar::CopyMode,
+            None,
+            TerminalSize {
+                width: 140,
+                height: 6,
+            },
+        )
+        .expect("render session");
+        let rendered = String::from_utf8_lossy(&buf);
+
+        assert!(rendered.contains("COPY MODE"));
+        assert!(rendered.contains("Space select"));
     }
 
     #[test]

@@ -23,8 +23,8 @@ use crossterm::{
 use crate::{
     cli::{AdmuxCli, ClientCommand, NewWindowArgs, ResizePaneArgs, SelectPaneArgs, SplitPaneArgs},
     commands::{InteractiveCommand, complete as complete_commands, parse as parse_command},
-    copy_mode::Selection,
-    input::{InputAction, InputState},
+    copy_mode::{CopyMode, Selection},
+    input::{InputAction, InputMode, InputState},
     ipc::{
         CommandRequest, CommandResponse, CycleDirection, NavigationDirection, PaneCursor,
         PaneRender, RenderSnapshot, SwitchSource,
@@ -478,6 +478,7 @@ fn run_attach_loop(
     let mut last_size = (0, 0);
     let mut selection_anchor: Option<SelectionAnchor> = None;
     let mut active_selection: Option<PaneSelection> = None;
+    let mut copy_mode: Option<CopyMode> = None;
     let mut resize_drag: Option<ResizeDrag> = None;
     let mut status_message: Option<String> = None;
     let mut prompt_history = Vec::<String>::new();
@@ -514,16 +515,42 @@ fn run_attach_loop(
             other => return Err(anyhow!("unexpected attach response: {other:?}")),
         };
 
+        let render_selection = copy_mode
+            .as_ref()
+            .map(copy_mode_selection)
+            .or(active_selection);
+        let bottom_bar =
+            copy_mode
+                .as_ref()
+                .map(|_| BottomBar::CopyMode)
+                .unwrap_or(BottomBar::Status {
+                    message: status_message.as_deref(),
+                });
+
+        if let Some(copy) = copy_mode.as_mut() {
+            if let Some(pane) = snapshot
+                .panes
+                .iter()
+                .find(|pane| pane.pane_id == copy.pane_id)
+            {
+                copy.clamp_to(
+                    pane.rows_plain.len().max(1),
+                    pane.rect.width.max(1) as usize,
+                );
+            } else {
+                copy_mode = None;
+                state.mode = InputMode::Normal;
+            }
+        }
+
         match &overlay {
             OverlayState::None => {
                 render_session(
                     stdout,
                     &current_session,
                     &snapshot,
-                    BottomBar::Status {
-                        message: status_message.as_deref(),
-                    },
-                    active_selection,
+                    bottom_bar,
+                    render_selection,
                     TerminalSize { width, height },
                 )?;
             }
@@ -608,6 +635,16 @@ fn run_attach_loop(
                     OverlayState::None => match state.handle_key(key) {
                         InputAction::Noop => {}
                         InputAction::Detach => break,
+                        InputAction::EnterCopyMode => {
+                            if let Some(pane) = focused_pane(&snapshot) {
+                                copy_mode = Some(copy_mode_from_pane(pane));
+                                active_selection = None;
+                                selection_anchor = None;
+                            }
+                        }
+                        InputAction::ExitCopyMode => {
+                            copy_mode = None;
+                        }
                         InputAction::SendBytes(bytes) => {
                             send_input_bytes(paths, &current_session, &bytes)?
                         }
@@ -708,16 +745,141 @@ fn run_attach_loop(
                                 },
                             )?;
                         }
+                        InputAction::CopyMove(direction) => {
+                            let pane_dims = copy_mode.as_ref().and_then(|copy| {
+                                snapshot
+                                    .panes
+                                    .iter()
+                                    .find(|pane| pane.pane_id == copy.pane_id)
+                                    .map(|pane| {
+                                        (
+                                            pane.rows_plain.len().max(1),
+                                            pane.rect.width.max(1) as usize,
+                                        )
+                                    })
+                            });
+                            if let (Some(copy), Some((rows, cols))) =
+                                (copy_mode.as_mut(), pane_dims)
+                            {
+                                match direction {
+                                    NavigationDirection::Left => copy.move_left(),
+                                    NavigationDirection::Right => copy.move_right(cols),
+                                    NavigationDirection::Up => copy.move_up(),
+                                    NavigationDirection::Down => copy.move_down(rows),
+                                }
+                            }
+                        }
+                        InputAction::CopyLineStart => {
+                            if let Some(copy) = copy_mode.as_mut() {
+                                copy.move_line_start();
+                            }
+                        }
+                        InputAction::CopyLineEnd => {
+                            let cols = copy_mode.as_ref().and_then(|copy| {
+                                snapshot
+                                    .panes
+                                    .iter()
+                                    .find(|pane| pane.pane_id == copy.pane_id)
+                                    .map(|pane| pane.rect.width.max(1) as usize)
+                            });
+                            if let (Some(copy), Some(cols)) = (copy_mode.as_mut(), cols) {
+                                copy.move_line_end(cols);
+                            }
+                        }
+                        InputAction::CopyTop => {
+                            if let Some(copy) = copy_mode.as_mut() {
+                                copy.move_top();
+                            }
+                        }
+                        InputAction::CopyBottom => {
+                            let rows = copy_mode.as_ref().and_then(|copy| {
+                                snapshot
+                                    .panes
+                                    .iter()
+                                    .find(|pane| pane.pane_id == copy.pane_id)
+                                    .map(|pane| pane.rows_plain.len().max(1))
+                            });
+                            if let (Some(copy), Some(rows)) = (copy_mode.as_mut(), rows) {
+                                copy.move_bottom(rows);
+                            }
+                        }
+                        InputAction::CopyPageUp => {
+                            if let Some(copy) = copy_mode.as_mut() {
+                                let page = snapshot
+                                    .panes
+                                    .iter()
+                                    .find(|pane| pane.pane_id == copy.pane_id)
+                                    .map(|pane| pane.rect.height.max(1) as i16)
+                                    .unwrap_or(10);
+                                let _ = request_response(
+                                    paths,
+                                    CommandRequest::ScrollPane {
+                                        session: current_session.clone(),
+                                        pane_id: Some(copy.pane_id),
+                                        lines: -page,
+                                    },
+                                )?;
+                            }
+                        }
+                        InputAction::CopyPageDown => {
+                            if let Some(copy) = copy_mode.as_mut() {
+                                let page = snapshot
+                                    .panes
+                                    .iter()
+                                    .find(|pane| pane.pane_id == copy.pane_id)
+                                    .map(|pane| pane.rect.height.max(1) as i16)
+                                    .unwrap_or(10);
+                                let _ = request_response(
+                                    paths,
+                                    CommandRequest::ScrollPane {
+                                        session: current_session.clone(),
+                                        pane_id: Some(copy.pane_id),
+                                        lines: page,
+                                    },
+                                )?;
+                            }
+                        }
+                        InputAction::CopyStartSelection => {
+                            if let Some(copy) = copy_mode.as_mut() {
+                                copy.start_selection();
+                            }
+                        }
+                        InputAction::CopyYank => {
+                            if let Some(copy) = copy_mode.take() {
+                                let selection =
+                                    copy.selection().unwrap_or_else(|| copy.cursor_selection());
+                                let copied = request_response(
+                                    paths,
+                                    CommandRequest::CopySelection {
+                                        session: current_session.clone(),
+                                        pane_id: Some(copy.pane_id),
+                                        start_row: selection.start_row,
+                                        start_col: selection.start_col,
+                                        end_row: selection.end_row,
+                                        end_col: selection.end_col,
+                                    },
+                                )?;
+                                if let CommandResponse::SelectionCopied { text } = copied {
+                                    let copied_chars = text.chars().count();
+                                    if copied_chars > 0 {
+                                        copy_via_osc52(stdout, &text)
+                                            .context("failed to send OSC52 clipboard copy")?;
+                                        status_message =
+                                            Some(format!("copied {copied_chars} chars"));
+                                    }
+                                }
+                            }
+                        }
                     },
                 }
             }
             Event::Paste(text) => {
-                if matches!(overlay, OverlayState::None) {
+                if matches!(overlay, OverlayState::None) && copy_mode.is_none() {
                     send_input_bytes(paths, &current_session, text.as_bytes())?;
                 }
             }
             Event::Mouse(mouse) => {
-                if matches!(overlay, OverlayState::None) {
+                if matches!(overlay, OverlayState::None) && copy_mode.is_none() {
                     handle_mouse_event(
                         paths,
                         &current_session,
@@ -1359,6 +1521,29 @@ fn choose_tree_status(tree: &ChooseTreeState) -> String {
     }
 }
 
+fn focused_pane(snapshot: &RenderSnapshot) -> Option<&PaneRender> {
+    snapshot.panes.iter().find(|pane| pane.focused)
+}
+
+fn copy_mode_from_pane(pane: &PaneRender) -> CopyMode {
+    let cursor = pane.cursor.clone().unwrap_or(PaneCursor { row: 0, col: 0 });
+    let mut mode = CopyMode::new(pane.pane_id, cursor.row, cursor.col);
+    mode.clamp_to(
+        pane.rows_plain.len().max(1),
+        pane.rect.width.max(1) as usize,
+    );
+    mode
+}
+
+fn copy_mode_selection(copy_mode: &CopyMode) -> PaneSelection {
+    PaneSelection {
+        pane_id: copy_mode.pane_id,
+        selection: copy_mode
+            .selection()
+            .unwrap_or_else(|| copy_mode.cursor_selection()),
+    }
+}
+
 fn help_lines() -> Vec<String> {
     vec![
         "admux help".into(),
@@ -1372,6 +1557,7 @@ fn help_lines() -> Vec<String> {
         "Ctrl-b n/p    next/previous window".into(),
         "Ctrl-b x      kill active pane".into(),
         "Ctrl-b :      command prompt".into(),
+        "Ctrl-b [      copy mode".into(),
         "Ctrl-b s      choose-tree".into(),
         "Ctrl-b d      detach".into(),
         "Ctrl-b ?      help".into(),

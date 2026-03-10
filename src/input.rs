@@ -25,6 +25,17 @@ pub enum InputAction {
     OpenPrompt,
     OpenSessions,
     OpenHelp,
+    EnterCopyMode,
+    ExitCopyMode,
+    CopyMove(NavigationDirection),
+    CopyLineStart,
+    CopyLineEnd,
+    CopyTop,
+    CopyBottom,
+    CopyPageUp,
+    CopyPageDown,
+    CopyStartSelection,
+    CopyYank,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +71,10 @@ impl InputState {
                     KeyCode::Char('%') => InputAction::SplitPane(SplitAxis::Vertical),
                     KeyCode::Char('"') => InputAction::SplitPane(SplitAxis::Horizontal),
                     KeyCode::Char(':') => InputAction::OpenPrompt,
+                    KeyCode::Char('[') => {
+                        self.mode = InputMode::CopyMode;
+                        InputAction::EnterCopyMode
+                    }
                     KeyCode::Char('s') => InputAction::OpenSessions,
                     KeyCode::Char('?') => InputAction::OpenHelp,
                     KeyCode::Char('c') => InputAction::NewWindow,
@@ -80,7 +95,34 @@ impl InputState {
                     _ => InputAction::Noop,
                 }
             }
-            InputMode::CopyMode => InputAction::Noop,
+            InputMode::CopyMode => match event.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.mode = InputMode::Normal;
+                    InputAction::ExitCopyMode
+                }
+                KeyCode::Char('h') | KeyCode::Left => {
+                    InputAction::CopyMove(NavigationDirection::Left)
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    InputAction::CopyMove(NavigationDirection::Down)
+                }
+                KeyCode::Char('k') | KeyCode::Up => InputAction::CopyMove(NavigationDirection::Up),
+                KeyCode::Char('l') | KeyCode::Right => {
+                    InputAction::CopyMove(NavigationDirection::Right)
+                }
+                KeyCode::Char('0') => InputAction::CopyLineStart,
+                KeyCode::Char('$') => InputAction::CopyLineEnd,
+                KeyCode::Char('g') => InputAction::CopyTop,
+                KeyCode::Char('G') => InputAction::CopyBottom,
+                KeyCode::PageUp => InputAction::CopyPageUp,
+                KeyCode::PageDown => InputAction::CopyPageDown,
+                KeyCode::Char(' ') | KeyCode::Char('v') => InputAction::CopyStartSelection,
+                KeyCode::Enter | KeyCode::Char('y') => {
+                    self.mode = InputMode::Normal;
+                    InputAction::CopyYank
+                }
+                _ => InputAction::Noop,
+            },
         }
     }
 }
@@ -164,5 +206,28 @@ mod tests {
             state.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT)),
             InputAction::OpenHelp
         );
+    }
+
+    #[test]
+    fn leader_left_bracket_enters_copy_mode() {
+        let mut state = InputState::default();
+        let _ = state.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        assert_eq!(
+            state.handle_key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE)),
+            InputAction::EnterCopyMode
+        );
+        assert_eq!(state.mode, InputMode::CopyMode);
+    }
+
+    #[test]
+    fn copy_mode_yank_exits_back_to_normal() {
+        let mut state = InputState {
+            mode: InputMode::CopyMode,
+        };
+        assert_eq!(
+            state.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
+            InputAction::CopyYank
+        );
+        assert_eq!(state.mode, InputMode::Normal);
     }
 }

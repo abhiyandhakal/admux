@@ -91,6 +91,11 @@ pub enum CommandRequest {
         end_row: u16,
         end_col: u16,
     },
+    ScrollPane {
+        session: String,
+        pane_id: Option<u64>,
+        lines: i16,
+    },
     Resize {
         session: String,
         rows: u16,

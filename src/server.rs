@@ -286,6 +286,21 @@ impl SessionStore {
                     message: format!("unknown session {session}"),
                 },
             },
+            CommandRequest::ScrollPane {
+                session,
+                pane_id,
+                lines,
+            } => match self.sessions.get(&session) {
+                Some(session) => match session.scroll_pane(pane_id.map(PaneId), lines) {
+                    Ok(_) => CommandResponse::Scrolled,
+                    Err(error) => CommandResponse::Error {
+                        message: error.to_string(),
+                    },
+                },
+                None => CommandResponse::Error {
+                    message: format!("unknown session {session}"),
+                },
+            },
             CommandRequest::Resize {
                 session,
                 rows,

@@ -282,6 +282,19 @@ impl Session {
         Ok(())
     }
 
+    pub fn scroll_pane(&self, pane_id: Option<PaneId>, lines: i16) -> Result<()> {
+        let window = self
+            .active_window()
+            .ok_or_else(|| anyhow!("unknown window"))?;
+        let pane_id = pane_id.unwrap_or(window.layout.active);
+        let pane = window
+            .panes
+            .get(&pane_id)
+            .ok_or_else(|| anyhow!("unknown pane"))?;
+        pane.process.scroll_scrollback_by(lines);
+        Ok(())
+    }
+
     pub fn split_active_pane(
         &mut self,
         axis: SplitAxis,

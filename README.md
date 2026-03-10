@@ -34,12 +34,12 @@ Implemented now:
 - chooser-local search with `Ctrl-s`, repeat with `n`/`N`, and expand/collapse-all with `Alt-+` / `Alt--`
 - chooser collapsed by default with `Tab` and `+` / `-` expand-collapse controls
 - mouse focus, drag-selection copy, wheel scroll, and border resize
+- modal copy mode with pane navigation, scrollback paging, selection, and yank
 - resize handling that preserves pane state while shrinking and restores PTY history when panes expand again
 - unit, integration, and binary smoke coverage
 
 Not finished yet:
 
-- copy-mode UI beyond drag-selection
 - restart recovery or persistent session metadata
 
 ## Build and run
@@ -68,6 +68,7 @@ Interactive defaults:
 - `Ctrl-b "` horizontal split
 - `Ctrl-b 0` through `Ctrl-b 9` select windows by index
 - `Ctrl-b :` open the command prompt
+- `Ctrl-b [` enter copy mode
 - `Ctrl-b s` open the session chooser
 - `Ctrl-b ?` open help
 - `Ctrl-b d` detach

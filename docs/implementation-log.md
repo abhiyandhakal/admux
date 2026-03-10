@@ -217,3 +217,21 @@ This document records each completed implementation slice in detail, including t
   - the next interactive attach poll switches the outer client to the newly created session
 - Commit: pending current worktree
 - Status: complete
+
+## Modal copy mode slice
+
+- Goal: replace drag-only copy interaction with a real modal copy mode that can be entered from the keyboard, navigate the active pane buffer, page scrollback, select text, and yank through the existing clipboard path.
+- Files changed:
+  - interaction and copy state: `src/client.rs`, `src/input.rs`, `src/copy_mode.rs`
+  - protocol/runtime: `src/ipc.rs`, `src/server.rs`, `src/session.rs`, `src/pty.rs`
+  - rendering: `src/render.rs`
+  - docs: `README.md`, `docs/detailed-status.md`
+- Verification:
+  - `cargo test`
+- Observed result:
+  - `Ctrl-b [` enters copy mode
+  - movement, line start/end, top/bottom, and page scroll all work over the focused pane
+  - selection and yank reuse the existing `CopySelection` and OSC52 clipboard flow
+  - renderer tests cover the copy-mode status bar
+- Commit: pending current worktree
+- Status: complete

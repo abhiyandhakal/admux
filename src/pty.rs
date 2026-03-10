@@ -245,6 +245,17 @@ impl PaneProcess {
         Ok(())
     }
 
+    pub fn scroll_scrollback_by(&self, lines: i16) {
+        let mut state = self.state.lock().expect("pane state lock poisoned");
+        let current = state.parser.screen().scrollback();
+        let next = if lines.is_negative() {
+            current.saturating_add(lines.unsigned_abs() as usize)
+        } else {
+            current.saturating_sub(lines as usize)
+        };
+        state.parser.screen_mut().set_scrollback(next);
+    }
+
     pub fn send_keys(&self, keys: &[String]) -> Result<()> {
         let mut writer = self.writer.lock().expect("pane writer lock poisoned");
         for key in keys {

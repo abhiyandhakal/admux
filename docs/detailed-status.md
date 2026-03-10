@@ -58,6 +58,7 @@
   - resize propagation from the current terminal into pane PTYs
   - mouse focus, selection copy, wheel scroll, and border resize
   - nested `admux new` redirects the outer client to the new session instead of nesting another fullscreen client in the pane
+  - modal copy mode on `Ctrl-b [` with vi-style movement, scrollback paging, selection, and yank
 
 ### Input and copy-mode foundations
 
@@ -115,10 +116,10 @@ Observed result:
 - pending layout regression fix commit in current worktree
 - pending resize and divider stability commit in current worktree
 - pending nested session redirect commit in current worktree
+- pending modal copy mode commit in current worktree
 
 ## Known gaps
 
-- copy mode is still drag-selection focused rather than a full modal copy-mode UI
 - session state is in-memory only while `admuxd` is alive
 
 ## Module map
