@@ -177,6 +177,7 @@ impl Session {
             .collect();
 
         Some(RenderSnapshot {
+            sessions: Vec::new(),
             windows: self.list_windows(),
             panes,
             dividers: window.layout.divider_cells(size),

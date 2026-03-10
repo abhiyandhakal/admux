@@ -116,7 +116,10 @@ impl SessionStore {
                     .unwrap_or(session_name);
                 if self.sessions.contains_key(&session_name) {
                     let session = self.sessions.get(&session_name).expect("checked contains");
-                    let snapshot = session.render_snapshot(session.pane_area());
+                    let snapshot = session.render_snapshot(session.pane_area()).map(|mut snapshot| {
+                        snapshot.sessions = self.list_session_summaries();
+                        snapshot
+                    });
                     CommandResponse::Attached {
                         session: session_name,
                         preview: session.active_pane_preview(),

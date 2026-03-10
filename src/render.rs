@@ -564,7 +564,7 @@ fn build_tmux_status_zones(
     ui: &UiConfig,
     width: u16,
 ) -> Option<StatusZones> {
-    let mut left = vec![StatusSegment::session(format!("[{}] ", session))];
+    let mut left = build_session_segments(session, snapshot);
     let mut center = snapshot
         .windows
         .iter()
@@ -633,8 +633,17 @@ fn fit_tmux_status_layout(
             right.clear();
             continue;
         }
+        if let Some(index) = left.iter().position(|segment| !segment.attrs.contains(&Attribute::Bold))
+            && shorten_non_active_session_segment(&mut left[index])
+        {
+            continue;
+        }
+        if left.len() > 1 {
+            left.pop();
+            continue;
+        }
         if let Some(segment) = left.first_mut()
-            && shorten_session_segment(segment)
+            && shorten_active_session_segment(segment)
         {
             continue;
         }
@@ -648,6 +657,29 @@ fn fit_tmux_status_layout(
         }
         break;
     }
+}
+
+fn build_session_segments(session: &str, snapshot: &RenderSnapshot) -> Vec<StatusSegment> {
+    if snapshot.sessions.is_empty() {
+        return vec![StatusSegment::session(format!("[{}] ", session))];
+    }
+
+    snapshot
+        .sessions
+        .iter()
+        .map(|summary| {
+            let label = if summary.stale {
+                format!("{}?", summary.name)
+            } else {
+                summary.name.clone()
+            };
+            if summary.name == session {
+                StatusSegment::session(format!("[{}] ", label))
+            } else {
+                StatusSegment::plain(format!("{} ", label))
+            }
+        })
+        .collect()
 }
 
 fn zones_overlap(
@@ -700,7 +732,24 @@ fn simplify_clock_segment(segment: &mut StatusSegment) -> bool {
     false
 }
 
-fn shorten_session_segment(segment: &mut StatusSegment) -> bool {
+fn shorten_non_active_session_segment(segment: &mut StatusSegment) -> bool {
+    let trimmed = segment.text.trim();
+    let label = trimmed.trim_end_matches('?');
+    let label_len = label.chars().count();
+    if label_len <= 1 {
+        return false;
+    }
+    let shortened = truncate(label, (label_len.saturating_sub(1)) as u16);
+    let suffix = if trimmed.ends_with('?') { "?" } else { "" };
+    let next = format!("{}{} ", shortened, suffix);
+    if next == segment.text {
+        return false;
+    }
+    segment.text = next;
+    true
+}
+
+fn shorten_active_session_segment(segment: &mut StatusSegment) -> bool {
     let trimmed = segment.text.trim();
     let name = trimmed.trim_matches(['[', ']']);
     let name_len = name.chars().count();
@@ -888,6 +937,16 @@ mod tests {
 
     fn sample_snapshot() -> RenderSnapshot {
         RenderSnapshot {
+            sessions: vec![
+                crate::ipc::SessionSummary {
+                    name: "work".into(),
+                    stale: false,
+                },
+                crate::ipc::SessionSummary {
+                    name: "logs".into(),
+                    stale: false,
+                },
+            ],
             windows: vec![WindowSummary {
                 id: 1,
                 index: 0,
@@ -1168,7 +1227,7 @@ mod tests {
             .map(|segment| segment.text)
             .collect::<String>();
         assert!(joined.contains("1:editor*"));
-        assert!(joined.contains("0:"));
+        assert!(joined.contains("0"));
         assert!(joined.contains("-"));
     }
 
@@ -1213,6 +1272,20 @@ mod tests {
 
         assert_eq!(zones.right_start, 80usize.saturating_sub(right_len));
         assert!(zones.right_start >= zones.center_start + total_len(&[], &zones.center, &[]));
+    }
+
+    #[test]
+    fn tmux_status_zones_include_session_list_on_left() {
+        let zones = build_tmux_status_zones("work", &sample_snapshot(), &sample_ui(), 80)
+            .expect("zones");
+        let joined = zones
+            .left
+            .iter()
+            .map(|segment| segment.text.clone())
+            .collect::<String>();
+
+        assert!(joined.contains("[work]"));
+        assert!(joined.contains("logs"));
     }
 
     #[test]

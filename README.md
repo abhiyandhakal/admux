@@ -12,7 +12,7 @@ The repository currently contains a working foundation with:
 - ratio-based split layouts
 - VT100-backed screen parsing and clipped pane rendering
 - a `crossterm` interactive attach loop with Unicode pane dividers, a status-row command prompt, a choose-tree session view, and tmux-style leader keys
-- a tmux-style one-row statusline with session on the left, a centered window list, and host/date/time on the right
+- a tmux-style one-row statusline with the session list on the left, a centered window list, and host/date/time on the right
 
 ## Current scope
 
@@ -119,7 +119,7 @@ leader = "Ctrl-b"
 Statusline defaults:
 
 - one row only, at the top or bottom according to `status_position`
-- left segment with tmux-style `[session]`
+- left segment with the session list, highlighting the current session
 - centered window list with `*` for current and `-` for last-selected windows
 - right segment with short hostname and local date/time
 - prompt, copy mode, chooser, and help temporarily repurpose the row instead of preserving the normal status content

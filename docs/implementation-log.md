@@ -266,6 +266,27 @@ This document records each completed implementation slice in detail, including t
 - Commit: pending current worktree
 - Status: complete
 
+## Statusline session-list slice
+
+- Goal: include the session list in the left side of the tmux-style statusline instead of showing only the current session.
+- Files changed:
+  - snapshot/runtime path: `src/ipc.rs`, `src/session.rs`, `src/server.rs`, `src/client.rs`
+  - rendering: `src/render.rs`
+  - docs: `README.md`, `docs/detailed-status.md`
+- Verification:
+  - `cargo test`
+  - direct binary smoke:
+    - `target/debug/admuxd serve --socket <temp-socket> --state <temp-state>`
+    - `ADMUX_SOCKET=<temp-socket> ADMUX_STATE=<temp-state> target/debug/admux new -d --name alpha -- sh`
+    - `ADMUX_SOCKET=<temp-socket> ADMUX_STATE=<temp-state> target/debug/admux new -d --name beta -- sh`
+    - `ADMUX_SOCKET=<temp-socket> ADMUX_STATE=<temp-state> target/debug/admux ls`
+- Observed result:
+  - attach snapshots now include session summaries
+  - the left status zone can render the current session plus other sessions without an extra client request
+  - renderer tests now cover the presence of multiple sessions on the left
+- Commit: pending current worktree
+- Status: complete
+
 ## Modal copy mode slice
 
 - Goal: replace drag-only copy interaction with a real modal copy mode that can be entered from the keyboard, navigate the active pane buffer, page scrollback, select text, and yank through the existing clipboard path.

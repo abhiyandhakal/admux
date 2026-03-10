@@ -1813,6 +1813,7 @@ fn resize_drag_request(
 fn fallback_snapshot(preview: String, width: u16, height: u16) -> RenderSnapshot {
     let rows_plain = preview.lines().map(ToOwned::to_owned).collect::<Vec<_>>();
     RenderSnapshot {
+        sessions: Vec::new(),
         windows: vec![WindowSummary {
             id: 1,
             index: 0,

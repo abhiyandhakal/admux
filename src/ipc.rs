@@ -213,6 +213,8 @@ pub struct PaneRender {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RenderSnapshot {
+    #[serde(default)]
+    pub sessions: Vec<SessionSummary>,
     pub windows: Vec<WindowSummary>,
     pub panes: Vec<PaneRender>,
     #[serde(default)]
