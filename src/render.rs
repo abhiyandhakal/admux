@@ -190,6 +190,7 @@ fn render_pane<W: Write>(out: &mut W, pane: &PaneRender) -> std::io::Result<()> 
         }
         queue!(out, MoveTo(pane.rect.x, pane.rect.y + offset as u16))?;
         out.write_all(row.as_bytes())?;
+        out.write_all(b"\x1b[0m")?;
     }
     Ok(())
 }
@@ -611,6 +612,7 @@ mod tests {
         assert!(rendered.contains("\u{1b}[31m"));
         assert!(rendered.contains("copied 5 chars"));
         assert!(rendered.contains("\u{1b}[?25h"));
+        assert!(rendered.contains("\u{1b}[0m"));
     }
 
     #[test]
