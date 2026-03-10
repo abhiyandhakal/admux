@@ -357,16 +357,20 @@ impl Session {
     pub fn resize_active_pane(
         &mut self,
         window_id: Option<WindowId>,
+        pane_id: Option<PaneId>,
         direction: NavigationDirection,
         amount: u16,
     ) -> Result<()> {
         let window = self
             .window_mut(window_id)
             .ok_or_else(|| anyhow!("unknown window"))?;
+        if let Some(pane_id) = pane_id {
+            window.layout.active = pane_id;
+        }
         let _ = window
             .layout
             .resize_active(convert_direction(direction), amount);
-        Ok(())
+        self.sync_pane_sizes()
     }
 
     pub fn select_window(&mut self, window_id: WindowId) -> Result<()> {

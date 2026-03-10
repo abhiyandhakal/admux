@@ -198,7 +198,12 @@ impl SessionStore {
             } => match parse_target(&target) {
                 Ok(target) => match self.sessions.get_mut(&target.session) {
                     Some(session) => {
-                        match session.resize_active_pane(target.window, direction, amount) {
+                        match session.resize_active_pane(
+                            target.window,
+                            target.pane,
+                            direction,
+                            amount,
+                        ) {
                             Ok(_) => CommandResponse::Resized,
                             Err(error) => CommandResponse::Error {
                                 message: error.to_string(),

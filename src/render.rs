@@ -190,9 +190,48 @@ fn render_pane<W: Write>(out: &mut W, pane: &PaneRender) -> std::io::Result<()> 
 }
 
 fn render_split_separators<W: Write>(
-    _out: &mut W,
-    _snapshot: &RenderSnapshot,
+    out: &mut W,
+    snapshot: &RenderSnapshot,
 ) -> std::io::Result<()> {
+    let panes = &snapshot.panes;
+    let mut vertical = Vec::new();
+    let mut horizontal = Vec::new();
+
+    for left in panes {
+        for right in panes {
+            if left.pane_id == right.pane_id {
+                continue;
+            }
+            if left.rect.x + left.rect.width + 1 == right.rect.x {
+                let start = left.rect.y.max(right.rect.y);
+                let end = (left.rect.y + left.rect.height).min(right.rect.y + right.rect.height);
+                for row in start..end {
+                    vertical.push((left.rect.x + left.rect.width, row));
+                }
+            }
+            if left.rect.y + left.rect.height + 1 == right.rect.y {
+                let start = left.rect.x.max(right.rect.x);
+                let end = (left.rect.x + left.rect.width).min(right.rect.x + right.rect.width);
+                for col in start..end {
+                    horizontal.push((col, left.rect.y + left.rect.height));
+                }
+            }
+        }
+    }
+
+    for (x, y) in &vertical {
+        let ch = if horizontal.iter().any(|(hx, hy)| hx == x && hy == y) {
+            '┼'
+        } else {
+            '│'
+        };
+        queue!(out, MoveTo(*x, *y), Print(ch))?;
+    }
+    for (x, y) in &horizontal {
+        if !vertical.iter().any(|(vx, vy)| vx == x && vy == y) {
+            queue!(out, MoveTo(*x, *y), Print('─'))?;
+        }
+    }
     Ok(())
 }
 
@@ -285,8 +324,8 @@ fn draw_preview_box<W: Write>(
     } else {
         Attribute::Dim
     };
-    let top = format!("+{}+", "-".repeat(rect.width.saturating_sub(2) as usize));
-    let bottom = top.clone();
+    let top = format!("┌{}┐", "─".repeat(rect.width.saturating_sub(2) as usize));
+    let bottom = format!("└{}┘", "─".repeat(rect.width.saturating_sub(2) as usize));
     queue!(
         out,
         SetAttribute(border_attr),
@@ -297,9 +336,9 @@ fn draw_preview_box<W: Write>(
         queue!(
             out,
             MoveTo(rect.x, row),
-            Print("|"),
+            Print("│"),
             MoveTo(rect.right().saturating_sub(1), row),
-            Print("|")
+            Print("│")
         )?;
     }
     queue!(
@@ -353,13 +392,7 @@ fn render_bottom_bar<W: Write>(
             cursor,
         } => {
             let line = render_prompt_line(buffer, completions, selected, size.width);
-            queue!(
-                out,
-                MoveTo(0, size.height.saturating_sub(1)),
-                SetAttribute(Attribute::Reverse),
-                Print(line),
-                SetAttribute(Attribute::Reset)
-            )?;
+            queue!(out, MoveTo(0, size.height.saturating_sub(1)), Print(line))?;
             return Ok(Some(
                 (1 + cursor).min(size.width.saturating_sub(1) as usize) as u16,
             ));
