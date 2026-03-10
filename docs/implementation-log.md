@@ -235,3 +235,19 @@ This document records each completed implementation slice in detail, including t
   - renderer tests cover the copy-mode status bar
 - Commit: pending current worktree
 - Status: complete
+
+## Persistent metadata slice
+
+- Goal: persist session/window/pane metadata across daemon restarts and surface stale sessions honestly without pretending live PTY recovery exists.
+- Files changed:
+  - runtime and daemon: `src/server.rs`, `src/client.rs`, `src/ipc.rs`, `src/paths.rs`, `src/bin/admuxd.rs`, `src/cli.rs`
+  - persistence module: `src/persistence.rs`, `src/lib.rs`
+  - docs: `README.md`, `docs/detailed-status.md`
+- Verification:
+  - `cargo test`
+- Observed result:
+  - daemon now reads and writes `state.json`
+  - `ls` and chooser/list windows can show stale sessions after a daemon restart
+  - attaching a stale session fails with a clear “persisted metadata only” error instead of pretending recovery is possible
+- Commit: pending current worktree
+- Status: complete

@@ -11,6 +11,7 @@
 
 - TOML config parsing with defaults in `src/config.rs`
 - XDG-aware path resolution with `ADMUX_SOCKET` and `ADMUX_CONFIG` overrides in `src/paths.rs`
+- persistent metadata path resolution via `state.json` in `src/paths.rs`
 
 ### Protocol and daemon
 
@@ -28,6 +29,7 @@
 - pane/window/session cleanup when child processes exit
 - resize path from the client into all pane PTYs plus stored viewport geometry
 - PTY resize handling now keeps the current screen stable while shrinking and rebuilds from raw history when panes expand again
+- session/window/pane metadata persists across daemon restarts, with stale session listings when live PTYs are gone
 
 ### Layout and pane foundations
 
@@ -117,10 +119,11 @@ Observed result:
 - pending resize and divider stability commit in current worktree
 - pending nested session redirect commit in current worktree
 - pending modal copy mode commit in current worktree
+- pending persistent metadata commit in current worktree
 
 ## Known gaps
 
-- session state is in-memory only while `admuxd` is alive
+- live pane/process recovery after `admuxd` restart is still out of scope
 
 ## Module map
 
@@ -130,6 +133,7 @@ Observed result:
 - `src/config.rs`: TOML config types and loaders
 - `src/ipc.rs`: request/response protocol
 - `src/paths.rs`: runtime/config path resolution
+- `src/persistence.rs`: on-disk metadata format and load/save helpers
 - `src/server.rs`: daemon loop and session request handling
 - `src/session.rs`: session runtime model
 - `src/pty.rs`: PTY-backed pane process management

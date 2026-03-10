@@ -7,6 +7,7 @@ use std::{
 pub struct RuntimePaths {
     pub socket_path: PathBuf,
     pub config_path: PathBuf,
+    pub state_path: PathBuf,
 }
 
 impl RuntimePaths {
@@ -21,9 +22,11 @@ impl RuntimePaths {
         if let Some(socket_path) = get_var("ADMUX_SOCKET") {
             let config_path =
                 get_var("ADMUX_CONFIG").unwrap_or_else(|| PathBuf::from("config.toml"));
+            let state_path = get_var("ADMUX_STATE").unwrap_or_else(|| PathBuf::from("state.json"));
             return Self {
                 socket_path,
                 config_path,
+                state_path,
             };
         }
 
@@ -40,6 +43,7 @@ impl RuntimePaths {
         Self {
             socket_path: runtime_root.join("admux").join("socket"),
             config_path: config_root.join("admux").join("config.toml"),
+            state_path: config_root.join("admux").join("state.json"),
         }
     }
 
@@ -72,6 +76,10 @@ mod tests {
             paths.config_path,
             PathBuf::from("/home/test/.config/admux/config.toml")
         );
+        assert_eq!(
+            paths.state_path,
+            PathBuf::from("/home/test/.config/admux/state.json")
+        );
     }
 
     #[test]
@@ -91,6 +99,10 @@ mod tests {
             paths.config_path,
             PathBuf::from("/home/tester/.config/admux/config.toml")
         );
+        assert_eq!(
+            paths.state_path,
+            PathBuf::from("/home/tester/.config/admux/state.json")
+        );
     }
 
     #[test]
@@ -101,5 +113,6 @@ mod tests {
 
         assert_eq!(paths.socket_path, PathBuf::from("/tmp/custom-admux.sock"));
         assert_eq!(paths.config_path, PathBuf::from("config.toml"));
+        assert_eq!(paths.state_path, PathBuf::from("state.json"));
     }
 }

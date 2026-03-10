@@ -35,12 +35,13 @@ Implemented now:
 - chooser collapsed by default with `Tab` and `+` / `-` expand-collapse controls
 - mouse focus, drag-selection copy, wheel scroll, and border resize
 - modal copy mode with pane navigation, scrollback paging, selection, and yank
+- persistent session/window/pane metadata across daemon restarts, with stale session listing when processes are gone
 - resize handling that preserves pane state while shrinking and restores PTY history when panes expand again
 - unit, integration, and binary smoke coverage
 
 Not finished yet:
 
-- restart recovery or persistent session metadata
+- live pane/process recovery across daemon restart
 
 ## Build and run
 
@@ -84,6 +85,7 @@ cargo run --bin admuxd -- serve
 ## Config
 
 Configuration is read from `~/.config/admux/config.toml`.
+Persistent session metadata is stored in `~/.config/admux/state.json`.
 
 Example:
 

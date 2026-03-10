@@ -12,9 +12,10 @@ use anyhow::{Context, Result, bail};
 use crate::{
     ipc::{
         CURRENT_PROTOCOL_VERSION, CommandRequest, CommandResponse, CycleDirection,
-        NavigationDirection, ProtocolVersion,
+        NavigationDirection, ProtocolVersion, SessionSummary,
     },
     pane::{PaneId, WindowId},
+    persistence::{PersistedSession, PersistedState, load_state, save_state},
     session::Session,
 };
 
@@ -24,13 +25,28 @@ pub enum ServerState {
     Running,
 }
 
-#[derive(Default)]
 pub struct SessionStore {
     sessions: BTreeMap<String, Session>,
+    persisted_sessions: BTreeMap<String, PersistedSession>,
+    state_path: Option<std::path::PathBuf>,
     pending_switches: BTreeMap<String, String>,
     last_session: Option<String>,
     next_pane_id: u64,
     next_window_id: u64,
+}
+
+impl Default for SessionStore {
+    fn default() -> Self {
+        Self {
+            sessions: BTreeMap::new(),
+            persisted_sessions: BTreeMap::new(),
+            state_path: None,
+            pending_switches: BTreeMap::new(),
+            last_session: None,
+            next_pane_id: 0,
+            next_window_id: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,10 +57,22 @@ struct TargetRef {
 }
 
 impl SessionStore {
+    pub fn with_state_path(path: std::path::PathBuf) -> Result<Self> {
+        let persisted = load_state(&path)?;
+        Ok(Self {
+            persisted_sessions: persisted.sessions,
+            state_path: Some(path),
+            last_session: persisted.last_session,
+            next_pane_id: persisted.next_pane_id,
+            next_window_id: persisted.next_window_id,
+            ..Self::default()
+        })
+    }
+
     pub fn handle(&mut self, request: CommandRequest) -> CommandResponse {
         self.prune_dead_sessions();
 
-        match request {
+        let response = match request {
             CommandRequest::Hello { version } => self.handle_hello(version),
             CommandRequest::NewSession {
                 name,
@@ -87,38 +115,92 @@ impl SessionStore {
                     .remove(&session_name)
                     .filter(|target| self.sessions.contains_key(target))
                     .unwrap_or(session_name);
-                let Some(session) = self.sessions.get(&session_name) else {
+                if self.sessions.contains_key(&session_name) {
+                    let session = self.sessions.get(&session_name).expect("checked contains");
+                    let snapshot = session.render_snapshot(session.pane_area());
+                    CommandResponse::Attached {
+                        session: session_name,
+                        preview: session.active_pane_preview(),
+                        formatted_preview: session.active_pane_formatted_preview(),
+                        formatted_cursor: session.active_pane_formatted_cursor(),
+                        snapshot,
+                    }
+                } else if self.persisted_sessions.contains_key(&session_name) {
+                    CommandResponse::Error {
+                        message: format!(
+                            "session {session_name} only has persisted metadata; live pane processes cannot be recovered"
+                        ),
+                    }
+                } else {
                     return CommandResponse::Error {
                         message: format!("unknown session {session_name}"),
                     };
-                };
-                let snapshot = session.render_snapshot(session.pane_area());
-                CommandResponse::Attached {
-                    session: session_name,
-                    preview: session.active_pane_preview(),
-                    formatted_preview: session.active_pane_formatted_preview(),
-                    formatted_cursor: session.active_pane_formatted_cursor(),
-                    snapshot,
                 }
             }
             CommandRequest::ListSessions => CommandResponse::SessionList {
-                sessions: self.sessions.keys().cloned().collect(),
+                sessions: self.list_session_summaries(),
             },
-            CommandRequest::ListWindows { session } => match self.sessions.get(&session) {
-                Some(session) => CommandResponse::WindowList {
-                    windows: session.list_windows(),
-                },
-                None => CommandResponse::Error {
-                    message: format!("unknown session {session}"),
-                },
-            },
+            CommandRequest::ListWindows { session } => {
+                if let Some(session) = self.sessions.get(&session) {
+                    CommandResponse::WindowList {
+                        windows: session.list_windows(),
+                    }
+                } else if let Some(session) = self.persisted_sessions.get(&session) {
+                    CommandResponse::WindowList {
+                        windows: session
+                            .window_order
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(index, id)| {
+                                let window = session.windows.get(id)?;
+                                Some(crate::window::WindowSummary::new(
+                                    *id,
+                                    index,
+                                    window.name.clone(),
+                                    *id == session.active_window,
+                                ))
+                            })
+                            .collect(),
+                    }
+                } else {
+                    CommandResponse::Error {
+                        message: format!("unknown session {session}"),
+                    }
+                }
+            }
             CommandRequest::ListPanes { target } => match parse_target(&target) {
                 Ok(target) => match self.sessions.get(&target.session) {
                     Some(session) => CommandResponse::PaneList {
                         panes: session.list_panes(target.window),
                     },
-                    None => CommandResponse::Error {
-                        message: format!("unknown session {}", target.session),
+                    None => match self.persisted_sessions.get(&target.session) {
+                        Some(session) => {
+                            let window_id = target.window.unwrap_or(session.active_window);
+                            let panes = session
+                                .windows
+                                .get(&window_id)
+                                .map(|window| {
+                                    window
+                                        .layout
+                                        .panes()
+                                        .into_iter()
+                                        .filter_map(|pane_id| {
+                                            let pane = window.panes.get(&pane_id)?;
+                                            Some(crate::ipc::PaneSummary {
+                                                id: pane.id.0,
+                                                title: pane.title.clone(),
+                                                active: pane_id == window.layout.active,
+                                                window_id: window.id.0,
+                                            })
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            CommandResponse::PaneList { panes }
+                        }
+                        None => CommandResponse::Error {
+                            message: format!("unknown session {}", target.session),
+                        },
                     },
                 },
                 Err(message) => CommandResponse::Error { message },
@@ -126,9 +208,12 @@ impl SessionStore {
             CommandRequest::KillSession { session } => {
                 if let Some(removed) = self.sessions.remove(&session) {
                     let _ = removed.kill();
+                    self.persisted_sessions.remove(&session);
                     if self.last_session.as_deref() == Some(session.as_str()) {
                         self.last_session = self.sessions.keys().next_back().cloned();
                     }
+                    CommandResponse::SessionKilled { session }
+                } else if self.persisted_sessions.remove(&session).is_some() {
                     CommandResponse::SessionKilled { session }
                 } else {
                     CommandResponse::Error {
@@ -317,7 +402,9 @@ impl SessionStore {
                 },
             },
             CommandRequest::ReloadConfig => CommandResponse::ConfigReloaded,
-        }
+        };
+        self.persist_metadata();
+        response
     }
 
     fn next_pane(&mut self) -> PaneId {
@@ -331,7 +418,15 @@ impl SessionStore {
     }
 
     fn prune_dead_sessions(&mut self) {
-        self.sessions.retain(|_, session| session.prune_dead());
+        let dead_sessions: Vec<_> = self
+            .sessions
+            .iter_mut()
+            .filter_map(|(name, session)| (!session.prune_dead()).then_some(name.clone()))
+            .collect();
+        for session in dead_sessions {
+            self.sessions.remove(&session);
+            self.persisted_sessions.remove(&session);
+        }
         self.pending_switches.retain(|source, target| {
             self.sessions.contains_key(source) && self.sessions.contains_key(target)
         });
@@ -357,10 +452,49 @@ impl SessionStore {
 
     fn resolve_session(&self, requested: Option<String>) -> Option<String> {
         match requested {
-            Some(session) if self.sessions.contains_key(&session) => Some(session),
+            Some(session)
+                if self.sessions.contains_key(&session)
+                    || self.persisted_sessions.contains_key(&session) =>
+            {
+                Some(session)
+            }
             Some(_) => None,
-            None => self.last_session.clone(),
+            None => self
+                .last_session
+                .clone()
+                .or_else(|| self.persisted_sessions.keys().next_back().cloned()),
         }
+    }
+
+    fn list_session_summaries(&self) -> Vec<SessionSummary> {
+        let mut sessions = BTreeMap::<String, bool>::new();
+        for name in self.persisted_sessions.keys() {
+            sessions.insert(name.clone(), true);
+        }
+        for name in self.sessions.keys() {
+            sessions.insert(name.clone(), false);
+        }
+        sessions
+            .into_iter()
+            .map(|(name, stale)| SessionSummary { name, stale })
+            .collect()
+    }
+
+    fn persist_metadata(&mut self) {
+        for (name, session) in &self.sessions {
+            self.persisted_sessions
+                .insert(name.clone(), PersistedSession::from_live(session));
+        }
+        let Some(path) = self.state_path.as_ref() else {
+            return;
+        };
+        let state = PersistedState {
+            last_session: self.last_session.clone(),
+            next_pane_id: self.next_pane_id,
+            next_window_id: self.next_window_id,
+            sessions: self.persisted_sessions.clone(),
+        };
+        let _ = save_state(path, &state);
     }
 
     fn split_pane(
@@ -474,6 +608,7 @@ impl SessionStore {
                 Ok(None) => {
                     if !session.is_alive() {
                         self.sessions.remove(&target.session);
+                        self.persisted_sessions.remove(&target.session);
                     }
                     CommandResponse::FocusChanged
                 }
@@ -494,6 +629,7 @@ impl SessionStore {
                     Ok(still_alive) => {
                         if !still_alive {
                             self.sessions.remove(&target.session);
+                            self.persisted_sessions.remove(&target.session);
                         }
                         CommandResponse::WindowKilled {
                             session: target.session,
@@ -538,7 +674,7 @@ impl SessionStore {
     }
 }
 
-pub fn serve(socket_path: &Path) -> Result<()> {
+pub fn serve(socket_path: &Path, state_path: &Path) -> Result<()> {
     if let Some(parent) = socket_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create socket directory {}", parent.display()))?;
@@ -550,7 +686,9 @@ pub fn serve(socket_path: &Path) -> Result<()> {
 
     let listener = UnixListener::bind(socket_path)
         .with_context(|| format!("failed to bind socket {}", socket_path.display()))?;
-    let state = Arc::new(Mutex::new(SessionStore::default()));
+    let state = Arc::new(Mutex::new(SessionStore::with_state_path(
+        state_path.to_path_buf(),
+    )?));
     for stream in listener.incoming() {
         let mut stream = stream.context("failed to accept client")?;
         let response = {
@@ -631,6 +769,7 @@ mod tests {
         ipc::{CommandRequest, SwitchSource},
         layout::SplitAxis,
     };
+    use tempfile::tempdir;
 
     #[test]
     fn store_creates_and_lists_sessions() {
@@ -653,7 +792,10 @@ mod tests {
         assert_eq!(
             listed,
             CommandResponse::SessionList {
-                sessions: vec!["work".into()]
+                sessions: vec![SessionSummary {
+                    name: "work".into(),
+                    stale: false,
+                }]
             }
         );
     }
@@ -772,6 +914,46 @@ mod tests {
         assert!(matches!(
             attached,
             CommandResponse::Attached { session, .. } if session == "logs"
+        ));
+    }
+
+    #[test]
+    fn persisted_metadata_survives_store_restart() {
+        let dir = tempdir().expect("tempdir");
+        let state_path = dir.path().join("state.json");
+
+        let mut store =
+            SessionStore::with_state_path(state_path.clone()).expect("create persisted store");
+        let _ = store.handle(CommandRequest::NewSession {
+            name: Some("work".into()),
+            cwd: None,
+            command: vec!["sh".into()],
+            switch_from: None,
+        });
+        drop(store);
+
+        let mut restarted =
+            SessionStore::with_state_path(state_path).expect("reload persisted store");
+        assert_eq!(
+            restarted.handle(CommandRequest::ListSessions),
+            CommandResponse::SessionList {
+                sessions: vec![SessionSummary {
+                    name: "work".into(),
+                    stale: true,
+                }],
+            }
+        );
+        assert!(matches!(
+            restarted.handle(CommandRequest::ListWindows {
+                session: "work".into(),
+            }),
+            CommandResponse::WindowList { windows } if windows.len() == 1
+        ));
+        assert!(matches!(
+            restarted.handle(CommandRequest::Attach {
+                session: Some("work".into()),
+            }),
+            CommandResponse::Error { message } if message.contains("persisted metadata")
         ));
     }
 }

@@ -9,10 +9,10 @@ fn main() -> Result<()> {
     let cli = AdmuxdCli::parse();
     match cli.command {
         DaemonCommand::Serve(args) => {
-            let socket = args
-                .socket
-                .unwrap_or_else(|| admux::paths::RuntimePaths::resolve().socket_path);
-            server::serve(&socket)
+            let paths = admux::paths::RuntimePaths::resolve();
+            let socket = args.socket.unwrap_or(paths.socket_path);
+            let state = args.state.unwrap_or(paths.state_path);
+            server::serve(&socket, &state)
         }
     }
 }

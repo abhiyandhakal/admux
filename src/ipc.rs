@@ -134,7 +134,7 @@ pub enum CommandResponse {
         snapshot: Option<RenderSnapshot>,
     },
     SessionList {
-        sessions: Vec<String>,
+        sessions: Vec<SessionSummary>,
     },
     WindowList {
         windows: Vec<WindowSummary>,
@@ -226,6 +226,13 @@ pub struct PaneSummary {
     pub title: String,
     pub active: bool,
     pub window_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub name: String,
+    #[serde(default)]
+    pub stale: bool,
 }
 
 #[cfg(test)]

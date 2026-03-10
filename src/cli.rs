@@ -151,6 +151,8 @@ pub enum DaemonCommand {
 pub struct ServeArgs {
     #[arg(long)]
     pub socket: Option<PathBuf>,
+    #[arg(long)]
+    pub state: Option<PathBuf>,
 }
 
 #[cfg(test)]
@@ -202,6 +204,7 @@ mod tests {
             cli.command,
             DaemonCommand::Serve(ServeArgs {
                 socket: Some(PathBuf::from("/tmp/admux.sock")),
+                state: None,
             })
         );
     }

@@ -308,10 +308,13 @@ fn with_connection<T>(
 fn spawn_daemon(paths: &RuntimePaths) -> Result<()> {
     let daemon_path = resolve_daemon_binary()?;
     let socket = paths.socket_path.display().to_string();
+    let state = paths.state_path.display().to_string();
     Command::new(daemon_path)
         .arg("serve")
         .arg("--socket")
         .arg(socket)
+        .arg("--state")
+        .arg(state)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -407,7 +410,11 @@ fn print_response(paths: &RuntimePaths, response: CommandResponse) -> Result<()>
         }
         CommandResponse::SessionList { sessions } => {
             for session in sessions {
-                println!("{session}");
+                if session.stale {
+                    println!("{} (stale)", session.name);
+                } else {
+                    println!("{}", session.name);
+                }
             }
         }
         CommandResponse::WindowList { windows } => {
@@ -1102,7 +1109,17 @@ fn execute_prompt_command(
 
 fn format_list_response(response: CommandResponse) -> String {
     match response {
-        CommandResponse::SessionList { sessions } => sessions.join(" "),
+        CommandResponse::SessionList { sessions } => sessions
+            .into_iter()
+            .map(|session| {
+                if session.stale {
+                    format!("{}(stale)", session.name)
+                } else {
+                    session.name
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
         CommandResponse::WindowList { windows } => windows
             .into_iter()
             .map(|window| {
@@ -1168,12 +1185,13 @@ fn rebuild_choose_tree(paths: &RuntimePaths, state: &mut ChooseTreeState) -> Res
     let mut lines = Vec::new();
 
     for session in sessions {
-        let expanded = state.expanded_sessions.contains(&session);
-        items.push(ChooseItem::Session(session.clone()));
+        let session_name = session.name.clone();
+        let expanded = state.expanded_sessions.contains(&session_name);
+        items.push(ChooseItem::Session(session_name.clone()));
         let window_count = match request_response(
             paths,
             CommandRequest::ListWindows {
-                session: session.clone(),
+                session: session_name.clone(),
             },
         )? {
             CommandResponse::WindowList { windows } => windows.len(),
@@ -1181,10 +1199,16 @@ fn rebuild_choose_tree(paths: &RuntimePaths, state: &mut ChooseTreeState) -> Res
         };
         lines.push(TreeLine {
             depth: 0,
-            label: if session == state.attached_session {
-                format!("{session}: {window_count} windows (attached)")
+            label: if session_name == state.attached_session {
+                if session.stale {
+                    format!("{session_name}: {window_count} windows (attached, stale)")
+                } else {
+                    format!("{session_name}: {window_count} windows (attached)")
+                }
+            } else if session.stale {
+                format!("{session_name}: {window_count} windows (stale)")
             } else {
-                format!("{session}: {window_count} windows")
+                format!("{session_name}: {window_count} windows")
             },
             selected: false,
             expanded,
@@ -1196,7 +1220,7 @@ fn rebuild_choose_tree(paths: &RuntimePaths, state: &mut ChooseTreeState) -> Res
         let windows = match request_response(
             paths,
             CommandRequest::ListWindows {
-                session: session.clone(),
+                session: session_name.clone(),
             },
         )? {
             CommandResponse::WindowList { windows } => windows,
@@ -1205,9 +1229,9 @@ fn rebuild_choose_tree(paths: &RuntimePaths, state: &mut ChooseTreeState) -> Res
         for window in windows {
             let expanded_window = state
                 .expanded_windows
-                .contains(&(session.clone(), window.id));
+                .contains(&(session_name.clone(), window.id));
             items.push(ChooseItem::Window {
-                session: session.clone(),
+                session: session_name.clone(),
                 window_id: window.id,
             });
             lines.push(TreeLine {
@@ -1223,7 +1247,7 @@ fn rebuild_choose_tree(paths: &RuntimePaths, state: &mut ChooseTreeState) -> Res
             let panes = match request_response(
                 paths,
                 CommandRequest::ListPanes {
-                    target: format!("{session}:{}", window.id),
+                    target: format!("{session_name}:{}", window.id),
                 },
             )? {
                 CommandResponse::PaneList { panes } => panes,
@@ -1231,7 +1255,7 @@ fn rebuild_choose_tree(paths: &RuntimePaths, state: &mut ChooseTreeState) -> Res
             };
             for pane in panes {
                 items.push(ChooseItem::Pane {
-                    session: session.clone(),
+                    session: session_name.clone(),
                     window_id: window.id,
                     pane_id: pane.id,
                 });
@@ -1448,8 +1472,10 @@ fn toggle_choose_selected(tree: &mut ChooseTreeState) {
 }
 
 fn expand_all_choose_items(paths: &RuntimePaths, tree: &mut ChooseTreeState) -> Result<()> {
-    let sessions = match request_response(paths, CommandRequest::ListSessions)? {
-        CommandResponse::SessionList { sessions } => sessions,
+    let sessions: Vec<String> = match request_response(paths, CommandRequest::ListSessions)? {
+        CommandResponse::SessionList { sessions } => {
+            sessions.into_iter().map(|session| session.name).collect()
+        }
         other => return Err(anyhow!("unexpected session list response: {other:?}")),
     };
     tree.expanded_sessions = sessions.iter().cloned().collect();
@@ -1830,6 +1856,7 @@ mod tests {
         let paths = RuntimePaths {
             socket_path: "/tmp/admux-test/socket".into(),
             config_path: "/tmp/admux-test/config.toml".into(),
+            state_path: "/tmp/admux-test/state.json".into(),
         };
         assert!(paths.socket_path.ends_with("socket"));
     }
