@@ -467,9 +467,12 @@ impl Session {
     }
 
     pub fn prune_dead(&mut self) -> bool {
+        let mut changed = false;
         let mut empty_windows = Vec::new();
         for (window_id, window) in &mut self.windows {
+            let before = window.panes.len();
             window.prune_dead();
+            changed |= before != window.panes.len();
             if window.panes.is_empty() {
                 empty_windows.push(*window_id);
             }
@@ -478,12 +481,18 @@ impl Session {
         for window_id in empty_windows {
             self.windows.remove(&window_id);
             self.window_order.retain(|id| *id != window_id);
+            changed = true;
         }
 
         if !self.windows.contains_key(&self.active_window)
             && let Some(window_id) = self.window_order.last().copied()
         {
             self.active_window = window_id;
+            changed = true;
+        }
+
+        if changed && !self.window_order.is_empty() {
+            let _ = self.sync_pane_sizes();
         }
 
         !self.window_order.is_empty()

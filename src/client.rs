@@ -1519,9 +1519,9 @@ fn resize_drag_request(
             if delta == 0 {
                 None
             } else if mouse.column > resize.last_col {
-                Some((NavigationDirection::Right, delta))
-            } else {
                 Some((NavigationDirection::Left, delta))
+            } else {
+                Some((NavigationDirection::Right, delta))
             }
         }
         NavigationDirection::Down => {
@@ -1529,9 +1529,9 @@ fn resize_drag_request(
             if delta == 0 {
                 None
             } else if mouse.row > resize.last_row {
-                Some((NavigationDirection::Down, delta))
-            } else {
                 Some((NavigationDirection::Up, delta))
+            } else {
+                Some((NavigationDirection::Down, delta))
             }
         }
         NavigationDirection::Left | NavigationDirection::Up => None,
@@ -1756,7 +1756,7 @@ mod tests {
             },
         );
 
-        assert_eq!(request, Some((NavigationDirection::Left, 3)));
+        assert_eq!(request, Some((NavigationDirection::Right, 3)));
     }
 
     #[test]
@@ -1778,6 +1778,6 @@ mod tests {
             },
         );
 
-        assert_eq!(request, Some((NavigationDirection::Right, 3)));
+        assert_eq!(request, Some((NavigationDirection::Left, 3)));
     }
 }

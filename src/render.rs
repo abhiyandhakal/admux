@@ -13,6 +13,11 @@ use crate::{
     pane::Rect,
 };
 
+const CONNECT_UP: u8 = 0b0001;
+const CONNECT_DOWN: u8 = 0b0010;
+const CONNECT_LEFT: u8 = 0b0100;
+const CONNECT_RIGHT: u8 = 0b1000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TerminalSize {
     pub width: u16,
@@ -193,9 +198,10 @@ fn render_split_separators<W: Write>(
     out: &mut W,
     snapshot: &RenderSnapshot,
 ) -> std::io::Result<()> {
+    use std::collections::BTreeMap;
+
     let panes = &snapshot.panes;
-    let mut vertical = Vec::new();
-    let mut horizontal = Vec::new();
+    let mut grid = BTreeMap::<(u16, u16), u8>::new();
 
     for left in panes {
         for right in panes {
@@ -205,34 +211,65 @@ fn render_split_separators<W: Write>(
             if left.rect.x + left.rect.width + 1 == right.rect.x {
                 let start = left.rect.y.max(right.rect.y);
                 let end = (left.rect.y + left.rect.height).min(right.rect.y + right.rect.height);
+                let x = left.rect.x + left.rect.width;
                 for row in start..end {
-                    vertical.push((left.rect.x + left.rect.width, row));
+                    let entry = grid.entry((x, row)).or_insert(0);
+                    if row > start {
+                        *entry |= CONNECT_UP;
+                    }
+                    if row + 1 < end {
+                        *entry |= CONNECT_DOWN;
+                    }
                 }
             }
             if left.rect.y + left.rect.height + 1 == right.rect.y {
                 let start = left.rect.x.max(right.rect.x);
                 let end = (left.rect.x + left.rect.width).min(right.rect.x + right.rect.width);
+                let y = left.rect.y + left.rect.height;
                 for col in start..end {
-                    horizontal.push((col, left.rect.y + left.rect.height));
+                    let entry = grid.entry((col, y)).or_insert(0);
+                    if col > start {
+                        *entry |= CONNECT_LEFT;
+                    }
+                    if col + 1 < end {
+                        *entry |= CONNECT_RIGHT;
+                    }
+                }
+                if start > 0 && grid.contains_key(&(start - 1, y)) {
+                    *grid.entry((start - 1, y)).or_insert(0) |= CONNECT_RIGHT;
+                    *grid.entry((start, y)).or_insert(0) |= CONNECT_LEFT;
+                }
+                if grid.contains_key(&(end, y)) {
+                    *grid.entry((end, y)).or_insert(0) |= CONNECT_LEFT;
+                    *grid.entry((end - 1, y)).or_insert(0) |= CONNECT_RIGHT;
                 }
             }
         }
     }
 
-    for (x, y) in &vertical {
-        let ch = if horizontal.iter().any(|(hx, hy)| hx == x && hy == y) {
-            '┼'
-        } else {
-            '│'
-        };
-        queue!(out, MoveTo(*x, *y), Print(ch))?;
-    }
-    for (x, y) in &horizontal {
-        if !vertical.iter().any(|(vx, vy)| vx == x && vy == y) {
-            queue!(out, MoveTo(*x, *y), Print('─'))?;
-        }
+    for ((x, y), mask) in grid {
+        queue!(out, MoveTo(x, y), Print(connection_glyph(mask)))?;
     }
     Ok(())
+}
+
+fn connection_glyph(mask: u8) -> char {
+    match mask {
+        m if m == (CONNECT_UP | CONNECT_DOWN) => '│',
+        m if m == (CONNECT_LEFT | CONNECT_RIGHT) => '─',
+        m if m == (CONNECT_UP | CONNECT_DOWN | CONNECT_RIGHT) => '├',
+        m if m == (CONNECT_UP | CONNECT_DOWN | CONNECT_LEFT) => '┤',
+        m if m == (CONNECT_LEFT | CONNECT_RIGHT | CONNECT_DOWN) => '┬',
+        m if m == (CONNECT_LEFT | CONNECT_RIGHT | CONNECT_UP) => '┴',
+        m if m == (CONNECT_UP | CONNECT_DOWN | CONNECT_LEFT | CONNECT_RIGHT) => '┼',
+        m if m == (CONNECT_DOWN | CONNECT_RIGHT) => '┌',
+        m if m == (CONNECT_DOWN | CONNECT_LEFT) => '┐',
+        m if m == (CONNECT_UP | CONNECT_RIGHT) => '└',
+        m if m == (CONNECT_UP | CONNECT_LEFT) => '┘',
+        m if m & (CONNECT_UP | CONNECT_DOWN) != 0 => '│',
+        m if m & (CONNECT_LEFT | CONNECT_RIGHT) != 0 => '─',
+        _ => ' ',
+    }
 }
 
 fn render_preview_snapshot<W: Write>(
