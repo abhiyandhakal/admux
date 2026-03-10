@@ -199,10 +199,12 @@ fn render_split_separators<W: Write>(
     out: &mut W,
     snapshot: &RenderSnapshot,
 ) -> std::io::Result<()> {
-    use std::collections::BTreeMap;
+    use std::collections::BTreeSet;
 
     let panes = &snapshot.panes;
-    let mut grid = BTreeMap::<(u16, u16), u8>::new();
+    let mut occupied = BTreeSet::<(u16, u16)>::new();
+    let mut horizontal_spans = Vec::<(u16, u16, u16)>::new();
+    let mut vertical_spans = Vec::<(u16, u16, u16)>::new();
 
     for left in panes {
         for right in panes {
@@ -213,45 +215,63 @@ fn render_split_separators<W: Write>(
                 let start = left.rect.y.max(right.rect.y);
                 let end = (left.rect.y + left.rect.height).min(right.rect.y + right.rect.height);
                 let x = left.rect.x + left.rect.width;
+                vertical_spans.push((x, start, end));
                 for row in start..end {
-                    let entry = grid.entry((x, row)).or_insert(0);
-                    if row > start {
-                        *entry |= CONNECT_UP;
-                    }
-                    if row + 1 < end {
-                        *entry |= CONNECT_DOWN;
-                    }
+                    occupied.insert((x, row));
                 }
             }
             if left.rect.y + left.rect.height + 1 == right.rect.y {
                 let start = left.rect.x.max(right.rect.x);
                 let end = (left.rect.x + left.rect.width).min(right.rect.x + right.rect.width);
                 let y = left.rect.y + left.rect.height;
+                horizontal_spans.push((y, start, end));
                 for col in start..end {
-                    let entry = grid.entry((col, y)).or_insert(0);
-                    if col > start {
-                        *entry |= CONNECT_LEFT;
-                    }
-                    if col + 1 < end {
-                        *entry |= CONNECT_RIGHT;
-                    }
-                }
-                if start > 0 && grid.contains_key(&(start - 1, y)) {
-                    *grid.entry((start - 1, y)).or_insert(0) |= CONNECT_RIGHT;
-                    *grid.entry((start, y)).or_insert(0) |= CONNECT_LEFT;
-                }
-                if grid.contains_key(&(end, y)) {
-                    *grid.entry((end, y)).or_insert(0) |= CONNECT_LEFT;
-                    *grid.entry((end - 1, y)).or_insert(0) |= CONNECT_RIGHT;
+                    occupied.insert((col, y));
                 }
             }
         }
     }
 
-    for ((x, y), mask) in grid {
+    for (y, start, end) in horizontal_spans {
+        if start > 0 && occupied.contains(&(start - 1, y)) {
+            occupied.insert((start - 1, y));
+        }
+        if occupied.contains(&(end, y)) {
+            occupied.insert((end, y));
+        }
+    }
+    for (x, start, end) in vertical_spans {
+        if start > 0 && occupied.contains(&(x, start - 1)) {
+            occupied.insert((x, start - 1));
+        }
+        if occupied.contains(&(x, end)) {
+            occupied.insert((x, end));
+        }
+    }
+
+    for (x, y) in occupied.iter().copied() {
+        let mask = connection_mask((x, y), &occupied);
         queue!(out, MoveTo(x, y), Print(connection_glyph(mask)))?;
     }
     Ok(())
+}
+
+fn connection_mask(cell: (u16, u16), occupied: &std::collections::BTreeSet<(u16, u16)>) -> u8 {
+    let (x, y) = cell;
+    let mut mask = 0;
+    if y > 0 && occupied.contains(&(x, y - 1)) {
+        mask |= CONNECT_UP;
+    }
+    if occupied.contains(&(x, y + 1)) {
+        mask |= CONNECT_DOWN;
+    }
+    if x > 0 && occupied.contains(&(x - 1, y)) {
+        mask |= CONNECT_LEFT;
+    }
+    if occupied.contains(&(x + 1, y)) {
+        mask |= CONNECT_RIGHT;
+    }
+    mask
 }
 
 fn connection_glyph(mask: u8) -> char {
@@ -701,5 +721,15 @@ mod tests {
         assert!(rendered.contains("Keys"));
         assert!(rendered.contains("Ctrl-b ?"));
         assert!(rendered.contains("help | q cancel"));
+    }
+
+    #[test]
+    fn connection_mask_produces_joined_tee() {
+        let occupied =
+            std::collections::BTreeSet::from([(10_u16, 2_u16), (10, 3), (10, 4), (11, 3), (12, 3)]);
+
+        let mask = connection_mask((10, 3), &occupied);
+
+        assert_eq!(connection_glyph(mask), '├');
     }
 }
