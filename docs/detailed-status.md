@@ -47,7 +47,7 @@
   - multi-pane redraws from daemon snapshots
   - internal pane dividers with joined Unicode junction glyphs
   - one-row tmux-style statusline
-  - normal statusline shows `[session]`, tmux-like window entries with current `*` and last-selected `-`, and short hostname plus local date/time on the right
+  - normal statusline anchors `[session]` on the left, centers the tmux-like window list, and keeps short hostname plus local date/time on the right
   - prompt, copy mode, chooser, and help repurpose the single status row instead of mixing normal status content with mode text
   - `status_position` now works for both top and bottom placement, including cursor/mouse/body offsets
   - `Ctrl-b d` detach

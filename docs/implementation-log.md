@@ -235,6 +235,7 @@ This document records each completed implementation slice in detail, including t
     - `ADMUX_SOCKET=<temp-socket> ADMUX_STATE=<temp-state> target/debug/admux kill status-smoke`
 - Observed result:
   - statusline now renders a tmux-style session segment, current `*` marker, and last-selected `-` marker
+  - the normal bar now uses real left, centered, and right zones instead of a left-flowing stream
   - the normal right side now shows short hostname plus local date/time instead of pane metadata
   - prompt and copy mode rows now fully repurpose the status line instead of mixing with the normal bar
   - `status_position = "top"` now moves pane rendering, chooser/help bodies, cursor restore, and mouse hit-testing below the bar

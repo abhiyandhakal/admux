@@ -373,7 +373,15 @@ fn render_bottom_bar<W: Write>(
 ) -> std::io::Result<Option<u16>> {
     let row = status_row(ui, size);
     let content = match bottom_bar {
-        BottomBar::Status { message } => render_status_line(session, snapshot, message, ui, size.width),
+        BottomBar::Status { message } => {
+            if message.is_none()
+                && let Some(zones) = build_tmux_status_zones(session, snapshot, ui, size.width)
+            {
+                render_status_zones(out, row, &zones, size.width)?;
+                return Ok(None);
+            }
+            render_status_line(session, snapshot, message, ui, size.width)
+        }
         BottomBar::CopyMode => vec![StatusSegment::message(
             "[copy-mode] h/j/k/l move  0/$ line  g/G top/bottom  PgUp/PgDn scroll  Space select  y copy  q quit",
         )],
@@ -472,6 +480,15 @@ struct StatusSegment {
     attrs: Vec<Attribute>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StatusZones {
+    left: Vec<StatusSegment>,
+    center: Vec<StatusSegment>,
+    right: Vec<StatusSegment>,
+    center_start: usize,
+    right_start: usize,
+}
+
 impl StatusSegment {
     fn session(text: impl Into<String>) -> Self {
         Self {
@@ -517,6 +534,36 @@ fn render_status_line(
         return vec![StatusSegment::message(fit_width(message, width))];
     }
 
+    let Some(zones) = build_tmux_status_zones(session, snapshot, ui, width) else {
+        return Vec::new();
+    };
+    let mut result = zones.left;
+    result.extend(zones.center);
+    result.extend(zones.right);
+    result
+}
+
+fn render_window_segment(window: &crate::window::WindowSummary) -> StatusSegment {
+    let marker = if window.active {
+        "*"
+    } else if window.last_selected {
+        "-"
+    } else {
+        ""
+    };
+    if window.active {
+        StatusSegment::active(format!(" {}:{}{} ", window.index, window.name, marker))
+    } else {
+        StatusSegment::plain(format!(" {}:{}{} ", window.index, window.name, marker))
+    }
+}
+
+fn build_tmux_status_zones(
+    session: &str,
+    snapshot: &RenderSnapshot,
+    ui: &UiConfig,
+    width: u16,
+) -> Option<StatusZones> {
     let mut left = vec![StatusSegment::session(format!("[{}] ", session))];
     let mut center = snapshot
         .windows
@@ -537,25 +584,23 @@ fn render_status_line(
     };
 
     fit_tmux_status_layout(&mut left, &mut center, &mut right, width);
-    let mut result = left;
-    result.extend(center);
-    result.extend(right);
-    result
-}
 
-fn render_window_segment(window: &crate::window::WindowSummary) -> StatusSegment {
-    let marker = if window.active {
-        "*"
-    } else if window.last_selected {
-        "-"
+    let center_len = total_len(&[], &center, &[]);
+    let right_len = total_len(&[], &[], &right);
+    let center_start = if width as usize > center_len {
+        (width as usize - center_len) / 2
     } else {
-        ""
+        0
     };
-    if window.active {
-        StatusSegment::active(format!(" {}:{}{} ", window.index, window.name, marker))
-    } else {
-        StatusSegment::plain(format!(" {}:{}{} ", window.index, window.name, marker))
-    }
+    let right_start = (width as usize).saturating_sub(right_len);
+
+    Some(StatusZones {
+        left,
+        center,
+        right,
+        center_start,
+        right_start,
+    })
 }
 
 fn fit_tmux_status_layout(
@@ -564,9 +609,10 @@ fn fit_tmux_status_layout(
     right: &mut Vec<StatusSegment>,
     width: u16,
 ) {
-    while total_len(left, center, right) > width as usize {
-        if right.len() > 1 {
-            right.pop();
+    while zones_overlap(left, center, right, width) {
+        if let Some(clock) = right.last_mut()
+            && simplify_clock_segment(clock)
+        {
             continue;
         }
         if let Some(segment) = center
@@ -579,10 +625,8 @@ fn fit_tmux_status_layout(
                 continue;
             }
         }
-        if let Some(segment) = right.first_mut()
-            && segment.len() > 8
-        {
-            segment.text = truncate(&segment.text, (segment.len().saturating_sub(4)) as u16);
+        if right.len() > 1 {
+            right.remove(0);
             continue;
         }
         if right.len() == 1 {
@@ -590,9 +634,8 @@ fn fit_tmux_status_layout(
             continue;
         }
         if let Some(segment) = left.first_mut()
-            && segment.len() > 6
+            && shorten_session_segment(segment)
         {
-            segment.text = format!("[{}] ", truncate(segment.text.trim_matches(['[', ']']), 4));
             continue;
         }
         if let Some(segment) = center
@@ -605,6 +648,26 @@ fn fit_tmux_status_layout(
         }
         break;
     }
+}
+
+fn zones_overlap(
+    left: &[StatusSegment],
+    center: &[StatusSegment],
+    right: &[StatusSegment],
+    width: u16,
+) -> bool {
+    let left_len = total_len(left, &[], &[]);
+    let center_len = total_len(&[], center, &[]);
+    let right_len = total_len(&[], &[], right);
+    let center_start = if width as usize > center_len {
+        (width as usize - center_len) / 2
+    } else {
+        0
+    };
+    let center_end = center_start.saturating_add(center_len);
+    let right_start = (width as usize).saturating_sub(right_len);
+
+    left_len > center_start || center_end > right_start || total_len(left, center, right) > width as usize
 }
 
 fn shorten_window_segment(segment: &mut StatusSegment) -> bool {
@@ -620,7 +683,37 @@ fn shorten_window_segment(segment: &mut StatusSegment) -> bool {
         segment.text = format!(" {}:{}{} ", index, shortened, marker);
         return true;
     }
+    if !segment.attrs.contains(&Attribute::Bold) {
+        let marker = marker.map(|ch| ch.to_string()).unwrap_or_default();
+        segment.text = format!(" {}{} ", index, marker);
+        return true;
+    }
     false
+}
+
+fn simplify_clock_segment(segment: &mut StatusSegment) -> bool {
+    let trimmed = segment.text.trim();
+    if let Some((time, _date)) = trimmed.split_once(' ') {
+        segment.text = time.to_string();
+        return true;
+    }
+    false
+}
+
+fn shorten_session_segment(segment: &mut StatusSegment) -> bool {
+    let trimmed = segment.text.trim();
+    let name = trimmed.trim_matches(['[', ']']);
+    let name_len = name.chars().count();
+    if name_len <= 1 {
+        return false;
+    }
+    let shortened = truncate(name, (name_len.saturating_sub(1)) as u16);
+    let next = format!("[{}] ", shortened);
+    if next == segment.text {
+        return false;
+    }
+    segment.text = next;
+    true
 }
 
 fn total_len(
@@ -660,6 +753,49 @@ fn render_status_segments<W: Write>(
         queue!(out, SetAttribute(Attribute::Reverse), Print(" ".repeat(width as usize - written)))?;
     }
     queue!(out, SetAttribute(Attribute::Reset))?;
+    Ok(())
+}
+
+fn render_status_zones<W: Write>(
+    out: &mut W,
+    row: u16,
+    zones: &StatusZones,
+    width: u16,
+) -> std::io::Result<()> {
+    queue!(
+        out,
+        MoveTo(0, row),
+        SetAttribute(Attribute::Reverse),
+        Print(" ".repeat(width as usize)),
+        SetAttribute(Attribute::Reset)
+    )?;
+    render_status_segments_at(out, row, 0, &zones.left, width)?;
+    render_status_segments_at(out, row, zones.center_start as u16, &zones.center, width)?;
+    render_status_segments_at(out, row, zones.right_start as u16, &zones.right, width)?;
+    Ok(())
+}
+
+fn render_status_segments_at<W: Write>(
+    out: &mut W,
+    row: u16,
+    start: u16,
+    segments: &[StatusSegment],
+    width: u16,
+) -> std::io::Result<()> {
+    let mut written = start as usize;
+    for segment in segments {
+        if written >= width as usize {
+            break;
+        }
+        queue!(out, MoveTo(written as u16, row), SetAttribute(Attribute::Reset))?;
+        for attr in &segment.attrs {
+            queue!(out, SetAttribute(*attr))?;
+        }
+        let remaining = width as usize - written;
+        let text = truncate(&segment.text, remaining as u16);
+        written += text.chars().count();
+        queue!(out, Print(text), SetAttribute(Attribute::Reset))?;
+    }
     Ok(())
 }
 
@@ -1051,6 +1187,32 @@ mod tests {
 
         assert!(joined.contains("0:shell*"));
         assert!(joined.contains("1:editor-"));
+    }
+
+    #[test]
+    fn tmux_status_zones_center_window_list() {
+        let mut snapshot = sample_snapshot();
+        snapshot.windows = vec![
+            WindowSummary { id: 1, index: 0, name: "shell".into(), active: true, last_selected: false },
+            WindowSummary { id: 2, index: 1, name: "editor".into(), active: false, last_selected: true },
+        ];
+
+        let zones = build_tmux_status_zones("work", &snapshot, &sample_ui(), 80).expect("zones");
+        let center_len = total_len(&[], &zones.center, &[]);
+        let expected = (80usize - center_len) / 2;
+
+        assert_eq!(zones.center_start, expected);
+        assert!(zones.center_start > total_len(&zones.left, &[], &[]));
+    }
+
+    #[test]
+    fn tmux_status_zones_right_align_host_and_clock() {
+        let zones = build_tmux_status_zones("work", &sample_snapshot(), &sample_ui(), 80)
+            .expect("zones");
+        let right_len = total_len(&[], &[], &zones.right);
+
+        assert_eq!(zones.right_start, 80usize.saturating_sub(right_len));
+        assert!(zones.right_start >= zones.center_start + total_len(&[], &zones.center, &[]));
     }
 
     #[test]
