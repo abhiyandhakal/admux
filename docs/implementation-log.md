@@ -218,6 +218,23 @@ This document records each completed implementation slice in detail, including t
 - Commit: pending current worktree
 - Status: complete
 
+## Statusline enhancement slice
+
+- Goal: replace the loose reverse-video bar with a denser one-row tmux-plus statusline that consistently shows session, windows, active pane or transient message, and clock, while honoring top or bottom placement from config.
+- Files changed:
+  - config and client plumbing: `Cargo.toml`, `src/config.rs`, `src/client.rs`
+  - rendering: `src/render.rs`
+  - docs: `README.md`, `docs/detailed-status.md`
+- Verification:
+  - `cargo test`
+- Observed result:
+  - statusline rendering now uses explicit prioritized segments instead of raw left/center/right strings
+  - inactive windows compress before the active window entry is shortened
+  - transient messages replace pane metadata on the right and the clock drops first on narrow terminals
+  - `status_position = "top"` now moves pane rendering, chooser/help bodies, cursor restore, and mouse hit-testing below the bar
+- Commit: pending current worktree
+- Status: complete
+
 ## Modal copy mode slice
 
 - Goal: replace drag-only copy interaction with a real modal copy mode that can be entered from the keyboard, navigate the active pane buffer, page scrollback, select text, and yank through the existing clipboard path.

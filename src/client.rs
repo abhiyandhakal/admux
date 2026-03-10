@@ -23,6 +23,7 @@ use crossterm::{
 use crate::{
     cli::{AdmuxCli, ClientCommand, NewWindowArgs, ResizePaneArgs, SelectPaneArgs, SplitPaneArgs},
     commands::{InteractiveCommand, complete as complete_commands, parse as parse_command},
+    config::{Config, StatusPosition, UiConfig},
     copy_mode::{CopyMode, Selection},
     input::{InputAction, InputMode, InputState},
     ipc::{
@@ -452,6 +453,7 @@ fn print_response(paths: &RuntimePaths, response: CommandResponse) -> Result<()>
 }
 
 fn attach_interactive(paths: &RuntimePaths, session: &str) -> Result<()> {
+    let config = load_config(paths)?;
     let mut stdout = io::stdout();
     terminal::enable_raw_mode().context("failed to enable raw mode")?;
     execute!(
@@ -463,7 +465,7 @@ fn attach_interactive(paths: &RuntimePaths, session: &str) -> Result<()> {
     )
     .context("failed to enter alternate screen")?;
 
-    let result = run_attach_loop(paths, session.to_string(), &mut stdout);
+    let result = run_attach_loop(paths, session.to_string(), &config.ui, &mut stdout);
 
     let _ = execute!(
         stdout,
@@ -479,6 +481,7 @@ fn attach_interactive(paths: &RuntimePaths, session: &str) -> Result<()> {
 fn run_attach_loop(
     paths: &RuntimePaths,
     mut current_session: String,
+    ui: &UiConfig,
     stdout: &mut impl Write,
 ) -> Result<()> {
     let mut state = InputState::default();
@@ -558,6 +561,7 @@ fn run_attach_loop(
                     &snapshot,
                     bottom_bar,
                     render_selection,
+                    ui,
                     TerminalSize { width, height },
                 )?;
             }
@@ -573,6 +577,7 @@ fn run_attach_loop(
                         cursor: prompt.cursor,
                     },
                     None,
+                    ui,
                     TerminalSize { width, height },
                 )?;
             }
@@ -587,6 +592,7 @@ fn run_attach_loop(
                     &title,
                     &preview_snapshot,
                     &chooser_status,
+                    ui,
                     TerminalSize { width, height },
                 )?;
             }
@@ -596,6 +602,7 @@ fn run_attach_loop(
                     &current_session,
                     &snapshot,
                     &help_lines(),
+                    ui,
                     TerminalSize { width, height },
                 )?;
             }
@@ -892,6 +899,7 @@ fn run_attach_loop(
                         &current_session,
                         &snapshot,
                         mouse,
+                        ui,
                         stdout,
                         &mut selection_anchor,
                         &mut active_selection,
@@ -904,6 +912,13 @@ fn run_attach_loop(
         }
     }
     Ok(())
+}
+
+fn load_config(paths: &RuntimePaths) -> Result<Config> {
+    if !paths.config_path.exists() {
+        return Ok(Config::default());
+    }
+    Config::load_from_path(&paths.config_path)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1595,13 +1610,20 @@ fn handle_mouse_event(
     paths: &RuntimePaths,
     session: &str,
     snapshot: &RenderSnapshot,
-    mouse: MouseEvent,
+    mut mouse: MouseEvent,
+    ui: &UiConfig,
     stdout: &mut impl Write,
     selection_anchor: &mut Option<SelectionAnchor>,
     active_selection: &mut Option<PaneSelection>,
     resize_drag: &mut Option<ResizeDrag>,
     status_message: &mut Option<String>,
 ) -> Result<()> {
+    if matches!(ui.status_position, StatusPosition::Top) {
+        if mouse.row == 0 {
+            return Ok(());
+        }
+        mouse.row = mouse.row.saturating_sub(1);
+    }
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             if let Some((pane, direction)) = separator_hit(snapshot, mouse.row, mouse.column) {

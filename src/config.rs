@@ -16,6 +16,10 @@ pub struct Config {
 pub struct UiConfig {
     pub status_position: StatusPosition,
     pub show_pane_labels: bool,
+    pub status_clock: bool,
+    pub status_show_pane: bool,
+    pub status_show_window_list: bool,
+    pub status_style: StatusStyle,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,6 +50,13 @@ pub enum StatusPosition {
     Bottom,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum StatusStyle {
+    #[default]
+    TmuxPlus,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -62,6 +73,10 @@ impl Default for UiConfig {
         Self {
             status_position: StatusPosition::Bottom,
             show_pane_labels: true,
+            status_clock: true,
+            status_show_pane: true,
+            status_show_window_list: true,
+            status_style: StatusStyle::TmuxPlus,
         }
     }
 }
@@ -118,6 +133,10 @@ mod tests {
         let config = Config::from_toml("").expect("default config");
         assert_eq!(config.keys.leader, "Ctrl-b");
         assert_eq!(config.ui.status_position, StatusPosition::Bottom);
+        assert!(config.ui.status_clock);
+        assert!(config.ui.status_show_pane);
+        assert!(config.ui.status_show_window_list);
+        assert_eq!(config.ui.status_style, StatusStyle::TmuxPlus);
         assert!(config.mouse.enabled);
         assert_eq!(config.behavior.scrollback_lines, 10_000);
     }
@@ -136,6 +155,7 @@ mod tests {
         .expect("partial config");
         assert_eq!(config.ui.status_position, StatusPosition::Top);
         assert!(config.ui.show_pane_labels);
+        assert!(config.ui.status_clock);
         assert_eq!(config.behavior.scrollback_lines, 2048);
         assert_eq!(config.keys.leader, "Ctrl-b");
     }

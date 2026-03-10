@@ -12,6 +12,7 @@
 - TOML config parsing with defaults in `src/config.rs`
 - XDG-aware path resolution with `ADMUX_SOCKET` and `ADMUX_CONFIG` overrides in `src/paths.rs`
 - persistent metadata path resolution via `state.json` in `src/paths.rs`
+- UI config now includes statusline controls for position, clock visibility, pane metadata, window list visibility, and status style
 
 ### Protocol and daemon
 
@@ -45,7 +46,9 @@
   - alternate screen entry
   - multi-pane redraws from daemon snapshots
   - internal pane dividers with joined Unicode junction glyphs
-  - reverse-video status line with window list
+  - one-row tmux-plus statusline with segment-aware fitting
+  - statusline shows session, active window, compressed window list, pane metadata or transient message, and clock
+  - `status_position` now works for both top and bottom placement, including cursor/mouse/body offsets
   - `Ctrl-b d` detach
   - `Ctrl-b 0` through `Ctrl-b 9` window index selection
   - `Ctrl-b :` status-row command prompt with tmux-style command names and completion
@@ -79,6 +82,7 @@
 - PTY capture tests
 - session store tests
 - render tests
+- statusline layout and truncation-priority tests
 - binary smoke tests that execute `admux` and `admuxd`
 - direct binary smoke for split-pane and new-window command flow
 - direct binary smoke for nested mixed-axis splits
