@@ -207,6 +207,19 @@ fn nested_switch_source() -> Option<SwitchSource> {
     Some(SwitchSource { session, pane_id })
 }
 
+fn apply_attached_session(
+    response: &CommandResponse,
+    current_session: &mut String,
+    last_size: &mut (u16, u16),
+) {
+    if let CommandResponse::Attached { session, .. } = response
+        && session != current_session
+    {
+        *current_session = session.clone();
+        *last_size = (0, 0);
+    }
+}
+
 pub fn request_response(paths: &RuntimePaths, request: CommandRequest) -> Result<CommandResponse> {
     let response = with_connection(paths, |stream| {
         write_message(stream, &request)?;
@@ -492,6 +505,7 @@ fn run_attach_loop(
                 session: Some(current_session.clone()),
             },
         )?;
+        apply_attached_session(&response, &mut current_session, &mut last_size);
         let snapshot = match response {
             CommandResponse::Attached {
                 preview, snapshot, ..
@@ -1755,6 +1769,24 @@ mod tests {
 
         assert!(tree.expanded_sessions.is_empty());
         assert!(tree.expanded_windows.is_empty());
+    }
+
+    #[test]
+    fn attached_response_updates_current_session_and_resets_size() {
+        let response = CommandResponse::Attached {
+            session: "logs".into(),
+            preview: String::new(),
+            formatted_preview: String::new(),
+            formatted_cursor: String::new(),
+            snapshot: None,
+        };
+        let mut current_session = String::from("work");
+        let mut last_size = (40, 120);
+
+        apply_attached_session(&response, &mut current_session, &mut last_size);
+
+        assert_eq!(current_session, "logs");
+        assert_eq!(last_size, (0, 0));
     }
 
     #[test]
