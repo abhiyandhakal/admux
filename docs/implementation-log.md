@@ -184,3 +184,20 @@ This document records each completed implementation slice in detail, including t
   - the layout tests covered mixed-axis nested split geometry
 - Commit: pending current worktree
 - Status: complete
+
+## Resize and divider stability slice
+
+- Goal: stop pane content from being mangled during drag resizes, make chooser expansion default to collapsed with explicit toggles, and add stronger mixed-axis divider regression coverage.
+- Files changed:
+  - PTY/runtime: `src/pty.rs`
+  - layout/rendering: `src/layout.rs`, `src/render.rs`, `src/ipc.rs`, `src/session.rs`, `src/client.rs`
+  - docs: `README.md`, `docs/detailed-status.md`
+- Verification:
+  - `cargo fmt --all`
+  - `cargo test`
+- Observed result:
+  - pane resize now keeps the current VT screen stable while shrinking
+  - expanding a pane rebuilds VT state from raw PTY history
+  - mixed-axis divider tests now cover right-branch and bottom-branch junction glyphs in both layout and renderer paths
+- Commit: pending current worktree
+- Status: complete

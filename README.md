@@ -11,7 +11,7 @@ The repository currently contains a working foundation with:
 - PTY-backed pane and window processes
 - ratio-based split layouts
 - VT100-backed screen parsing and clipped pane rendering
-- a `crossterm` interactive attach loop with split separators, a status-row command prompt, a choose-tree session view, and tmux-style leader keys
+- a `crossterm` interactive attach loop with Unicode pane dividers, a status-row command prompt, a choose-tree session view, and tmux-style leader keys
 
 ## Current scope
 
@@ -25,14 +25,16 @@ Implemented now:
 - daemon autostart from `admux`
 - session state stored in the daemon
 - PTY-backed command execution per pane
-- multi-pane `crossterm` rendering with no persistent pane borders in normal mode and per-pane cursors
+- multi-pane `crossterm` rendering with internal pane dividers, joined junction glyphs, and per-pane cursors
 - leader-key commands for split, window navigation, pane focus, pane resize, and detach
 - `Ctrl-b 0` through `Ctrl-b 9` for window index selection
 - `Ctrl-b :` for a tmux-style status-row command prompt with command completion
 - `Ctrl-b s` for a tmux-like session/window chooser with stacked pane previews
 - `Ctrl-b ?` for a full-screen help overlay
 - chooser-local search with `Ctrl-s`, repeat with `n`/`N`, and expand/collapse-all with `Alt-+` / `Alt--`
+- chooser collapsed by default with `Tab` and `+` / `-` expand-collapse controls
 - mouse focus, drag-selection copy, wheel scroll, and border resize
+- resize handling that preserves pane state while shrinking and restores PTY history when panes expand again
 - unit, integration, and binary smoke coverage
 
 Not finished yet:

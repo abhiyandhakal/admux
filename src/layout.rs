@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::pane::{PaneId, Rect};
 
@@ -37,6 +37,13 @@ pub struct LayoutTree {
     pub active: PaneId,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DividerCell {
+    pub x: u16,
+    pub y: u16,
+    pub mask: u8,
+}
+
 impl LayoutTree {
     pub fn new(root: PaneId) -> Self {
         Self {
@@ -64,6 +71,45 @@ impl LayoutTree {
         let mut rects = BTreeMap::new();
         self.root.collect_rects(area, &mut rects);
         rects
+    }
+
+    pub fn divider_cells(&self, area: Rect) -> Vec<DividerCell> {
+        let mut occupied = BTreeSet::<(u16, u16)>::new();
+        let mut horizontal_spans = Vec::<(u16, u16, u16)>::new();
+        let mut vertical_spans = Vec::<(u16, u16, u16)>::new();
+        self.root.collect_dividers(
+            area,
+            &mut occupied,
+            &mut horizontal_spans,
+            &mut vertical_spans,
+        );
+
+        for (y, start, end) in horizontal_spans {
+            if start > 0 && occupied.contains(&(start - 1, y)) {
+                occupied.insert((start - 1, y));
+            }
+            if occupied.contains(&(end, y)) {
+                occupied.insert((end, y));
+            }
+        }
+        for (x, start, end) in vertical_spans {
+            if start > 0 && occupied.contains(&(x, start - 1)) {
+                occupied.insert((x, start - 1));
+            }
+            if occupied.contains(&(x, end)) {
+                occupied.insert((x, end));
+            }
+        }
+
+        occupied
+            .iter()
+            .copied()
+            .map(|(x, y)| DividerCell {
+                x,
+                y,
+                mask: connection_mask((x, y), &occupied),
+            })
+            .collect()
     }
 
     pub fn select_direction(&mut self, direction: Direction, area: Rect) -> Option<PaneId> {
@@ -194,6 +240,44 @@ impl LayoutNode {
                 let (first_rect, second_rect) = split_rect(area, *axis, *ratio);
                 first.collect_rects(first_rect, rects);
                 second.collect_rects(second_rect, rects);
+            }
+        }
+    }
+
+    fn collect_dividers(
+        &self,
+        area: Rect,
+        occupied: &mut BTreeSet<(u16, u16)>,
+        horizontal_spans: &mut Vec<(u16, u16, u16)>,
+        vertical_spans: &mut Vec<(u16, u16, u16)>,
+    ) {
+        match self {
+            LayoutNode::Pane(_) => {}
+            LayoutNode::Split {
+                axis,
+                ratio,
+                first,
+                second,
+            } => {
+                let (first_rect, second_rect) = split_rect(area, *axis, *ratio);
+                match axis {
+                    SplitAxis::Vertical => {
+                        let x = first_rect.right();
+                        vertical_spans.push((x, area.y, area.bottom()));
+                        for y in area.y..area.bottom() {
+                            occupied.insert((x, y));
+                        }
+                    }
+                    SplitAxis::Horizontal => {
+                        let y = first_rect.bottom();
+                        horizontal_spans.push((y, area.x, area.right()));
+                        for x in area.x..area.right() {
+                            occupied.insert((x, y));
+                        }
+                    }
+                }
+                first.collect_dividers(first_rect, occupied, horizontal_spans, vertical_spans);
+                second.collect_dividers(second_rect, occupied, horizontal_spans, vertical_spans);
             }
         }
     }
@@ -373,6 +457,24 @@ fn axis_distance(a: u16, b: u16) -> u16 {
     a.abs_diff(b)
 }
 
+fn connection_mask(cell: (u16, u16), occupied: &BTreeSet<(u16, u16)>) -> u8 {
+    let (x, y) = cell;
+    let mut mask = 0;
+    if y > 0 && occupied.contains(&(x, y - 1)) {
+        mask |= 0b0001;
+    }
+    if occupied.contains(&(x, y + 1)) {
+        mask |= 0b0010;
+    }
+    if x > 0 && occupied.contains(&(x - 1, y)) {
+        mask |= 0b0100;
+    }
+    if occupied.contains(&(x + 1, y)) {
+        mask |= 0b1000;
+    }
+    mask
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -452,5 +554,49 @@ mod tests {
         assert_eq!(rects[&PaneId(1)].x, 0);
         assert_eq!(rects[&PaneId(2)].x, rects[&PaneId(3)].x);
         assert!(rects[&PaneId(2)].y < rects[&PaneId(3)].y);
+    }
+
+    #[test]
+    fn divider_cells_join_vertical_root_with_nested_horizontal_split() {
+        let mut tree = LayoutTree::new(PaneId(1));
+        tree.split_active(SplitAxis::Vertical, PaneId(2));
+        tree.active = PaneId(2);
+        tree.split_active(SplitAxis::Horizontal, PaneId(3));
+
+        let cells = tree.divider_cells(Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 20,
+        });
+        let junction = cells
+            .iter()
+            .find(|cell| cell.mask == 0b1011)
+            .copied()
+            .expect("expected right-branch tee junction");
+
+        assert_eq!(junction.mask, 0b1011);
+    }
+
+    #[test]
+    fn divider_cells_join_horizontal_root_with_nested_vertical_split() {
+        let mut tree = LayoutTree::new(PaneId(1));
+        tree.split_active(SplitAxis::Horizontal, PaneId(2));
+        tree.active = PaneId(2);
+        tree.split_active(SplitAxis::Vertical, PaneId(3));
+
+        let cells = tree.divider_cells(Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 20,
+        });
+        let junction = cells
+            .iter()
+            .find(|cell| cell.mask == 0b1110)
+            .copied()
+            .expect("expected bottom-branch tee junction");
+
+        assert_eq!(junction.mask, 0b1110);
     }
 }

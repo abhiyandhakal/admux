@@ -177,6 +177,7 @@ impl Session {
         Some(RenderSnapshot {
             windows: self.list_windows(),
             panes,
+            dividers: window.layout.divider_cells(size),
             active_window_id: window.id.0,
             active_pane_id: window.layout.active.0,
         })

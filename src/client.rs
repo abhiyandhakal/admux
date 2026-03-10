@@ -1565,6 +1565,7 @@ fn fallback_snapshot(preview: String, width: u16, height: u16) -> RenderSnapshot
             rows_plain,
             cursor: Some(PaneCursor { row: 0, col: 0 }),
         }],
+        dividers: Vec::new(),
         active_window_id: 1,
         active_pane_id: 1,
     }

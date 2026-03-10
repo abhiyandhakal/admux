@@ -27,6 +27,7 @@
 - pane output capture for clipped pane regions and attach previews from parsed screen state
 - pane/window/session cleanup when child processes exit
 - resize path from the client into all pane PTYs plus stored viewport geometry
+- PTY resize handling now keeps the current screen stable while shrinking and rebuilds from raw history when panes expand again
 
 ### Layout and pane foundations
 
@@ -41,12 +42,13 @@
 - interactive `crossterm` attach path with:
   - alternate screen entry
   - multi-pane redraws from daemon snapshots
-  - no persistent pane borders in normal mode
+  - internal pane dividers with joined Unicode junction glyphs
   - reverse-video status line with window list
   - `Ctrl-b d` detach
   - `Ctrl-b 0` through `Ctrl-b 9` window index selection
   - `Ctrl-b :` status-row command prompt with tmux-style command names and completion
   - `Ctrl-b s` tmux-like chooser with a stacked session list and pane preview grid
+  - chooser starts collapsed and supports `Tab` plus `+` / `-` expand-collapse controls
   - `Ctrl-b ?` full-screen help overlay
   - chooser-local search on `Ctrl-s`, repeat on `n` / `N`, and expand/collapse-all on `Alt-+` / `Alt--`
   - direct key forwarding to the active PTY
@@ -98,6 +100,7 @@ Observed result:
 - second window creation succeeded
 - window list showed the new active `logs` window
 - prompt parser and separator-only renderer tests passed under `cargo test`
+- mixed-axis divider glyph tests and PTY resize-history tests passed under `cargo test`
 
 ## Commit history so far
 
@@ -109,6 +112,7 @@ Observed result:
 - `a15bf48` `feat: add tmux-style prompt and chooser`
 - `f5b5f46` `feat: add help overlay and chooser search`
 - pending layout regression fix commit in current worktree
+- pending resize and divider stability commit in current worktree
 
 ## Known gaps
 

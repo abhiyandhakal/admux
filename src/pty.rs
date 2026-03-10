@@ -8,6 +8,13 @@ use std::{
     thread,
 };
 
+const HISTORY_LIMIT: usize = 2 * 1024 * 1024;
+
+struct TerminalState {
+    parser: vt100::Parser,
+    history: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PtyState {
     Detached,
@@ -15,7 +22,7 @@ pub enum PtyState {
 }
 
 pub struct PaneProcess {
-    parser: Arc<Mutex<vt100::Parser>>,
+    state: Arc<Mutex<TerminalState>>,
     writer: Mutex<Box<dyn Write + Send>>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     child: Mutex<Box<dyn Child + Send>>,
@@ -51,8 +58,11 @@ impl PaneProcess {
             .master
             .take_writer()
             .context("failed to acquire PTY writer")?;
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 10_000)));
-        let parser_clone = Arc::clone(&parser);
+        let state = Arc::new(Mutex::new(TerminalState {
+            parser: vt100::Parser::new(24, 80, 10_000),
+            history: Vec::new(),
+        }));
+        let state_clone = Arc::clone(&state);
 
         thread::spawn(move || {
             let mut buf = [0u8; 4096];
@@ -60,8 +70,13 @@ impl PaneProcess {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(size) => {
-                        if let Ok(mut parser) = parser_clone.lock() {
-                            parser.process(&buf[..size]);
+                        if let Ok(mut state) = state_clone.lock() {
+                            state.history.extend_from_slice(&buf[..size]);
+                            if state.history.len() > HISTORY_LIMIT {
+                                let drop_len = state.history.len() - HISTORY_LIMIT;
+                                state.history.drain(..drop_len);
+                            }
+                            state.parser.process(&buf[..size]);
                         }
                     }
                     Err(_) => break,
@@ -70,7 +85,7 @@ impl PaneProcess {
         });
 
         Ok(Self {
-            parser,
+            state,
             writer: Mutex::new(writer),
             master: Mutex::new(pair.master),
             child: Mutex::new(child),
@@ -78,18 +93,20 @@ impl PaneProcess {
     }
 
     pub fn preview(&self) -> String {
-        self.parser
+        self.state
             .lock()
-            .expect("pane parser lock poisoned")
+            .expect("pane state lock poisoned")
+            .parser
             .screen()
             .contents()
     }
 
     pub fn formatted_preview(&self) -> String {
         let bytes = self
-            .parser
+            .state
             .lock()
-            .expect("pane parser lock poisoned")
+            .expect("pane state lock poisoned")
+            .parser
             .screen()
             .contents_formatted();
         String::from_utf8_lossy(&bytes).into_owned()
@@ -97,18 +114,20 @@ impl PaneProcess {
 
     pub fn formatted_cursor(&self) -> String {
         let bytes = self
-            .parser
+            .state
             .lock()
-            .expect("pane parser lock poisoned")
+            .expect("pane state lock poisoned")
+            .parser
             .screen()
             .cursor_state_formatted();
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
     pub fn visible_rows(&self, width: u16, height: u16) -> Vec<String> {
-        self.parser
+        self.state
             .lock()
-            .expect("pane parser lock poisoned")
+            .expect("pane state lock poisoned")
+            .parser
             .screen()
             .rows(0, width)
             .take(height as usize)
@@ -116,9 +135,10 @@ impl PaneProcess {
     }
 
     pub fn visible_rows_formatted(&self, width: u16, height: u16) -> Vec<String> {
-        self.parser
+        self.state
             .lock()
-            .expect("pane parser lock poisoned")
+            .expect("pane state lock poisoned")
+            .parser
             .screen()
             .rows_formatted(0, width)
             .take(height as usize)
@@ -127,17 +147,19 @@ impl PaneProcess {
     }
 
     pub fn cursor_position(&self) -> (u16, u16) {
-        self.parser
+        self.state
             .lock()
-            .expect("pane parser lock poisoned")
+            .expect("pane state lock poisoned")
+            .parser
             .screen()
             .cursor_position()
     }
 
     pub fn screen_size(&self) -> (u16, u16) {
-        self.parser
+        self.state
             .lock()
-            .expect("pane parser lock poisoned")
+            .expect("pane state lock poisoned")
+            .parser
             .screen()
             .size()
     }
@@ -149,14 +171,16 @@ impl PaneProcess {
         end_row: u16,
         end_col: u16,
     ) -> String {
-        self.parser
+        self.state
             .lock()
-            .expect("pane parser lock poisoned")
+            .expect("pane state lock poisoned")
+            .parser
             .screen()
             .contents_between(start_row, start_col, end_row, end_col)
     }
 
     pub fn resize(&self, rows: u16, cols: u16) -> Result<()> {
+        let (current_rows, current_cols) = self.screen_size();
         self.master
             .lock()
             .expect("pane master lock poisoned")
@@ -167,11 +191,15 @@ impl PaneProcess {
                 pixel_height: 0,
             })
             .context("failed to resize PTY")?;
-        self.parser
-            .lock()
-            .expect("pane parser lock poisoned")
-            .screen_mut()
-            .set_size(rows, cols);
+        let mut state = self.state.lock().expect("pane state lock poisoned");
+        if rows < current_rows || cols < current_cols {
+            state.parser.screen_mut().set_size(rows, cols);
+        } else {
+            let history = state.history.clone();
+            let mut parser = vt100::Parser::new(rows, cols, 10_000);
+            parser.process(&history);
+            state.parser = parser;
+        }
         Ok(())
     }
 
@@ -182,20 +210,21 @@ impl PaneProcess {
         col: u16,
     ) -> Result<()> {
         let mouse_mode = self
-            .parser
+            .state
             .lock()
-            .expect("pane parser lock poisoned")
+            .expect("pane state lock poisoned")
+            .parser
             .screen()
             .mouse_protocol_mode();
 
         if mouse_mode == vt100::MouseProtocolMode::None {
-            let mut parser = self.parser.lock().expect("pane parser lock poisoned");
-            let current = parser.screen().scrollback();
+            let mut state = self.state.lock().expect("pane state lock poisoned");
+            let current = state.parser.screen().scrollback();
             let next = match direction {
                 ScrollDirection::Up => current.saturating_add(3),
                 ScrollDirection::Down => current.saturating_sub(3),
             };
-            parser.screen_mut().set_scrollback(next);
+            state.parser.screen_mut().set_scrollback(next);
             return Ok(());
         }
 
@@ -288,5 +317,29 @@ mod tests {
         let preview = pane.preview();
         assert!(preview.contains("after"));
         assert!(!preview.contains("beforeafter"));
+    }
+
+    #[test]
+    fn pane_process_restores_history_after_expanding() {
+        let pane = PaneProcess::spawn(
+            &[
+                "sh".into(),
+                "-lc".into(),
+                "printf 'one two three four five six seven eight nine ten'".into(),
+            ],
+            None,
+        )
+        .expect("spawn pane");
+
+        thread::sleep(Duration::from_millis(100));
+        pane.resize(24, 10).expect("resize pane");
+        let shrunk = pane.preview();
+        assert!(shrunk.contains("one two"));
+
+        pane.resize(24, 80).expect("resize pane");
+
+        let preview = pane.preview();
+        assert!(preview.contains("three"));
+        assert!(preview.contains("seven"));
     }
 }

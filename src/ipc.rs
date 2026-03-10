@@ -2,7 +2,11 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{layout::SplitAxis, pane::Rect, window::WindowSummary};
+use crate::{
+    layout::{DividerCell, SplitAxis},
+    pane::Rect,
+    window::WindowSummary,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtocolVersion(pub u16);
@@ -198,6 +202,8 @@ pub struct PaneRender {
 pub struct RenderSnapshot {
     pub windows: Vec<WindowSummary>,
     pub panes: Vec<PaneRender>,
+    #[serde(default)]
+    pub dividers: Vec<DividerCell>,
     pub active_window_id: u64,
     pub active_pane_id: u64,
 }

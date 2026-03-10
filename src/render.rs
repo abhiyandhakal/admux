@@ -199,77 +199,14 @@ fn render_split_separators<W: Write>(
     out: &mut W,
     snapshot: &RenderSnapshot,
 ) -> std::io::Result<()> {
-    use std::collections::BTreeSet;
-
-    let mut occupied = BTreeSet::<(u16, u16)>::new();
-    let max_x = snapshot
-        .panes
-        .iter()
-        .map(|pane| pane.rect.right())
-        .max()
-        .unwrap_or(0);
-    let max_y = snapshot
-        .panes
-        .iter()
-        .map(|pane| pane.rect.bottom())
-        .max()
-        .unwrap_or(0);
-
-    for y in 0..max_y {
-        for x in 0..max_x {
-            if snapshot.panes.iter().any(|pane| pane.rect.contains(y, x)) {
-                continue;
-            }
-            let left = x > 0
-                && snapshot
-                    .panes
-                    .iter()
-                    .any(|pane| pane.rect.contains(y, x - 1));
-            let right = x + 1 < max_x
-                && snapshot
-                    .panes
-                    .iter()
-                    .any(|pane| pane.rect.contains(y, x + 1));
-            let up = y > 0
-                && snapshot
-                    .panes
-                    .iter()
-                    .any(|pane| pane.rect.contains(y - 1, x));
-            let down = y + 1 < max_y
-                && snapshot
-                    .panes
-                    .iter()
-                    .any(|pane| pane.rect.contains(y + 1, x));
-
-            if (left && right) || (up && down) {
-                occupied.insert((x, y));
-            }
-        }
-    }
-
-    for (x, y) in occupied.iter().copied() {
-        let mask = connection_mask((x, y), &occupied);
-        queue!(out, MoveTo(x, y), Print(connection_glyph(mask)))?;
+    for divider in &snapshot.dividers {
+        queue!(
+            out,
+            MoveTo(divider.x, divider.y),
+            Print(connection_glyph(divider.mask))
+        )?;
     }
     Ok(())
-}
-
-fn connection_mask(cell: (u16, u16), occupied: &std::collections::BTreeSet<(u16, u16)>) -> u8 {
-    let (x, y) = cell;
-    let mut mask = 0;
-    if y > 0 && occupied.contains(&(x, y - 1)) {
-        mask |= CONNECT_UP;
-    }
-    if occupied.contains(&(x, y + 1)) {
-        mask |= CONNECT_DOWN;
-    }
-    if x > 0 && occupied.contains(&(x - 1, y)) {
-        mask |= CONNECT_LEFT;
-    }
-    if occupied.contains(&(x + 1, y)) {
-        mask |= CONNECT_RIGHT;
-    }
-    mask
 }
 
 fn connection_glyph(mask: u8) -> char {
@@ -577,6 +514,8 @@ fn truncate(value: &str, width: u16) -> String {
 mod tests {
     use super::*;
     use crate::ipc::{PaneCursor, PaneRender, RenderSnapshot};
+    use crate::layout::{LayoutTree, SplitAxis};
+    use crate::pane::PaneId;
     use crate::pane::Rect;
     use crate::window::WindowSummary;
 
@@ -602,6 +541,7 @@ mod tests {
                 rows_formatted: vec!["\u{1b}[31mhello\u{1b}[0m".into()],
                 cursor: Some(PaneCursor { row: 0, col: 2 }),
             }],
+            dividers: Vec::new(),
             active_window_id: 1,
             active_pane_id: 1,
         }
@@ -723,11 +663,73 @@ mod tests {
 
     #[test]
     fn connection_mask_produces_joined_tee() {
-        let occupied =
-            std::collections::BTreeSet::from([(10_u16, 2_u16), (10, 3), (10, 4), (11, 3), (12, 3)]);
-
-        let mask = connection_mask((10, 3), &occupied);
-
+        let mask = CONNECT_UP | CONNECT_DOWN | CONNECT_RIGHT;
         assert_eq!(connection_glyph(mask), '├');
+    }
+
+    #[test]
+    fn render_displays_mixed_axis_right_branch_junction() {
+        let mut tree = LayoutTree::new(PaneId(1));
+        tree.split_active(SplitAxis::Vertical, PaneId(2));
+        tree.active = PaneId(2);
+        tree.split_active(SplitAxis::Horizontal, PaneId(3));
+
+        let mut snapshot = sample_snapshot();
+        snapshot.dividers = tree.divider_cells(Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 8,
+        });
+
+        let mut buf = Vec::new();
+        render_session(
+            &mut buf,
+            "work",
+            &snapshot,
+            BottomBar::Status { message: None },
+            None,
+            TerminalSize {
+                width: 20,
+                height: 9,
+            },
+        )
+        .expect("render session");
+        let rendered = String::from_utf8_lossy(&buf);
+
+        assert!(rendered.contains('├'));
+    }
+
+    #[test]
+    fn render_displays_mixed_axis_bottom_branch_junction() {
+        let mut tree = LayoutTree::new(PaneId(1));
+        tree.split_active(SplitAxis::Horizontal, PaneId(2));
+        tree.active = PaneId(2);
+        tree.split_active(SplitAxis::Vertical, PaneId(3));
+
+        let mut snapshot = sample_snapshot();
+        snapshot.dividers = tree.divider_cells(Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 8,
+        });
+
+        let mut buf = Vec::new();
+        render_session(
+            &mut buf,
+            "work",
+            &snapshot,
+            BottomBar::Status { message: None },
+            None,
+            TerminalSize {
+                width: 20,
+                height: 9,
+            },
+        )
+        .expect("render session");
+        let rendered = String::from_utf8_lossy(&buf);
+
+        assert!(rendered.contains('┬'));
     }
 }
