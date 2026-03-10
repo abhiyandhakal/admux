@@ -158,6 +158,7 @@ impl SessionStore {
                                     index,
                                     window.name.clone(),
                                     *id == session.active_window,
+                                    Some(*id) == session.last_window,
                                 ))
                             })
                             .collect(),
@@ -875,6 +876,7 @@ mod tests {
                     index: 0,
                     name: "editor".into(),
                     active: true,
+                    last_selected: false,
                 }]
             }
         );

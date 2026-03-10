@@ -220,17 +220,23 @@ This document records each completed implementation slice in detail, including t
 
 ## Statusline enhancement slice
 
-- Goal: replace the loose reverse-video bar with a denser one-row tmux-plus statusline that consistently shows session, windows, active pane or transient message, and clock, while honoring top or bottom placement from config.
+- Goal: replace the custom segmented bar with a tmux-style one-row statusline that shows `[session]`, a tmux-like window list, and compact host/date/time status while still honoring top or bottom placement from config.
 - Files changed:
   - config and client plumbing: `Cargo.toml`, `src/config.rs`, `src/client.rs`
+  - runtime and persistence: `src/session.rs`, `src/window.rs`, `src/server.rs`, `src/persistence.rs`
   - rendering: `src/render.rs`
   - docs: `README.md`, `docs/detailed-status.md`
 - Verification:
   - `cargo test`
+  - direct binary smoke:
+    - `target/debug/admuxd serve --socket <temp-socket> --state <temp-state>`
+    - `ADMUX_SOCKET=<temp-socket> ADMUX_STATE=<temp-state> target/debug/admux new -d --name status-smoke -- sh -lc 'printf ok; sleep 1'`
+    - `ADMUX_SOCKET=<temp-socket> ADMUX_STATE=<temp-state> target/debug/admux list-windows status-smoke`
+    - `ADMUX_SOCKET=<temp-socket> ADMUX_STATE=<temp-state> target/debug/admux kill status-smoke`
 - Observed result:
-  - statusline rendering now uses explicit prioritized segments instead of raw left/center/right strings
-  - inactive windows compress before the active window entry is shortened
-  - transient messages replace pane metadata on the right and the clock drops first on narrow terminals
+  - statusline now renders a tmux-style session segment, current `*` marker, and last-selected `-` marker
+  - the normal right side now shows short hostname plus local date/time instead of pane metadata
+  - prompt and copy mode rows now fully repurpose the status line instead of mixing with the normal bar
   - `status_position = "top"` now moves pane rendering, chooser/help bodies, cursor restore, and mouse hit-testing below the bar
 - Commit: pending current worktree
 - Status: complete

@@ -29,6 +29,8 @@ pub struct PersistedSession {
     pub cols: u16,
     pub window_order: Vec<WindowId>,
     pub active_window: WindowId,
+    #[serde(default)]
+    pub last_window: Option<WindowId>,
     pub windows: BTreeMap<WindowId, PersistedWindow>,
 }
 
@@ -56,6 +58,7 @@ impl PersistedSession {
             cols: session.cols,
             window_order: session.window_order.clone(),
             active_window: session.active_window,
+            last_window: session.last_window,
             windows: session
                 .windows
                 .iter()
@@ -138,6 +141,7 @@ mod tests {
                 cols: 80,
                 window_order: vec![WindowId(1)],
                 active_window: WindowId(1),
+                last_window: None,
                 windows: BTreeMap::new(),
             },
         );

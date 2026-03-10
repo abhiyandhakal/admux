@@ -24,6 +24,7 @@ pub struct Session {
     pub windows: BTreeMap<WindowId, WindowRuntime>,
     pub window_order: Vec<WindowId>,
     pub active_window: WindowId,
+    pub last_window: Option<WindowId>,
 }
 
 pub struct WindowRuntime {
@@ -84,6 +85,7 @@ impl Session {
             windows,
             window_order: vec![window_id],
             active_window: window_id,
+            last_window: None,
         };
         session.sync_pane_sizes()?;
         Ok(session)
@@ -195,6 +197,7 @@ impl Session {
                     index,
                     window.name.clone(),
                     *id == self.active_window,
+                    Some(*id) == self.last_window,
                 ))
             })
             .collect()
@@ -353,7 +356,7 @@ impl Session {
         )?;
         self.windows.insert(window_id, window);
         self.window_order.push(window_id);
-        self.active_window = window_id;
+        self.remember_window_switch(window_id);
         self.sync_pane_sizes()?;
         Ok(WindowCreation { window_id, pane_id })
     }
@@ -401,7 +404,7 @@ impl Session {
 
     pub fn select_window(&mut self, window_id: WindowId) -> Result<()> {
         if self.windows.contains_key(&window_id) {
-            self.active_window = window_id;
+            self.remember_window_switch(window_id);
             Ok(())
         } else {
             Err(anyhow!("unknown window"))
@@ -420,7 +423,7 @@ impl Session {
         } else {
             (current + len - 1) % len
         };
-        self.active_window = self.window_order[next_index];
+        self.remember_window_switch(self.window_order[next_index]);
         Ok(())
     }
 
@@ -444,7 +447,7 @@ impl Session {
             self.windows.remove(&window_id);
             self.window_order.retain(|id| *id != window_id);
             if let Some(next_window) = self.window_order.last().copied() {
-                self.active_window = next_window;
+                self.remember_window_after_removal(window_id, next_window);
             }
             return Ok(None);
         }
@@ -463,7 +466,7 @@ impl Session {
         }
         self.window_order.retain(|id| *id != window_id);
         if let Some(next_window) = self.window_order.last().copied() {
-            self.active_window = next_window;
+            self.remember_window_after_removal(window_id, next_window);
         }
         if !self.window_order.is_empty() {
             self.sync_pane_sizes()?;
@@ -513,7 +516,11 @@ impl Session {
         if !self.windows.contains_key(&self.active_window)
             && let Some(window_id) = self.window_order.last().copied()
         {
-            self.active_window = window_id;
+            self.remember_window_after_removal(self.active_window, window_id);
+            changed = true;
+        }
+        if self.last_window.is_some_and(|window_id| !self.windows.contains_key(&window_id)) {
+            self.last_window = None;
             changed = true;
         }
 
@@ -543,6 +550,20 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    fn remember_window_switch(&mut self, next_window: WindowId) {
+        if self.active_window != next_window {
+            self.last_window = Some(self.active_window);
+            self.active_window = next_window;
+        }
+    }
+
+    fn remember_window_after_removal(&mut self, removed_window: WindowId, next_window: WindowId) {
+        self.active_window = next_window;
+        self.last_window = self
+            .last_window
+            .filter(|window_id| *window_id != removed_window && *window_id != next_window);
     }
 }
 
@@ -668,5 +689,31 @@ mod tests {
 
         assert_eq!(cursor.row, 4);
         assert_eq!(cursor.col, 9);
+    }
+
+    #[test]
+    fn selecting_window_tracks_last_window() {
+        let mut session = Session::new(
+            "work".into(),
+            None,
+            vec!["sh".into()],
+            WindowId(1),
+            PaneId(1),
+        )
+        .expect("create session");
+
+        session
+            .new_window(WindowId(2), PaneId(2), Some("logs".into()), &["sh".into()])
+            .expect("create window");
+        session.select_window(WindowId(1)).expect("select first");
+
+        assert_eq!(session.active_window, WindowId(1));
+        assert_eq!(session.last_window, Some(WindowId(2)));
+
+        let windows = session.list_windows();
+        assert!(windows.iter().any(|window| window.active && window.id == 1));
+        assert!(windows
+            .iter()
+            .any(|window| window.last_selected && window.id == 2));
     }
 }

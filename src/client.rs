@@ -1813,6 +1813,7 @@ fn fallback_snapshot(preview: String, width: u16, height: u16) -> RenderSnapshot
             index: 0,
             name: "shell".into(),
             active: true,
+            last_selected: false,
         }],
         panes: vec![PaneRender {
             pane_id: 1,

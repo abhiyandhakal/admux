@@ -374,8 +374,8 @@ fn render_bottom_bar<W: Write>(
     let row = status_row(ui, size);
     let content = match bottom_bar {
         BottomBar::Status { message } => render_status_line(session, snapshot, message, ui, size.width),
-        BottomBar::CopyMode => vec![StatusSegment::active(
-            " COPY MODE | h j k l move | 0/$ line | g/G top/bottom | PgUp/PgDn scroll | Space select | y copy | q quit ",
+        BottomBar::CopyMode => vec![StatusSegment::message(
+            "[copy-mode] h/j/k/l move  0/$ line  g/G top/bottom  PgUp/PgDn scroll  Space select  y copy  q quit",
         )],
         BottomBar::Prompt {
             buffer,
@@ -473,6 +473,13 @@ struct StatusSegment {
 }
 
 impl StatusSegment {
+    fn session(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            attrs: vec![Attribute::Reverse, Attribute::Bold],
+        }
+    }
+
     fn plain(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
@@ -487,10 +494,10 @@ impl StatusSegment {
         }
     }
 
-    fn dim(text: impl Into<String>) -> Self {
+    fn message(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
-            attrs: vec![Attribute::Reverse, Attribute::Dim],
+            attrs: vec![Attribute::Reverse, Attribute::Bold],
         }
     }
 
@@ -506,55 +513,52 @@ fn render_status_line(
     ui: &UiConfig,
     width: u16,
 ) -> Vec<StatusSegment> {
-    let active_window = snapshot.windows.iter().find(|window| window.active);
-    let mut left = vec![
-        StatusSegment::active(" admux "),
-        StatusSegment::plain(format!(" {} ", session)),
-    ];
-    if let Some(window) = active_window {
-        left.push(StatusSegment::active(format!(" {}:{} ", window.index, window.name)));
+    if let Some(message) = message {
+        return vec![StatusSegment::message(fit_width(message, width))];
     }
 
-    let mut center = if ui.status_show_window_list {
-        snapshot
-            .windows
-            .iter()
-            .map(|window| {
-                if window.active {
-                    StatusSegment::active(format!(" [{}:{}] ", window.index, window.name))
-                } else {
-                    StatusSegment::dim(format!(" {} ", window.index))
-                }
-            })
-            .collect()
+    let mut left = vec![StatusSegment::session(format!("[{}] ", session))];
+    let mut center = snapshot
+        .windows
+        .iter()
+        .map(render_window_segment)
+        .collect::<Vec<_>>();
+    let mut right = if ui.status_clock {
+        let mut segments = Vec::new();
+        if let Some(host) = short_hostname() {
+            segments.push(StatusSegment::plain(format!("{host} ")));
+        }
+        if let Some(clock) = local_clock() {
+            segments.push(StatusSegment::plain(clock));
+        }
+        segments
     } else {
         Vec::new()
     };
 
-    let mut right = Vec::new();
-    if let Some(message) = message {
-        right.push(StatusSegment::active(format!(" {} ", truncate(message, width))));
-    } else if ui.status_show_pane {
-        let pane_title = active_pane_title(snapshot);
-        right.push(StatusSegment::plain(format!(
-            " pane {}:{} ",
-            snapshot.active_pane_id, pane_title
-        )));
-    }
-    if ui.status_clock
-        && let Some(clock) = local_clock()
-    {
-        right.push(StatusSegment::active(format!(" {} ", clock)));
-    }
-
-    fit_status_layout(&mut left, &mut center, &mut right, width);
+    fit_tmux_status_layout(&mut left, &mut center, &mut right, width);
     let mut result = left;
     result.extend(center);
     result.extend(right);
     result
 }
 
-fn fit_status_layout(
+fn render_window_segment(window: &crate::window::WindowSummary) -> StatusSegment {
+    let marker = if window.active {
+        "*"
+    } else if window.last_selected {
+        "-"
+    } else {
+        ""
+    };
+    if window.active {
+        StatusSegment::active(format!(" {}:{}{} ", window.index, window.name, marker))
+    } else {
+        StatusSegment::plain(format!(" {}:{}{} ", window.index, window.name, marker))
+    }
+}
+
+fn fit_tmux_status_layout(
     left: &mut Vec<StatusSegment>,
     center: &mut Vec<StatusSegment>,
     right: &mut Vec<StatusSegment>,
@@ -565,48 +569,58 @@ fn fit_status_layout(
             right.pop();
             continue;
         }
-        if left.len() > 2 {
-            left.pop();
-            continue;
-        }
         if let Some(segment) = center
             .iter_mut()
-            .find(|segment| segment.attrs.contains(&Attribute::Dim) && segment.text.contains(':'))
+            .find(|segment| {
+                !segment.attrs.contains(&Attribute::Bold) && segment.text.contains(':')
+            })
         {
-            if let Some(index) = segment.text.find(':') {
-                let prefix = segment.text[..index].trim();
-                segment.text = format!(" {} ", prefix.trim_matches(['[', ']']));
+            if shorten_window_segment(segment) {
                 continue;
             }
         }
         if let Some(segment) = right.first_mut()
-            && segment.len() > 12
+            && segment.len() > 8
         {
-            segment.text = format!(" {} ", truncate(segment.text.trim(), 10));
+            segment.text = truncate(&segment.text, (segment.len().saturating_sub(4)) as u16);
             continue;
         }
-        if right.len() == 1 && right.first().is_some_and(|segment| !segment.attrs.contains(&Attribute::Bold)) {
+        if right.len() == 1 {
             right.clear();
             continue;
         }
-        if let Some(segment) = left.get_mut(1)
-            && segment.len() > 10
+        if let Some(segment) = left.first_mut()
+            && segment.len() > 6
         {
-            segment.text = format!(" {} ", truncate(segment.text.trim(), 8));
+            segment.text = format!("[{}] ", truncate(segment.text.trim_matches(['[', ']']), 4));
             continue;
         }
         if let Some(segment) = center
             .iter_mut()
             .find(|segment| segment.attrs.contains(&Attribute::Bold) && segment.text.contains(':'))
         {
-            if let Some(index) = segment.text.find(':') {
-                let prefix = segment.text[..index].trim();
-                segment.text = format!(" [{}] ", prefix.trim_matches(['[', ']']));
+            if shorten_window_segment(segment) {
                 continue;
             }
         }
         break;
     }
+}
+
+fn shorten_window_segment(segment: &mut StatusSegment) -> bool {
+    let trimmed = segment.text.trim();
+    let Some((index, rest)) = trimmed.split_once(':') else {
+        return false;
+    };
+    let marker = rest.chars().last().filter(|ch| matches!(ch, '*' | '-'));
+    let name = rest.trim_end_matches(['*', '-']);
+    if name.chars().count() > 1 {
+        let shortened = truncate(name, (name.chars().count().saturating_sub(1)) as u16);
+        let marker = marker.map(|ch| ch.to_string()).unwrap_or_default();
+        segment.text = format!(" {}:{}{} ", index, shortened, marker);
+        return true;
+    }
+    false
 }
 
 fn total_len(
@@ -649,27 +663,26 @@ fn render_status_segments<W: Write>(
     Ok(())
 }
 
-fn active_pane_title(snapshot: &RenderSnapshot) -> String {
-    snapshot
-        .panes
-        .iter()
-        .find(|pane| pane.focused)
-        .map(|pane| {
-            if pane.title.trim().is_empty() {
-                format!("pane {}", pane.pane_id)
-            } else {
-                pane.title.clone()
-            }
-        })
-        .unwrap_or_else(|| format!("pane {}", snapshot.active_pane_id))
-}
-
 fn local_clock() -> Option<String> {
     let now = time::OffsetDateTime::now_local().ok()?;
-    let format =
-        time::format_description::parse("[hour repr:24 padding:zero]:[minute padding:zero]")
-            .ok()?;
+    let format = time::format_description::parse(
+        "[hour repr:24 padding:zero]:[minute padding:zero] [day padding:zero]-[month repr:short]-[year repr:last_two]",
+    )
+    .ok()?;
     now.format(&format).ok()
+}
+
+fn short_hostname() -> Option<String> {
+    let hostname = hostname::get().ok()?;
+    let value = hostname.into_string().ok()?;
+    Some(
+        value
+            .split('.')
+            .next()
+            .filter(|part| !part.is_empty())
+            .unwrap_or(value.as_str())
+            .to_string(),
+    )
 }
 
 fn status_row(ui: &UiConfig, size: TerminalSize) -> u16 {
@@ -744,6 +757,7 @@ mod tests {
                 index: 0,
                 name: "shell".into(),
                 active: true,
+                last_selected: false,
             }],
             panes: vec![PaneRender {
                 pane_id: 1,
@@ -918,7 +932,7 @@ mod tests {
         .expect("render session");
         let rendered = String::from_utf8_lossy(&buf);
 
-        assert!(rendered.contains("COPY MODE"));
+        assert!(rendered.contains("[copy-mode]"));
         assert!(rendered.contains("Space select"));
     }
 
@@ -1001,25 +1015,42 @@ mod tests {
         );
         let joined = segments.into_iter().map(|segment| segment.text).collect::<String>();
         assert!(joined.contains("copied 5 chars"));
-        assert!(!joined.contains("pane 1:shell"));
+        assert!(!joined.contains("shell"));
     }
 
     #[test]
     fn status_line_compresses_inactive_windows_when_narrow() {
         let mut snapshot = sample_snapshot();
         snapshot.windows = vec![
-            WindowSummary { id: 1, index: 0, name: "shell".into(), active: false },
-            WindowSummary { id: 2, index: 1, name: "editor".into(), active: true },
-            WindowSummary { id: 3, index: 2, name: "logs".into(), active: false },
+            WindowSummary { id: 1, index: 0, name: "shell".into(), active: false, last_selected: true },
+            WindowSummary { id: 2, index: 1, name: "editor".into(), active: true, last_selected: false },
+            WindowSummary { id: 3, index: 2, name: "logs".into(), active: false, last_selected: false },
         ];
         snapshot.active_window_id = 2;
         let joined = render_status_line("work", &snapshot, None, &sample_ui(), 32)
             .into_iter()
             .map(|segment| segment.text)
             .collect::<String>();
-        assert!(joined.contains("[1:editor]"));
-        assert!(joined.contains(" 0 "));
-        assert!(joined.contains(" 2 "));
+        assert!(joined.contains("1:editor*"));
+        assert!(joined.contains("0:"));
+        assert!(joined.contains("-"));
+    }
+
+    #[test]
+    fn status_line_marks_last_selected_window() {
+        let mut snapshot = sample_snapshot();
+        snapshot.windows = vec![
+            WindowSummary { id: 1, index: 0, name: "shell".into(), active: true, last_selected: false },
+            WindowSummary { id: 2, index: 1, name: "editor".into(), active: false, last_selected: true },
+        ];
+
+        let joined = render_status_line("work", &snapshot, None, &sample_ui(), 80)
+            .into_iter()
+            .map(|segment| segment.text)
+            .collect::<String>();
+
+        assert!(joined.contains("0:shell*"));
+        assert!(joined.contains("1:editor-"));
     }
 
     #[test]
