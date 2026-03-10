@@ -32,7 +32,7 @@ impl PaneProcess {
     pub fn spawn(
         command: &[String],
         cwd: Option<&Path>,
-        admux_context: Option<(&str, crate::pane::PaneId)>,
+        admux_context: Option<(&str, crate::pane::WindowId, crate::pane::PaneId)>,
     ) -> Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -288,22 +288,24 @@ impl PaneProcess {
 
 fn build_command(
     command: &[String],
-    admux_context: Option<(&str, crate::pane::PaneId)>,
+    admux_context: Option<(&str, crate::pane::WindowId, crate::pane::PaneId)>,
 ) -> CommandBuilder {
     if command.is_empty() {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
         let mut builder = CommandBuilder::new(shell);
-        if let Some((session_name, pane_id)) = admux_context {
+        if let Some((session_name, window_id, pane_id)) = admux_context {
             builder.env("ADMUX", "1");
             builder.env("ADMUX_SESSION", session_name);
+            builder.env("ADMUX_WINDOW", window_id.0.to_string());
             builder.env("ADMUX_PANE", pane_id.0.to_string());
         }
         builder
     } else {
         let mut builder = CommandBuilder::new(&command[0]);
-        if let Some((session_name, pane_id)) = admux_context {
+        if let Some((session_name, window_id, pane_id)) = admux_context {
             builder.env("ADMUX", "1");
             builder.env("ADMUX_SESSION", session_name);
+            builder.env("ADMUX_WINDOW", window_id.0.to_string());
             builder.env("ADMUX_PANE", pane_id.0.to_string());
         }
         for arg in &command[1..] {

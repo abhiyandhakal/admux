@@ -22,6 +22,7 @@ Implemented now:
 - split panes horizontally and vertically
 - create, list, cycle, and select windows
 - list panes within the active window
+- pane numbering is window-local and starts at `0` in each window
 - rename the active window from the interactive prompt
 - daemon autostart from `admux`
 - session state stored in the daemon
@@ -76,6 +77,12 @@ Interactive defaults:
 - `Ctrl-b d` detach
 
 Inside an existing `admux` pane, running `admux new` creates a sibling session and switches the current client to it on the next attach poll. It does not nest a second fullscreen `admux` UI inside the pane unless `-d` is used.
+
+Pane target notes:
+
+- pane targets use `session:window.pane`
+- `pane` is local to that window, not global across the session
+- each new window starts its pane numbering at `0`
 
 Run the daemon explicitly:
 

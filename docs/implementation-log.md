@@ -242,6 +242,30 @@ This document records each completed implementation slice in detail, including t
 - Commit: pending current worktree
 - Status: complete
 
+## Window-local pane numbering slice
+
+- Goal: replace the old global pane counter with per-window pane numbering so each window starts at pane `0` and user-facing pane targets become window-local.
+- Files changed:
+  - protocol and nested context: `src/ipc.rs`, `src/client.rs`, `src/pty.rs`
+  - runtime and persistence: `src/session.rs`, `src/server.rs`, `src/persistence.rs`
+  - docs: `README.md`, `docs/detailed-status.md`
+- Verification:
+  - `cargo test`
+  - direct binary smoke:
+    - `target/debug/admuxd serve --socket <temp-socket> --state <temp-state>`
+    - `ADMUX_SOCKET=<temp-socket> ADMUX_STATE=<temp-state> target/debug/admux new -d --name pane-smoke -- sh`
+    - `ADMUX_SOCKET=<temp-socket> ADMUX_STATE=<temp-state> target/debug/admux split-pane pane-smoke --vertical`
+    - `ADMUX_SOCKET=<temp-socket> ADMUX_STATE=<temp-state> target/debug/admux list-panes pane-smoke:1`
+    - `ADMUX_SOCKET=<temp-socket> ADMUX_STATE=<temp-state> target/debug/admux new-window pane-smoke --name logs -- sh`
+    - `ADMUX_SOCKET=<temp-socket> ADMUX_STATE=<temp-state> target/debug/admux list-panes pane-smoke:2`
+- Observed result:
+  - first window created pane `0`
+  - splitting that window created pane `1`
+  - a new second window started again at pane `0`
+  - pane targets and nested-session context now carry window-local pane numbers with explicit window context
+- Commit: pending current worktree
+- Status: complete
+
 ## Modal copy mode slice
 
 - Goal: replace drag-only copy interaction with a real modal copy mode that can be entered from the keyboard, navigate the active pane buffer, page scrollback, select text, and yank through the existing clipboard path.

@@ -204,8 +204,13 @@ pub fn run(cli: AdmuxCli) -> Result<()> {
 
 fn nested_switch_source() -> Option<SwitchSource> {
     let session = std::env::var("ADMUX_SESSION").ok()?;
+    let window_id = std::env::var("ADMUX_WINDOW").ok()?.parse().ok()?;
     let pane_id = std::env::var("ADMUX_PANE").ok()?.parse().ok()?;
-    Some(SwitchSource { session, pane_id })
+    Some(SwitchSource {
+        session,
+        window_id,
+        pane_id,
+    })
 }
 
 fn apply_attached_session(

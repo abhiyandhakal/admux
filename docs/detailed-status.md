@@ -25,6 +25,7 @@
 - session store in the daemon
 - PTY-backed command spawning through `portable-pty`
 - session now owns ordered windows and each window owns a split-tree of panes
+- pane numbers are window-local, starting at `0` in each window and remaining stable for the pane lifetime
 - VT100-backed screen parsing of PTY output
 - pane output capture for clipped pane regions and attach previews from parsed screen state
 - pane/window/session cleanup when child processes exit
@@ -87,6 +88,7 @@
 - binary smoke tests that execute `admux` and `admuxd`
 - direct binary smoke for split-pane and new-window command flow
 - direct binary smoke for nested mixed-axis splits
+- direct binary smoke for window-local pane numbering
 - prompt command parser and completion tests
 - chooser search helper tests
 

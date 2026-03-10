@@ -11,7 +11,7 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtocolVersion(pub u16);
 
-pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(2);
+pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(3);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommandRequest {
@@ -190,6 +190,7 @@ pub enum CycleDirection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwitchSource {
     pub session: String,
+    pub window_id: u64,
     pub pane_id: u64,
 }
 

@@ -31,7 +31,6 @@ pub struct SessionStore {
     state_path: Option<std::path::PathBuf>,
     pending_switches: BTreeMap<String, String>,
     last_session: Option<String>,
-    next_pane_id: u64,
     next_window_id: u64,
 }
 
@@ -43,7 +42,6 @@ impl Default for SessionStore {
             state_path: None,
             pending_switches: BTreeMap::new(),
             last_session: None,
-            next_pane_id: 0,
             next_window_id: 0,
         }
     }
@@ -63,7 +61,6 @@ impl SessionStore {
             persisted_sessions: persisted.sessions,
             state_path: Some(path),
             last_session: persisted.last_session,
-            next_pane_id: persisted.next_pane_id,
             next_window_id: persisted.next_window_id,
             ..Self::default()
         })
@@ -82,21 +79,23 @@ impl SessionStore {
             } => {
                 let name = name.unwrap_or_else(|| format!("session-{}", self.sessions.len() + 1));
                 let window_id = self.next_window();
-                let pane_id = self.next_pane();
-                match Session::new(name.clone(), cwd, command, window_id, pane_id) {
+                match Session::new(name.clone(), cwd, command, window_id) {
                     Ok(session) => {
                         self.sessions.insert(name.clone(), session);
                         self.last_session = Some(name.clone());
                         if let Some(source) = switch_from
                             && self.sessions.get(&source.session).is_some_and(|session| {
-                                session.contains_pane(PaneId(source.pane_id))
+                                session.contains_window_pane(
+                                    WindowId(source.window_id),
+                                    PaneId(source.pane_id),
+                                )
                             })
                         {
                             self.pending_switches.insert(source.session, name.clone());
                         }
                         CommandResponse::SessionCreated {
                             session: name,
-                            pane_id: pane_id.0,
+                            pane_id: 0,
                         }
                     }
                     Err(error) => CommandResponse::Error {
@@ -258,9 +257,8 @@ impl SessionStore {
                 command,
             } => {
                 let window_id = self.next_window();
-                let pane_id = self.next_pane();
                 match self.sessions.get_mut(&session) {
-                    Some(session) => match session.new_window(window_id, pane_id, name, &command) {
+                    Some(session) => match session.new_window(window_id, name, &command) {
                         Ok(created) => CommandResponse::WindowCreated {
                             session: session.name.clone(),
                             window_id: created.window_id.0,
@@ -408,11 +406,6 @@ impl SessionStore {
         response
     }
 
-    fn next_pane(&mut self) -> PaneId {
-        self.next_pane_id += 1;
-        PaneId(self.next_pane_id)
-    }
-
     fn next_window(&mut self) -> WindowId {
         self.next_window_id += 1;
         WindowId(self.next_window_id)
@@ -491,7 +484,6 @@ impl SessionStore {
         };
         let state = PersistedState {
             last_session: self.last_session.clone(),
-            next_pane_id: self.next_pane_id,
             next_window_id: self.next_window_id,
             sessions: self.persisted_sessions.clone(),
         };
@@ -504,7 +496,6 @@ impl SessionStore {
         axis: crate::layout::SplitAxis,
         command: Vec<String>,
     ) -> CommandResponse {
-        let pane_id = self.next_pane();
         match self.sessions.get_mut(&target.session) {
             Some(session) => {
                 if let Some(window) = target.window {
@@ -513,7 +504,7 @@ impl SessionStore {
                 if let Some(pane) = target.pane {
                     let _ = session.select_pane(target.window, pane);
                 }
-                match session.split_active_pane(axis, pane_id, &command) {
+                match session.split_active_pane(axis, &command) {
                     Ok(split) => CommandResponse::PaneSplit {
                         session: session.name.clone(),
                         window_id: split.window_id.0,
@@ -785,7 +776,7 @@ mod tests {
             created,
             CommandResponse::SessionCreated {
                 session,
-                pane_id: 1
+                pane_id: 0
             } if session == "work"
         ));
 
@@ -822,7 +813,7 @@ mod tests {
             CommandResponse::PaneSplit {
                 session,
                 window_id: 1,
-                pane_id: 2
+                pane_id: 1
             } if session == "work"
         ));
     }
@@ -902,6 +893,7 @@ mod tests {
             command: vec!["sh".into()],
             switch_from: Some(SwitchSource {
                 session: "work".into(),
+                window_id: 1,
                 pane_id,
             }),
         });

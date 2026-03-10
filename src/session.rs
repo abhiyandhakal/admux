@@ -31,6 +31,7 @@ pub struct WindowRuntime {
     pub id: WindowId,
     pub name: String,
     pub layout: LayoutTree,
+    pub next_pane_id: u64,
     pub panes: BTreeMap<PaneId, PaneRuntime>,
 }
 
@@ -61,7 +62,6 @@ impl Session {
         cwd: Option<PathBuf>,
         command: Vec<String>,
         window_id: WindowId,
-        pane_id: PaneId,
     ) -> Result<Self> {
         let mut windows = BTreeMap::new();
         windows.insert(
@@ -71,7 +71,6 @@ impl Session {
                 default_window_name(&command),
                 cwd.clone(),
                 &command,
-                pane_id,
                 &name,
             )?,
         );
@@ -228,9 +227,14 @@ impl Session {
     }
 
     pub fn contains_pane(&self, pane_id: PaneId) -> bool {
+        self.active_window()
+            .is_some_and(|window| window.panes.contains_key(&pane_id))
+    }
+
+    pub fn contains_window_pane(&self, window_id: WindowId, pane_id: PaneId) -> bool {
         self.windows
-            .values()
-            .any(|window| window.panes.contains_key(&pane_id))
+            .get(&window_id)
+            .is_some_and(|window| window.panes.contains_key(&pane_id))
     }
 
     pub fn send_keys(
@@ -301,7 +305,6 @@ impl Session {
     pub fn split_active_pane(
         &mut self,
         axis: SplitAxis,
-        pane_id: PaneId,
         command: &[String],
     ) -> Result<SplitResult> {
         let cwd = self.cwd.clone();
@@ -315,10 +318,11 @@ impl Session {
             .windows
             .get_mut(&active_window)
             .ok_or_else(|| anyhow!("unknown window"))?;
+        let pane_id = window.allocate_pane_id();
         let process = PaneProcess::spawn(
             &default_command,
             cwd.as_deref(),
-            Some((&self.name, pane_id)),
+            Some((&self.name, active_window, pane_id)),
         )?;
         let pane = PaneRuntime {
             id: pane_id,
@@ -337,7 +341,6 @@ impl Session {
     pub fn new_window(
         &mut self,
         window_id: WindowId,
-        pane_id: PaneId,
         name: Option<String>,
         command: &[String],
     ) -> Result<WindowCreation> {
@@ -351,9 +354,9 @@ impl Session {
             name.unwrap_or_else(|| default_window_name(&command)),
             self.cwd.clone(),
             &command,
-            pane_id,
             &self.name,
         )?;
+        let pane_id = window.layout.active;
         self.windows.insert(window_id, window);
         self.window_order.push(window_id);
         self.remember_window_switch(window_id);
@@ -573,10 +576,14 @@ impl WindowRuntime {
         name: String,
         cwd: Option<PathBuf>,
         command: &[String],
-        pane_id: PaneId,
         session_name: &str,
     ) -> Result<Self> {
-        let process = PaneProcess::spawn(command, cwd.as_deref(), Some((session_name, pane_id)))?;
+        let pane_id = PaneId(0);
+        let process = PaneProcess::spawn(
+            command,
+            cwd.as_deref(),
+            Some((session_name, id, pane_id)),
+        )?;
         let pane = PaneRuntime {
             id: pane_id,
             title: default_window_name(command),
@@ -589,8 +596,15 @@ impl WindowRuntime {
             id,
             name,
             layout: LayoutTree::new(pane_id),
+            next_pane_id: 1,
             panes,
         })
+    }
+
+    fn allocate_pane_id(&mut self) -> PaneId {
+        let pane_id = PaneId(self.next_pane_id);
+        self.next_pane_id += 1;
+        pane_id
     }
 
     fn active_pane(&self) -> Option<&PaneRuntime> {
@@ -656,13 +670,12 @@ mod tests {
             None,
             vec!["sh".into()],
             WindowId(1),
-            PaneId(1),
         )
         .expect("create session");
         session.set_viewport(30, 120).expect("set viewport");
 
         let created = session
-            .new_window(WindowId(2), PaneId(2), Some("logs".into()), &["sh".into()])
+            .new_window(WindowId(2), Some("logs".into()), &["sh".into()])
             .expect("create window");
 
         let window = session.windows.get(&created.window_id).expect("window");
@@ -698,12 +711,11 @@ mod tests {
             None,
             vec!["sh".into()],
             WindowId(1),
-            PaneId(1),
         )
         .expect("create session");
 
         session
-            .new_window(WindowId(2), PaneId(2), Some("logs".into()), &["sh".into()])
+            .new_window(WindowId(2), Some("logs".into()), &["sh".into()])
             .expect("create window");
         session.select_window(WindowId(1)).expect("select first");
 
@@ -715,5 +727,37 @@ mod tests {
         assert!(windows
             .iter()
             .any(|window| window.last_selected && window.id == 2));
+    }
+
+    #[test]
+    fn pane_ids_are_window_local_and_stable() {
+        let mut session = Session::new(
+            "work".into(),
+            None,
+            vec!["sh".into()],
+            WindowId(1),
+        )
+        .expect("create session");
+
+        let first_window_panes = session.list_panes(Some(WindowId(1)));
+        assert_eq!(first_window_panes[0].id, 0);
+
+        let split = session
+            .split_active_pane(SplitAxis::Vertical, &["sh".into()])
+            .expect("split pane");
+        assert_eq!(split.pane_id, PaneId(1));
+
+        let second_window = session
+            .new_window(WindowId(2), Some("logs".into()), &["sh".into()])
+            .expect("create window");
+        assert_eq!(second_window.pane_id, PaneId(0));
+
+        session.select_window(WindowId(1)).expect("back to first");
+        session
+            .kill_pane(Some(WindowId(1)), Some(PaneId(0)))
+            .expect("kill pane");
+        let remaining = session.list_panes(Some(WindowId(1)));
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, 1);
     }
 }

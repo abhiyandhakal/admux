@@ -15,7 +15,6 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PersistedState {
     pub last_session: Option<String>,
-    pub next_pane_id: u64,
     pub next_window_id: u64,
     pub sessions: BTreeMap<String, PersistedSession>,
 }
@@ -39,6 +38,8 @@ pub struct PersistedWindow {
     pub id: WindowId,
     pub name: String,
     pub layout: crate::layout::LayoutTree,
+    #[serde(default)]
+    pub next_pane_id: u64,
     pub panes: BTreeMap<PaneId, PersistedPane>,
 }
 
@@ -74,6 +75,7 @@ impl PersistedWindow {
             id: window.id,
             name: window.name.clone(),
             layout: window.layout.clone(),
+            next_pane_id: window.next_pane_id,
             panes: window
                 .panes
                 .iter()
@@ -127,7 +129,6 @@ mod tests {
         let path = dir.path().join("state.json");
         let mut state = PersistedState {
             last_session: Some("work".into()),
-            next_pane_id: 3,
             next_window_id: 2,
             sessions: BTreeMap::new(),
         };
