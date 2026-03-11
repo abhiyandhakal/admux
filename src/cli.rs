@@ -153,6 +153,8 @@ pub struct ServeArgs {
     pub socket: Option<PathBuf>,
     #[arg(long)]
     pub state: Option<PathBuf>,
+    #[arg(long)]
+    pub config: Option<PathBuf>,
 }
 
 #[cfg(test)]
@@ -205,6 +207,7 @@ mod tests {
             DaemonCommand::Serve(ServeArgs {
                 socket: Some(PathBuf::from("/tmp/admux.sock")),
                 state: None,
+                config: None,
             })
         );
     }

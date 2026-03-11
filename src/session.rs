@@ -3,6 +3,7 @@ use std::{collections::BTreeMap, path::PathBuf};
 use anyhow::{Result, anyhow};
 
 use crate::{
+    config::WindowDefaults,
     ipc::{
         NavigationDirection, PaneCursor, PaneRender, PaneSummary, RenderSnapshot, ScrollDirection,
     },
@@ -25,6 +26,9 @@ pub struct Session {
     pub window_order: Vec<WindowId>,
     pub active_window: WindowId,
     pub last_window: Option<WindowId>,
+    pub default_shell: Option<String>,
+    pub scrollback_lines: usize,
+    pub window_defaults: WindowDefaults,
 }
 
 pub struct WindowRuntime {
@@ -62,16 +66,23 @@ impl Session {
         cwd: Option<PathBuf>,
         command: Vec<String>,
         window_id: WindowId,
+        default_shell: Option<String>,
+        scrollback_lines: usize,
+        window_defaults: WindowDefaults,
     ) -> Result<Self> {
         let mut windows = BTreeMap::new();
+        let initial_name = default_window_name(&command, &window_defaults);
         windows.insert(
             window_id,
             WindowRuntime::new(
                 window_id,
-                default_window_name(&command),
+                initial_name,
                 cwd.clone(),
                 &command,
                 &name,
+                default_shell.as_deref(),
+                scrollback_lines,
+                &window_defaults,
             )?,
         );
 
@@ -85,6 +96,9 @@ impl Session {
             window_order: vec![window_id],
             active_window: window_id,
             last_window: None,
+            default_shell,
+            scrollback_lines,
+            window_defaults,
         };
         session.sync_pane_sizes()?;
         Ok(session)
@@ -324,10 +338,12 @@ impl Session {
             &default_command,
             cwd.as_deref(),
             Some((&self.name, active_window, pane_id)),
+            self.default_shell.as_deref(),
+            self.scrollback_lines,
         )?;
         let pane = PaneRuntime {
             id: pane_id,
-            title: default_window_name(&default_command),
+            title: default_window_name(&default_command, &self.window_defaults),
             process,
         };
         window.panes.insert(pane_id, pane);
@@ -352,10 +368,13 @@ impl Session {
         };
         let window = WindowRuntime::new(
             window_id,
-            name.unwrap_or_else(|| default_window_name(&command)),
+            name.unwrap_or_else(|| default_window_name(&command, &self.window_defaults)),
             self.cwd.clone(),
             &command,
             &self.name,
+            self.default_shell.as_deref(),
+            self.scrollback_lines,
+            &self.window_defaults,
         )?;
         let pane_id = window.layout.active;
         self.windows.insert(window_id, window);
@@ -523,7 +542,10 @@ impl Session {
             self.remember_window_after_removal(self.active_window, window_id);
             changed = true;
         }
-        if self.last_window.is_some_and(|window_id| !self.windows.contains_key(&window_id)) {
+        if self
+            .last_window
+            .is_some_and(|window_id| !self.windows.contains_key(&window_id))
+        {
             self.last_window = None;
             changed = true;
         }
@@ -578,16 +600,21 @@ impl WindowRuntime {
         cwd: Option<PathBuf>,
         command: &[String],
         session_name: &str,
+        default_shell: Option<&str>,
+        scrollback_lines: usize,
+        window_defaults: &WindowDefaults,
     ) -> Result<Self> {
         let pane_id = PaneId(0);
         let process = PaneProcess::spawn(
             command,
             cwd.as_deref(),
             Some((session_name, id, pane_id)),
+            default_shell,
+            scrollback_lines,
         )?;
         let pane = PaneRuntime {
             id: pane_id,
-            title: default_window_name(command),
+            title: default_window_name(command, window_defaults),
             process,
         };
         let mut panes = BTreeMap::new();
@@ -631,13 +658,16 @@ impl WindowRuntime {
     }
 }
 
-fn default_window_name(command: &[String]) -> String {
+fn default_window_name(command: &[String], defaults: &WindowDefaults) -> String {
+    if !defaults.use_command_name {
+        return defaults.shell_name.clone();
+    }
     command
         .first()
         .and_then(|part| part.rsplit('/').next())
         .filter(|part| !part.is_empty())
         .map(ToOwned::to_owned)
-        .unwrap_or_else(|| "shell".into())
+        .unwrap_or_else(|| defaults.shell_name.clone())
 }
 
 fn convert_direction(direction: NavigationDirection) -> Direction {
@@ -671,6 +701,9 @@ mod tests {
             None,
             vec!["sh".into()],
             WindowId(1),
+            None,
+            10_000,
+            WindowDefaults::default(),
         )
         .expect("create session");
         session.set_viewport(30, 120).expect("set viewport");
@@ -712,6 +745,9 @@ mod tests {
             None,
             vec!["sh".into()],
             WindowId(1),
+            None,
+            10_000,
+            WindowDefaults::default(),
         )
         .expect("create session");
 
@@ -725,9 +761,11 @@ mod tests {
 
         let windows = session.list_windows();
         assert!(windows.iter().any(|window| window.active && window.id == 1));
-        assert!(windows
-            .iter()
-            .any(|window| window.last_selected && window.id == 2));
+        assert!(
+            windows
+                .iter()
+                .any(|window| window.last_selected && window.id == 2)
+        );
     }
 
     #[test]
@@ -737,6 +775,9 @@ mod tests {
             None,
             vec!["sh".into()],
             WindowId(1),
+            None,
+            10_000,
+            WindowDefaults::default(),
         )
         .expect("create session");
 

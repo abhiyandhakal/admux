@@ -10,6 +10,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 
 use crate::{
+    config::{Config, ResolvedConfig},
     ipc::{
         CURRENT_PROTOCOL_VERSION, CommandRequest, CommandResponse, CycleDirection,
         NavigationDirection, ProtocolVersion, SessionSummary,
@@ -32,6 +33,8 @@ pub struct SessionStore {
     pending_switches: BTreeMap<String, String>,
     last_session: Option<String>,
     next_window_id: u64,
+    config_path: Option<std::path::PathBuf>,
+    config: ResolvedConfig,
 }
 
 impl Default for SessionStore {
@@ -43,6 +46,10 @@ impl Default for SessionStore {
             pending_switches: BTreeMap::new(),
             last_session: None,
             next_window_id: 0,
+            config_path: None,
+            config: Config::default()
+                .resolve()
+                .expect("default config should resolve"),
         }
     }
 }
@@ -55,15 +62,21 @@ struct TargetRef {
 }
 
 impl SessionStore {
-    pub fn with_state_path(path: std::path::PathBuf) -> Result<Self> {
-        let persisted = load_state(&path)?;
-        Ok(Self {
+    pub fn with_paths(
+        state_path: std::path::PathBuf,
+        config_path: std::path::PathBuf,
+    ) -> Result<Self> {
+        let persisted = load_state(&state_path)?;
+        let mut store = Self {
             persisted_sessions: persisted.sessions,
-            state_path: Some(path),
+            state_path: Some(state_path),
             last_session: persisted.last_session,
             next_window_id: persisted.next_window_id,
+            config_path: Some(config_path),
             ..Self::default()
-        })
+        };
+        store.reload_config()?;
+        Ok(store)
     }
 
     pub fn handle(&mut self, request: CommandRequest) -> CommandResponse {
@@ -77,9 +90,24 @@ impl SessionStore {
                 command,
                 switch_from,
             } => {
-                let name = name.unwrap_or_else(|| format!("session-{}", self.sessions.len() + 1));
+                let name = name.unwrap_or_else(|| {
+                    format!(
+                        "{}-{}",
+                        self.config.defaults.session.name_prefix,
+                        self.sessions.len() + 1
+                    )
+                });
+                let command = self.effective_command(command);
                 let window_id = self.next_window();
-                match Session::new(name.clone(), cwd, command, window_id) {
+                match Session::new(
+                    name.clone(),
+                    cwd,
+                    command,
+                    window_id,
+                    self.config.behavior.default_shell.clone(),
+                    self.config.behavior.scrollback_lines,
+                    self.config.defaults.window.clone(),
+                ) {
                     Ok(session) => {
                         self.sessions.insert(name.clone(), session);
                         self.last_session = Some(name.clone());
@@ -116,10 +144,13 @@ impl SessionStore {
                     .unwrap_or(session_name);
                 if self.sessions.contains_key(&session_name) {
                     let session = self.sessions.get(&session_name).expect("checked contains");
-                    let snapshot = session.render_snapshot(session.pane_area()).map(|mut snapshot| {
-                        snapshot.sessions = self.list_session_summaries();
-                        snapshot
-                    });
+                    let snapshot =
+                        session
+                            .render_snapshot(session.pane_area())
+                            .map(|mut snapshot| {
+                                snapshot.sessions = self.list_session_summaries();
+                                snapshot
+                            });
                     CommandResponse::Attached {
                         session: session_name,
                         preview: session.active_pane_preview(),
@@ -260,6 +291,7 @@ impl SessionStore {
                 command,
             } => {
                 let window_id = self.next_window();
+                let command = self.effective_command(command);
                 match self.sessions.get_mut(&session) {
                     Some(session) => match session.new_window(window_id, name, &command) {
                         Ok(created) => CommandResponse::WindowCreated {
@@ -403,7 +435,12 @@ impl SessionStore {
                     message: format!("unknown session {session}"),
                 },
             },
-            CommandRequest::ReloadConfig => CommandResponse::ConfigReloaded,
+            CommandRequest::ReloadConfig => match self.reload_config() {
+                Ok(()) => CommandResponse::ConfigReloaded,
+                Err(error) => CommandResponse::Error {
+                    message: error.to_string(),
+                },
+            },
         };
         self.persist_metadata();
         response
@@ -499,6 +536,7 @@ impl SessionStore {
         axis: crate::layout::SplitAxis,
         command: Vec<String>,
     ) -> CommandResponse {
+        let command = self.effective_command(command);
         match self.sessions.get_mut(&target.session) {
             Some(session) => {
                 if let Some(window) = target.window {
@@ -667,9 +705,35 @@ impl SessionStore {
             },
         }
     }
+
+    fn effective_command(&self, command: Vec<String>) -> Vec<String> {
+        if command.is_empty() {
+            self.config
+                .behavior
+                .default_shell
+                .as_ref()
+                .map(|shell| vec![shell.clone()])
+                .unwrap_or_default()
+        } else {
+            command
+        }
+    }
+
+    fn reload_config(&mut self) -> Result<()> {
+        let Some(path) = self.config_path.as_ref() else {
+            self.config = Config::default().resolve()?;
+            return Ok(());
+        };
+        self.config = if path.exists() {
+            Config::load_from_path(path)?.resolve()?
+        } else {
+            Config::default().resolve()?
+        };
+        Ok(())
+    }
 }
 
-pub fn serve(socket_path: &Path, state_path: &Path) -> Result<()> {
+pub fn serve(socket_path: &Path, state_path: &Path, config_path: &Path) -> Result<()> {
     if let Some(parent) = socket_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create socket directory {}", parent.display()))?;
@@ -681,8 +745,9 @@ pub fn serve(socket_path: &Path, state_path: &Path) -> Result<()> {
 
     let listener = UnixListener::bind(socket_path)
         .with_context(|| format!("failed to bind socket {}", socket_path.display()))?;
-    let state = Arc::new(Mutex::new(SessionStore::with_state_path(
+    let state = Arc::new(Mutex::new(SessionStore::with_paths(
         state_path.to_path_buf(),
+        config_path.to_path_buf(),
     )?));
     for stream in listener.incoming() {
         let mut stream = stream.context("failed to accept client")?;
@@ -918,9 +983,10 @@ mod tests {
     fn persisted_metadata_survives_store_restart() {
         let dir = tempdir().expect("tempdir");
         let state_path = dir.path().join("state.json");
+        let config_path = dir.path().join("config.toml");
 
-        let mut store =
-            SessionStore::with_state_path(state_path.clone()).expect("create persisted store");
+        let mut store = SessionStore::with_paths(state_path.clone(), config_path.clone())
+            .expect("create persisted store");
         let _ = store.handle(CommandRequest::NewSession {
             name: Some("work".into()),
             cwd: None,
@@ -930,7 +996,7 @@ mod tests {
         drop(store);
 
         let mut restarted =
-            SessionStore::with_state_path(state_path).expect("reload persisted store");
+            SessionStore::with_paths(state_path, config_path).expect("reload persisted store");
         assert_eq!(
             restarted.handle(CommandRequest::ListSessions),
             CommandResponse::SessionList {
@@ -951,6 +1017,85 @@ mod tests {
                 session: Some("work".into()),
             }),
             CommandResponse::Error { message } if message.contains("persisted metadata")
+        ));
+    }
+
+    #[test]
+    fn reload_config_updates_future_creation_defaults() {
+        let dir = tempdir().expect("tempdir");
+        let state_path = dir.path().join("state.json");
+        let config_path = dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+                [defaults.session]
+                name_prefix = "work"
+
+                [defaults.window]
+                shell_name = "term"
+                use_command_name = false
+            "#,
+        )
+        .expect("write config");
+
+        let mut store =
+            SessionStore::with_paths(state_path, config_path).expect("create configured store");
+        assert_eq!(
+            store.handle(CommandRequest::ReloadConfig),
+            CommandResponse::ConfigReloaded
+        );
+
+        let created = store.handle(CommandRequest::NewSession {
+            name: None,
+            cwd: None,
+            command: Vec::new(),
+            switch_from: None,
+        });
+        assert!(matches!(
+            created,
+            CommandResponse::SessionCreated { ref session, .. } if session == "work-1"
+        ));
+        assert!(matches!(
+            store.handle(CommandRequest::ListWindows {
+                session: "work-1".into(),
+            }),
+            CommandResponse::WindowList { ref windows }
+                if windows.len() == 1 && windows[0].name == "term"
+        ));
+    }
+
+    #[test]
+    fn invalid_reload_keeps_previous_config() {
+        let dir = tempdir().expect("tempdir");
+        let state_path = dir.path().join("state.json");
+        let config_path = dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+                [defaults.session]
+                name_prefix = "work"
+            "#,
+        )
+        .expect("write config");
+
+        let mut store =
+            SessionStore::with_paths(state_path, config_path.clone()).expect("create store");
+        fs::write(&config_path, "[keys.leader]\ndetach = \"Ctrl-Magic\"\n").expect("overwrite");
+
+        assert!(matches!(
+            store.handle(CommandRequest::ReloadConfig),
+            CommandResponse::Error { .. }
+        ));
+
+        let created = store.handle(CommandRequest::NewSession {
+            name: None,
+            cwd: None,
+            command: Vec::new(),
+            switch_from: None,
+        });
+        assert!(matches!(
+            created,
+            CommandResponse::SessionCreated { ref session, .. } if session == "work-1"
         ));
     }
 }

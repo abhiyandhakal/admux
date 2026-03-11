@@ -8,7 +8,7 @@ use crossterm::{
 };
 
 use crate::{
-    config::{StatusPosition, UiConfig},
+    config::{DividerCharset, ResolvedUiConfig, StatusPosition},
     copy_mode::Selection,
     ipc::{PaneRender, RenderSnapshot},
     pane::Rect,
@@ -60,7 +60,7 @@ pub fn render_session<W: Write>(
     snapshot: &RenderSnapshot,
     bottom_bar: BottomBar<'_>,
     selection: Option<PaneSelection>,
-    ui: &UiConfig,
+    ui: &ResolvedUiConfig,
     size: TerminalSize,
 ) -> std::io::Result<()> {
     queue!(out, Clear(ClearType::All), MoveTo(0, 0))?;
@@ -89,7 +89,7 @@ pub fn render_choose_tree<W: Write>(
     preview_title: &str,
     preview_snapshot: &RenderSnapshot,
     bottom_message: &str,
-    ui: &UiConfig,
+    ui: &ResolvedUiConfig,
     size: TerminalSize,
 ) -> std::io::Result<()> {
     queue!(out, Clear(ClearType::All), MoveTo(0, 0))?;
@@ -161,7 +161,7 @@ pub fn render_help_overlay<W: Write>(
     session: &str,
     snapshot: &RenderSnapshot,
     lines: &[String],
-    ui: &UiConfig,
+    ui: &ResolvedUiConfig,
     size: TerminalSize,
 ) -> std::io::Result<()> {
     queue!(out, Clear(ClearType::All), MoveTo(0, 0))?;
@@ -192,7 +192,11 @@ pub fn render_help_overlay<W: Write>(
     out.flush()
 }
 
-fn render_pane<W: Write>(out: &mut W, pane: &PaneRender, ui: &UiConfig) -> std::io::Result<()> {
+fn render_pane<W: Write>(
+    out: &mut W,
+    pane: &PaneRender,
+    ui: &ResolvedUiConfig,
+) -> std::io::Result<()> {
     for (offset, row) in pane.rows_formatted.iter().enumerate() {
         if offset as u16 >= pane.rect.height {
             break;
@@ -210,19 +214,31 @@ fn render_pane<W: Write>(out: &mut W, pane: &PaneRender, ui: &UiConfig) -> std::
 fn render_split_separators<W: Write>(
     out: &mut W,
     snapshot: &RenderSnapshot,
-    ui: &UiConfig,
+    ui: &ResolvedUiConfig,
 ) -> std::io::Result<()> {
     for divider in &snapshot.dividers {
         queue!(
             out,
             MoveTo(divider.x, offset_row(divider.y, ui)),
-            Print(connection_glyph(divider.mask))
+            Print(connection_glyph(divider.mask, ui.dividers.charset))
         )?;
     }
     Ok(())
 }
 
-fn connection_glyph(mask: u8) -> char {
+fn connection_glyph(mask: u8, charset: DividerCharset) -> char {
+    if matches!(charset, DividerCharset::Ascii) {
+        return match mask {
+            m if m & (CONNECT_UP | CONNECT_DOWN) != 0
+                && m & (CONNECT_LEFT | CONNECT_RIGHT) != 0 =>
+            {
+                '+'
+            }
+            m if m & (CONNECT_UP | CONNECT_DOWN) != 0 => '|',
+            m if m & (CONNECT_LEFT | CONNECT_RIGHT) != 0 => '-',
+            _ => ' ',
+        };
+    }
     match mask {
         m if m == (CONNECT_UP | CONNECT_DOWN) => '│',
         m if m == (CONNECT_LEFT | CONNECT_RIGHT) => '─',
@@ -368,7 +384,7 @@ fn render_bottom_bar<W: Write>(
     session: &str,
     snapshot: &RenderSnapshot,
     bottom_bar: BottomBar<'_>,
-    ui: &UiConfig,
+    ui: &ResolvedUiConfig,
     size: TerminalSize,
 ) -> std::io::Result<Option<u16>> {
     let row = status_row(ui, size);
@@ -412,7 +428,7 @@ fn render_bottom_bar<W: Write>(
 fn render_cursor<W: Write>(
     out: &mut W,
     snapshot: &RenderSnapshot,
-    ui: &UiConfig,
+    ui: &ResolvedUiConfig,
 ) -> std::io::Result<()> {
     if let Some(pane) = snapshot.panes.iter().find(|pane| pane.focused)
         && let Some(cursor) = &pane.cursor
@@ -433,7 +449,7 @@ fn render_selection_overlay<W: Write>(
     out: &mut W,
     snapshot: &RenderSnapshot,
     selection: PaneSelection,
-    ui: &UiConfig,
+    ui: &ResolvedUiConfig,
 ) -> std::io::Result<()> {
     let Some(pane) = snapshot
         .panes
@@ -527,7 +543,7 @@ fn render_status_line(
     session: &str,
     snapshot: &RenderSnapshot,
     message: Option<&str>,
-    ui: &UiConfig,
+    ui: &ResolvedUiConfig,
     width: u16,
 ) -> Vec<StatusSegment> {
     if let Some(message) = message {
@@ -561,21 +577,33 @@ fn render_window_segment(window: &crate::window::WindowSummary) -> StatusSegment
 fn build_tmux_status_zones(
     session: &str,
     snapshot: &RenderSnapshot,
-    ui: &UiConfig,
+    ui: &ResolvedUiConfig,
     width: u16,
 ) -> Option<StatusZones> {
-    let mut left = build_session_segments(session, snapshot);
-    let mut center = snapshot
-        .windows
-        .iter()
-        .map(render_window_segment)
-        .collect::<Vec<_>>();
-    let mut right = if ui.status_clock {
+    let mut left = if ui.status.show_sessions {
+        build_session_segments(session, snapshot)
+    } else {
+        vec![StatusSegment::session(format!("[{session}] "))]
+    };
+    let mut center = if ui.status.show_window_list {
+        snapshot
+            .windows
+            .iter()
+            .map(render_window_segment)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let mut right = if ui.status.show_clock || ui.status.show_host {
         let mut segments = Vec::new();
-        if let Some(host) = short_hostname() {
+        if ui.status.show_host
+            && let Some(host) = short_hostname()
+        {
             segments.push(StatusSegment::plain(format!("{host} ")));
         }
-        if let Some(clock) = local_clock() {
+        if ui.status.show_clock
+            && let Some(clock) = local_clock()
+        {
             segments.push(StatusSegment::plain(clock));
         }
         segments
@@ -617,9 +645,7 @@ fn fit_tmux_status_layout(
         }
         if let Some(segment) = center
             .iter_mut()
-            .find(|segment| {
-                !segment.attrs.contains(&Attribute::Bold) && segment.text.contains(':')
-            })
+            .find(|segment| !segment.attrs.contains(&Attribute::Bold) && segment.text.contains(':'))
         {
             if shorten_window_segment(segment) {
                 continue;
@@ -633,7 +659,9 @@ fn fit_tmux_status_layout(
             right.clear();
             continue;
         }
-        if let Some(index) = left.iter().position(|segment| !segment.attrs.contains(&Attribute::Bold))
+        if let Some(index) = left
+            .iter()
+            .position(|segment| !segment.attrs.contains(&Attribute::Bold))
             && shorten_non_active_session_segment(&mut left[index])
         {
             continue;
@@ -699,7 +727,9 @@ fn zones_overlap(
     let center_end = center_start.saturating_add(center_len);
     let right_start = (width as usize).saturating_sub(right_len);
 
-    left_len > center_start || center_end > right_start || total_len(left, center, right) > width as usize
+    left_len > center_start
+        || center_end > right_start
+        || total_len(left, center, right) > width as usize
 }
 
 fn shorten_window_segment(segment: &mut StatusSegment) -> bool {
@@ -765,11 +795,7 @@ fn shorten_active_session_segment(segment: &mut StatusSegment) -> bool {
     true
 }
 
-fn total_len(
-    left: &[StatusSegment],
-    center: &[StatusSegment],
-    right: &[StatusSegment],
-) -> usize {
+fn total_len(left: &[StatusSegment], center: &[StatusSegment], right: &[StatusSegment]) -> usize {
     left.iter()
         .chain(center.iter())
         .chain(right.iter())
@@ -799,7 +825,11 @@ fn render_status_segments<W: Write>(
         queue!(out, Print(text))?;
     }
     if written < width as usize {
-        queue!(out, SetAttribute(Attribute::Reverse), Print(" ".repeat(width as usize - written)))?;
+        queue!(
+            out,
+            SetAttribute(Attribute::Reverse),
+            Print(" ".repeat(width as usize - written))
+        )?;
     }
     queue!(out, SetAttribute(Attribute::Reset))?;
     Ok(())
@@ -836,7 +866,11 @@ fn render_status_segments_at<W: Write>(
         if written >= width as usize {
             break;
         }
-        queue!(out, MoveTo(written as u16, row), SetAttribute(Attribute::Reset))?;
+        queue!(
+            out,
+            MoveTo(written as u16, row),
+            SetAttribute(Attribute::Reset)
+        )?;
         for attr in &segment.attrs {
             queue!(out, SetAttribute(*attr))?;
         }
@@ -870,21 +904,21 @@ fn short_hostname() -> Option<String> {
     )
 }
 
-fn status_row(ui: &UiConfig, size: TerminalSize) -> u16 {
+fn status_row(ui: &ResolvedUiConfig, size: TerminalSize) -> u16 {
     match ui.status_position {
         StatusPosition::Top => 0,
         StatusPosition::Bottom => size.height.saturating_sub(1),
     }
 }
 
-fn offset_row(row: u16, ui: &UiConfig) -> u16 {
+fn offset_row(row: u16, ui: &ResolvedUiConfig) -> u16 {
     match ui.status_position {
         StatusPosition::Top => row.saturating_add(1),
         StatusPosition::Bottom => row,
     }
 }
 
-fn body_start_row(ui: &UiConfig) -> u16 {
+fn body_start_row(ui: &ResolvedUiConfig) -> u16 {
     match ui.status_position {
         StatusPosition::Top => 1,
         StatusPosition::Bottom => 0,
@@ -928,7 +962,10 @@ fn truncate(value: &str, width: u16) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{StatusPosition, StatusStyle, UiConfig};
+    use crate::config::{
+        DividerCharset, DividerConfig, ModeBarConfig, OverlayConfig, ResolvedUiConfig,
+        StatusConfig, StatusPosition, ThemeConfig,
+    };
     use crate::ipc::{PaneCursor, PaneRender, RenderSnapshot};
     use crate::layout::{LayoutTree, SplitAxis};
     use crate::pane::PaneId;
@@ -974,14 +1011,19 @@ mod tests {
         }
     }
 
-    fn sample_ui() -> UiConfig {
-        UiConfig {
+    fn sample_ui() -> ResolvedUiConfig {
+        ResolvedUiConfig {
             status_position: StatusPosition::Bottom,
             show_pane_labels: true,
-            status_clock: true,
-            status_show_pane: true,
-            status_show_window_list: true,
-            status_style: StatusStyle::TmuxPlus,
+            status: StatusConfig::default(),
+            dividers: DividerConfig {
+                charset: DividerCharset::Unicode,
+                highlight_active: true,
+            },
+            theme: ThemeConfig::default(),
+            chooser: OverlayConfig::default(),
+            help: OverlayConfig::default(),
+            copy_mode: ModeBarConfig::default(),
         }
     }
 
@@ -1106,7 +1148,7 @@ mod tests {
     #[test]
     fn connection_mask_produces_joined_tee() {
         let mask = CONNECT_UP | CONNECT_DOWN | CONNECT_RIGHT;
-        assert_eq!(connection_glyph(mask), '├');
+        assert_eq!(connection_glyph(mask, DividerCharset::Unicode), '├');
     }
 
     #[test]
@@ -1208,7 +1250,10 @@ mod tests {
             &sample_ui(),
             60,
         );
-        let joined = segments.into_iter().map(|segment| segment.text).collect::<String>();
+        let joined = segments
+            .into_iter()
+            .map(|segment| segment.text)
+            .collect::<String>();
         assert!(joined.contains("copied 5 chars"));
         assert!(!joined.contains("shell"));
     }
@@ -1217,9 +1262,27 @@ mod tests {
     fn status_line_compresses_inactive_windows_when_narrow() {
         let mut snapshot = sample_snapshot();
         snapshot.windows = vec![
-            WindowSummary { id: 1, index: 0, name: "shell".into(), active: false, last_selected: true },
-            WindowSummary { id: 2, index: 1, name: "editor".into(), active: true, last_selected: false },
-            WindowSummary { id: 3, index: 2, name: "logs".into(), active: false, last_selected: false },
+            WindowSummary {
+                id: 1,
+                index: 0,
+                name: "shell".into(),
+                active: false,
+                last_selected: true,
+            },
+            WindowSummary {
+                id: 2,
+                index: 1,
+                name: "editor".into(),
+                active: true,
+                last_selected: false,
+            },
+            WindowSummary {
+                id: 3,
+                index: 2,
+                name: "logs".into(),
+                active: false,
+                last_selected: false,
+            },
         ];
         snapshot.active_window_id = 2;
         let joined = render_status_line("work", &snapshot, None, &sample_ui(), 32)
@@ -1235,8 +1298,20 @@ mod tests {
     fn status_line_marks_last_selected_window() {
         let mut snapshot = sample_snapshot();
         snapshot.windows = vec![
-            WindowSummary { id: 1, index: 0, name: "shell".into(), active: true, last_selected: false },
-            WindowSummary { id: 2, index: 1, name: "editor".into(), active: false, last_selected: true },
+            WindowSummary {
+                id: 1,
+                index: 0,
+                name: "shell".into(),
+                active: true,
+                last_selected: false,
+            },
+            WindowSummary {
+                id: 2,
+                index: 1,
+                name: "editor".into(),
+                active: false,
+                last_selected: true,
+            },
         ];
 
         let joined = render_status_line("work", &snapshot, None, &sample_ui(), 80)
@@ -1252,8 +1327,20 @@ mod tests {
     fn tmux_status_zones_center_window_list() {
         let mut snapshot = sample_snapshot();
         snapshot.windows = vec![
-            WindowSummary { id: 1, index: 0, name: "shell".into(), active: true, last_selected: false },
-            WindowSummary { id: 2, index: 1, name: "editor".into(), active: false, last_selected: true },
+            WindowSummary {
+                id: 1,
+                index: 0,
+                name: "shell".into(),
+                active: true,
+                last_selected: false,
+            },
+            WindowSummary {
+                id: 2,
+                index: 1,
+                name: "editor".into(),
+                active: false,
+                last_selected: true,
+            },
         ];
 
         let zones = build_tmux_status_zones("work", &snapshot, &sample_ui(), 80).expect("zones");
@@ -1266,8 +1353,8 @@ mod tests {
 
     #[test]
     fn tmux_status_zones_right_align_host_and_clock() {
-        let zones = build_tmux_status_zones("work", &sample_snapshot(), &sample_ui(), 80)
-            .expect("zones");
+        let zones =
+            build_tmux_status_zones("work", &sample_snapshot(), &sample_ui(), 80).expect("zones");
         let right_len = total_len(&[], &[], &zones.right);
 
         assert_eq!(zones.right_start, 80usize.saturating_sub(right_len));
@@ -1276,8 +1363,8 @@ mod tests {
 
     #[test]
     fn tmux_status_zones_include_session_list_on_left() {
-        let zones = build_tmux_status_zones("work", &sample_snapshot(), &sample_ui(), 80)
-            .expect("zones");
+        let zones =
+            build_tmux_status_zones("work", &sample_snapshot(), &sample_ui(), 80).expect("zones");
         let joined = zones
             .left
             .iter()
@@ -1300,7 +1387,10 @@ mod tests {
             BottomBar::Status { message: None },
             None,
             &ui,
-            TerminalSize { width: 40, height: 6 },
+            TerminalSize {
+                width: 40,
+                height: 6,
+            },
         )
         .expect("render session");
         let rendered = String::from_utf8_lossy(&buf);

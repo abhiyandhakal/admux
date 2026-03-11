@@ -16,6 +16,7 @@ pub enum InteractiveCommand {
     DetachClient,
     RenameWindow { name: String },
     SendKeys { keys: Vec<String> },
+    ReloadConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +71,10 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["prev-window"],
     },
     CommandSpec {
+        canonical: "reload-config",
+        aliases: &[],
+    },
+    CommandSpec {
         canonical: "rename-window",
         aliases: &[],
     },
@@ -103,6 +108,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "new-window",
     "next-window",
     "previous-window",
+    "reload-config",
     "rename-window",
     "select-window",
     "send-keys",
@@ -158,6 +164,7 @@ pub fn parse(input: &str) -> Result<InteractiveCommand, String> {
         "list-panes" => parse_no_args(command, args).map(|_| InteractiveCommand::ListPanes),
         "choose-tree" => parse_no_args(command, args).map(|_| InteractiveCommand::ChooseTree),
         "detach-client" => parse_no_args(command, args).map(|_| InteractiveCommand::DetachClient),
+        "reload-config" => parse_no_args(command, args).map(|_| InteractiveCommand::ReloadConfig),
         "rename-window" => parse_rename_window(args),
         "send-keys" => parse_send_keys(args),
         _ => Err(format!("unsupported command '{command}'")),
@@ -372,6 +379,14 @@ mod tests {
             InteractiveCommand::SendKeys {
                 keys: vec!["C-l".into(), "echo hello".into(), "Enter".into()],
             }
+        );
+    }
+
+    #[test]
+    fn parses_reload_config() {
+        assert_eq!(
+            parse("reload-config").expect("parse"),
+            InteractiveCommand::ReloadConfig
         );
     }
 

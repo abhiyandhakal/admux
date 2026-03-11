@@ -100,21 +100,59 @@ Example:
 ```toml
 [ui]
 status_position = "bottom"
-show_pane_labels = true
-status_clock = true
-status_show_pane = true
-status_show_window_list = true
-status_style = "tmux-plus"
+
+[ui.status]
+show_sessions = true
+show_window_list = true
+show_host = true
+show_clock = true
+
+[ui.dividers]
+charset = "unicode"
+highlight_active = true
+
+[ui.theme.active_window]
+bold = true
+reverse = true
 
 [mouse]
 enabled = true
+focus_on_click = true
+selection_copy = true
+border_resize = true
+wheel_scroll = true
 
 [behavior]
 scrollback_lines = 10000
+default_shell = "/bin/zsh"
+resize_step = 25
+copy_page_size = 20
+
+[defaults.session]
+name_prefix = "work"
+
+[defaults.window]
+shell_name = "shell"
+use_command_name = true
 
 [keys]
 leader = "Ctrl-b"
+
+[keys.leader]
+reload_config = "r"
+new_window = "c"
+
+[keys.copy_mode]
+copy_yank = "Enter"
 ```
+
+Config notes:
+
+- primary schema is grouped TOML: `[ui.status]`, `[ui.dividers]`, `[ui.theme.*]`, `[mouse]`, `[behavior]`, `[defaults.*]`, and per-mode key tables under `[keys.*]`
+- legacy aliases like `[ui] status_clock = true` and `[keys] leader = "Ctrl-b"` still load for compatibility
+- key bindings are typed and validated at load time; duplicate bindings, unknown actions, and invalid key names fail explicitly
+- `admux reload-config` now reloads both the daemon-side creation defaults and the client-side interactive key/UI config without restarting the daemon
+- future sessions/windows/panes use the reloaded defaults; already-running pane processes are not retroactively respawned
 
 Statusline defaults:
 

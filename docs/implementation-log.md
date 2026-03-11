@@ -320,3 +320,27 @@ This document records each completed implementation slice in detail, including t
   - attaching a stale session fails with a clear “persisted metadata only” error instead of pretending recovery is possible
 - Commit: pending current worktree
 - Status: complete
+
+## Extensible config slice
+
+- Goal: replace the old minimal config with a typed grouped TOML config that actually drives runtime behavior across keymaps, UI choices, mouse behavior, and future pane/session defaults.
+- Files changed:
+  - config model and validation: `src/config.rs`
+  - input/runtime integration: `src/input.rs`, `src/client.rs`, `src/commands.rs`
+  - rendering integration: `src/render.rs`
+  - daemon/runtime defaults and reload path: `src/server.rs`, `src/session.rs`, `src/pty.rs`, `src/cli.rs`, `src/bin/admuxd.rs`
+  - docs: `README.md`, `docs/detailed-status.md`
+- Verification:
+  - `cargo test`
+  - direct built-binary smoke:
+    - `target/debug/admuxd serve --socket <temp-socket> --state <temp-state> --config <temp-config>`
+    - `ADMUX_SOCKET=<temp-socket> ADMUX_STATE=<temp-state> ADMUX_CONFIG=<temp-config> target/debug/admux reload-config`
+    - `ADMUX_SOCKET=<temp-socket> ADMUX_STATE=<temp-state> ADMUX_CONFIG=<temp-config> target/debug/admux new -d`
+    - `ADMUX_SOCKET=<temp-socket> ADMUX_STATE=<temp-state> ADMUX_CONFIG=<temp-config> target/debug/admux list-windows work-1`
+- Observed result:
+  - key handling is now config-driven for normal, leader, and copy-mode tables
+  - explicit reload now reparses and validates config, keeps the old config on reload failure, and updates future creation defaults on success
+  - mouse behavior and copy page size now respect config toggles instead of being hardcoded
+  - daemon-side defaults can set session naming prefixes, shell fallback, resize step, scrollback size, and default window naming policy for future panes
+- Commit: pending current worktree
+- Status: complete

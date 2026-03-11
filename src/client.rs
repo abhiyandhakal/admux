@@ -23,7 +23,7 @@ use crossterm::{
 use crate::{
     cli::{AdmuxCli, ClientCommand, NewWindowArgs, ResizePaneArgs, SelectPaneArgs, SplitPaneArgs},
     commands::{InteractiveCommand, complete as complete_commands, parse as parse_command},
-    config::{Config, StatusPosition, UiConfig},
+    config::{Config, ResolvedConfig, StatusPosition},
     copy_mode::{CopyMode, Selection},
     input::{InputAction, InputMode, InputState},
     ipc::{
@@ -315,12 +315,15 @@ fn spawn_daemon(paths: &RuntimePaths) -> Result<()> {
     let daemon_path = resolve_daemon_binary()?;
     let socket = paths.socket_path.display().to_string();
     let state = paths.state_path.display().to_string();
+    let config = paths.config_path.display().to_string();
     Command::new(daemon_path)
         .arg("serve")
         .arg("--socket")
         .arg(socket)
         .arg("--state")
         .arg(state)
+        .arg("--config")
+        .arg(config)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -458,7 +461,7 @@ fn print_response(paths: &RuntimePaths, response: CommandResponse) -> Result<()>
 }
 
 fn attach_interactive(paths: &RuntimePaths, session: &str) -> Result<()> {
-    let config = load_config(paths)?;
+    let mut config = load_config(paths)?;
     let mut stdout = io::stdout();
     terminal::enable_raw_mode().context("failed to enable raw mode")?;
     execute!(
@@ -470,7 +473,7 @@ fn attach_interactive(paths: &RuntimePaths, session: &str) -> Result<()> {
     )
     .context("failed to enter alternate screen")?;
 
-    let result = run_attach_loop(paths, session.to_string(), &config.ui, &mut stdout);
+    let result = run_attach_loop(paths, session.to_string(), &mut config, &mut stdout);
 
     let _ = execute!(
         stdout,
@@ -486,10 +489,10 @@ fn attach_interactive(paths: &RuntimePaths, session: &str) -> Result<()> {
 fn run_attach_loop(
     paths: &RuntimePaths,
     mut current_session: String,
-    ui: &UiConfig,
+    config: &mut ResolvedConfig,
     stdout: &mut impl Write,
 ) -> Result<()> {
-    let mut state = InputState::default();
+    let mut state = InputState::new(config.keys.clone(), config.behavior.resize_step);
     let mut last_size = (0, 0);
     let mut selection_anchor: Option<SelectionAnchor> = None;
     let mut active_selection: Option<PaneSelection> = None;
@@ -566,7 +569,7 @@ fn run_attach_loop(
                     &snapshot,
                     bottom_bar,
                     render_selection,
-                    ui,
+                    &config.ui,
                     TerminalSize { width, height },
                 )?;
             }
@@ -582,7 +585,7 @@ fn run_attach_loop(
                         cursor: prompt.cursor,
                     },
                     None,
-                    ui,
+                    &config.ui,
                     TerminalSize { width, height },
                 )?;
             }
@@ -597,7 +600,7 @@ fn run_attach_loop(
                     &title,
                     &preview_snapshot,
                     &chooser_status,
-                    ui,
+                    &config.ui,
                     TerminalSize { width, height },
                 )?;
             }
@@ -607,7 +610,7 @@ fn run_attach_loop(
                     &current_session,
                     &snapshot,
                     &help_lines(),
-                    ui,
+                    &config.ui,
                     TerminalSize { width, height },
                 )?;
             }
@@ -764,6 +767,16 @@ fn run_attach_loop(
                                 },
                             )?;
                         }
+                        InputAction::ReloadConfig => {
+                            let _ = request_response(paths, CommandRequest::ReloadConfig)?;
+                            let reloaded = load_config(paths)?;
+                            state.replace_config(
+                                reloaded.keys.clone(),
+                                reloaded.behavior.resize_step,
+                            );
+                            *config = reloaded;
+                            status_message = Some("config reloaded".into());
+                        }
                         InputAction::CopyMove(direction) => {
                             let pane_dims = copy_mode.as_ref().and_then(|copy| {
                                 snapshot
@@ -824,12 +837,18 @@ fn run_attach_loop(
                         }
                         InputAction::CopyPageUp => {
                             if let Some(copy) = copy_mode.as_mut() {
-                                let page = snapshot
-                                    .panes
-                                    .iter()
-                                    .find(|pane| pane.pane_id == copy.pane_id)
-                                    .map(|pane| pane.rect.height.max(1) as i16)
-                                    .unwrap_or(10);
+                                let page = config
+                                    .behavior
+                                    .copy_page_size
+                                    .map(|value| value.min(i16::MAX as u16) as i16)
+                                    .unwrap_or_else(|| {
+                                        snapshot
+                                            .panes
+                                            .iter()
+                                            .find(|pane| pane.pane_id == copy.pane_id)
+                                            .map(|pane| pane.rect.height.max(1) as i16)
+                                            .unwrap_or(10)
+                                    });
                                 let _ = request_response(
                                     paths,
                                     CommandRequest::ScrollPane {
@@ -842,12 +861,18 @@ fn run_attach_loop(
                         }
                         InputAction::CopyPageDown => {
                             if let Some(copy) = copy_mode.as_mut() {
-                                let page = snapshot
-                                    .panes
-                                    .iter()
-                                    .find(|pane| pane.pane_id == copy.pane_id)
-                                    .map(|pane| pane.rect.height.max(1) as i16)
-                                    .unwrap_or(10);
+                                let page = config
+                                    .behavior
+                                    .copy_page_size
+                                    .map(|value| value.min(i16::MAX as u16) as i16)
+                                    .unwrap_or_else(|| {
+                                        snapshot
+                                            .panes
+                                            .iter()
+                                            .find(|pane| pane.pane_id == copy.pane_id)
+                                            .map(|pane| pane.rect.height.max(1) as i16)
+                                            .unwrap_or(10)
+                                    });
                                 let _ = request_response(
                                     paths,
                                     CommandRequest::ScrollPane {
@@ -904,7 +929,7 @@ fn run_attach_loop(
                         &current_session,
                         &snapshot,
                         mouse,
-                        ui,
+                        config,
                         stdout,
                         &mut selection_anchor,
                         &mut active_selection,
@@ -919,11 +944,11 @@ fn run_attach_loop(
     Ok(())
 }
 
-fn load_config(paths: &RuntimePaths) -> Result<Config> {
+fn load_config(paths: &RuntimePaths) -> Result<ResolvedConfig> {
     if !paths.config_path.exists() {
-        return Ok(Config::default());
+        return Config::default().resolve();
     }
-    Config::load_from_path(&paths.config_path)
+    Config::load_from_path(&paths.config_path)?.resolve()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1123,6 +1148,10 @@ fn execute_prompt_command(
                 },
             )?;
             Ok(None)
+        }
+        InteractiveCommand::ReloadConfig => {
+            let _ = request_response(paths, CommandRequest::ReloadConfig)?;
+            Ok(Some("config reloaded".into()))
         }
     }
 }
@@ -1616,13 +1645,17 @@ fn handle_mouse_event(
     session: &str,
     snapshot: &RenderSnapshot,
     mut mouse: MouseEvent,
-    ui: &UiConfig,
+    config: &ResolvedConfig,
     stdout: &mut impl Write,
     selection_anchor: &mut Option<SelectionAnchor>,
     active_selection: &mut Option<PaneSelection>,
     resize_drag: &mut Option<ResizeDrag>,
     status_message: &mut Option<String>,
 ) -> Result<()> {
+    let ui = &config.ui;
+    if !config.mouse.enabled {
+        return Ok(());
+    }
     if matches!(ui.status_position, StatusPosition::Top) {
         if mouse.row == 0 {
             return Ok(());
@@ -1631,7 +1664,9 @@ fn handle_mouse_event(
     }
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            if let Some((pane, direction)) = separator_hit(snapshot, mouse.row, mouse.column) {
+            if config.mouse.border_resize
+                && let Some((pane, direction)) = separator_hit(snapshot, mouse.row, mouse.column)
+            {
                 *resize_drag = Some(ResizeDrag {
                     pane_id: pane.pane_id,
                     direction,
@@ -1641,25 +1676,29 @@ fn handle_mouse_event(
             } else if let Some((pane, row, col)) =
                 pane_content_hit(snapshot, mouse.row, mouse.column)
             {
-                let _ = request_response(
-                    paths,
-                    CommandRequest::SelectPane {
-                        target: Some(format!(
-                            "{session}:{}.{}",
-                            snapshot.active_window_id, pane.pane_id
-                        )),
-                        direction: None,
-                    },
-                )?;
-                *selection_anchor = Some(SelectionAnchor {
-                    pane_id: pane.pane_id,
-                    row,
-                    col,
-                });
-                *active_selection = Some(PaneSelection {
-                    pane_id: pane.pane_id,
-                    selection: Selection::new(row, col, row, col),
-                });
+                if config.mouse.focus_on_click {
+                    let _ = request_response(
+                        paths,
+                        CommandRequest::SelectPane {
+                            target: Some(format!(
+                                "{session}:{}.{}",
+                                snapshot.active_window_id, pane.pane_id
+                            )),
+                            direction: None,
+                        },
+                    )?;
+                }
+                if config.mouse.selection_copy {
+                    *selection_anchor = Some(SelectionAnchor {
+                        pane_id: pane.pane_id,
+                        row,
+                        col,
+                    });
+                    *active_selection = Some(PaneSelection {
+                        pane_id: pane.pane_id,
+                        selection: Selection::new(row, col, row, col),
+                    });
+                }
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
@@ -1672,13 +1711,14 @@ fn handle_mouse_event(
                         CommandRequest::ResizePane {
                             target,
                             direction,
-                            amount: delta.saturating_mul(20),
+                            amount: delta.saturating_mul(config.behavior.resize_step.max(1)),
                         },
                     )?;
                     resize.last_row = mouse.row;
                     resize.last_col = mouse.column;
                 }
-            } else if let Some(anchor) = selection_anchor.as_ref()
+            } else if config.mouse.selection_copy
+                && let Some(anchor) = selection_anchor.as_ref()
                 && let Some((pane, row, col)) = pane_content_hit(snapshot, mouse.row, mouse.column)
                 && pane.pane_id == anchor.pane_id
             {
@@ -1690,7 +1730,8 @@ fn handle_mouse_event(
         }
         MouseEventKind::Up(MouseButton::Left) => {
             *resize_drag = None;
-            if let Some(anchor) = selection_anchor.take()
+            if config.mouse.selection_copy
+                && let Some(anchor) = selection_anchor.take()
                 && let Some((pane, row, col)) = pane_content_hit(snapshot, mouse.row, mouse.column)
                 && pane.pane_id == anchor.pane_id
             {
@@ -1718,6 +1759,9 @@ fn handle_mouse_event(
             *active_selection = None;
         }
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            if !config.mouse.wheel_scroll {
+                return Ok(());
+            }
             let direction = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
                 crate::ipc::ScrollDirection::Up
             } else {

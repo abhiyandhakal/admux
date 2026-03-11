@@ -132,6 +132,29 @@ Observed result:
 
 - live pane/process recovery after `admuxd` restart is still out of scope
 
+## Config system
+
+- `admux` now has a typed grouped TOML config with a resolved runtime form instead of a mostly-placeholder config shape
+- grouped sections currently supported:
+  - `[keys]`, `[keys.normal]`, `[keys.leader]`, `[keys.copy_mode]`
+  - `[ui.status]`, `[ui.dividers]`, `[ui.theme.*]`
+  - `[mouse]`
+  - `[behavior]`
+  - `[defaults.session]`, `[defaults.window]`
+- compatibility aliases are still accepted for older config files where practical, including the old top-level status booleans and `[keys] leader = "..."`
+- config validation now rejects:
+  - duplicate bindings inside a mode
+  - unknown action names
+  - invalid key names
+- runtime integration now covers:
+  - configurable leader/normal/copy-mode key tables
+  - configurable resize step
+  - configurable copy page size
+  - configurable mouse toggles for focus, selection, border resizing, and wheel scrolling
+  - configurable daemon-side defaults for future session naming, shell fallback, scrollback size, and window naming
+- `admux reload-config` now really reloads config instead of returning a stub acknowledgement
+- reload keeps the previous config active if parsing or validation fails
+
 ## Module map
 
 - `src/cli.rs`: clap CLI definitions

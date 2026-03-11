@@ -13,6 +13,7 @@ const HISTORY_LIMIT: usize = 2 * 1024 * 1024;
 struct TerminalState {
     parser: vt100::Parser,
     history: Vec<u8>,
+    scrollback_lines: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +34,8 @@ impl PaneProcess {
         command: &[String],
         cwd: Option<&Path>,
         admux_context: Option<(&str, crate::pane::WindowId, crate::pane::PaneId)>,
+        default_shell: Option<&str>,
+        scrollback_lines: usize,
     ) -> Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -44,7 +47,7 @@ impl PaneProcess {
             })
             .context("failed to create PTY pair")?;
 
-        let mut builder = build_command(command, admux_context);
+        let mut builder = build_command(command, admux_context, default_shell);
         if let Some(cwd) = cwd {
             builder.cwd(cwd);
         }
@@ -63,8 +66,9 @@ impl PaneProcess {
             .take_writer()
             .context("failed to acquire PTY writer")?;
         let state = Arc::new(Mutex::new(TerminalState {
-            parser: vt100::Parser::new(24, 80, 10_000),
+            parser: vt100::Parser::new(24, 80, scrollback_lines),
             history: Vec::new(),
+            scrollback_lines,
         }));
         let state_clone = Arc::clone(&state);
 
@@ -200,7 +204,7 @@ impl PaneProcess {
             state.parser.screen_mut().set_size(rows, cols);
         } else {
             let history = state.history.clone();
-            let mut parser = vt100::Parser::new(rows, cols, 10_000);
+            let mut parser = vt100::Parser::new(rows, cols, state.scrollback_lines);
             parser.process(&history);
             state.parser = parser;
         }
@@ -289,9 +293,13 @@ impl PaneProcess {
 fn build_command(
     command: &[String],
     admux_context: Option<(&str, crate::pane::WindowId, crate::pane::PaneId)>,
+    default_shell: Option<&str>,
 ) -> CommandBuilder {
     if command.is_empty() {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        let shell = default_shell
+            .map(ToOwned::to_owned)
+            .or_else(|| std::env::var("SHELL").ok())
+            .unwrap_or_else(|| "/bin/sh".into());
         let mut builder = CommandBuilder::new(shell);
         if let Some((session_name, window_id, pane_id)) = admux_context {
             builder.env("ADMUX", "1");
@@ -326,6 +334,8 @@ mod tests {
             &["sh".into(), "-lc".into(), "printf 'hello from pane'".into()],
             None,
             None,
+            None,
+            10_000,
         )
         .expect("spawn pane");
 
@@ -343,6 +353,8 @@ mod tests {
             ],
             None,
             None,
+            None,
+            10_000,
         )
         .expect("spawn pane");
 
@@ -362,6 +374,8 @@ mod tests {
             ],
             None,
             None,
+            None,
+            10_000,
         )
         .expect("spawn pane");
 

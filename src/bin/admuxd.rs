@@ -12,7 +12,8 @@ fn main() -> Result<()> {
             let paths = admux::paths::RuntimePaths::resolve();
             let socket = args.socket.unwrap_or(paths.socket_path);
             let state = args.state.unwrap_or(paths.state_path);
-            server::serve(&socket, &state)
+            let config = args.config.unwrap_or(paths.config_path);
+            server::serve(&socket, &state, &config)
         }
     }
 }
