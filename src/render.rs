@@ -417,12 +417,18 @@ fn render_preview_snapshot<W: Write>(
             queue!(out, MoveTo(content.x, content.y + offset as u16))?;
             if plain_row.chars().count() <= content.width as usize {
                 out.write_all(formatted_row.as_bytes())?;
-                out.write_all(b"\x1b[0m")?;
             } else {
                 queue_style(out, &ui.theme.help)?;
-                queue!(out, Print(truncate(plain_row, content.width)))?;
-                reset_style(out)?;
+                let clipped = truncate_ansi_preserving_style(formatted_row, content.width as usize);
+                if clipped.is_empty() {
+                    queue!(out, Print(truncate(plain_row, content.width)))?;
+                    reset_style(out)?;
+                } else {
+                    reset_style(out)?;
+                    out.write_all(clipped.as_bytes())?;
+                }
             }
+            out.write_all(b"\x1b[0m")?;
         }
     }
 
@@ -1087,6 +1093,46 @@ fn fit_width(value: &str, width: u16) -> String {
 
 fn truncate(value: &str, width: u16) -> String {
     value.chars().take(width as usize).collect()
+}
+
+fn truncate_ansi_preserving_style(value: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+
+    let mut out = String::new();
+    let mut chars = value.chars().peekable();
+    let mut visible = 0usize;
+
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            out.push(ch);
+            if let Some(next) = chars.next() {
+                out.push(next);
+                if next == '[' {
+                    for esc in chars.by_ref() {
+                        out.push(esc);
+                        if ('@'..='~').contains(&esc) {
+                            break;
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
+        if visible >= width {
+            break;
+        }
+        out.push(ch);
+        visible += 1;
+    }
+
+    if visible == 0 {
+        String::new()
+    } else {
+        out
+    }
 }
 
 #[cfg(test)]
