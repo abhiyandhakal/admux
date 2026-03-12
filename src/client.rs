@@ -554,6 +554,13 @@ fn run_attach_loop(
     let mut status_message: Option<String> = None;
     let mut prompt_history = Vec::<String>::new();
     let mut overlay = OverlayState::None;
+    let mut snapshot = fetch_attach_snapshot(
+        paths,
+        &mut current_session,
+        &mut last_size,
+        80,
+        24,
+    )?;
 
     loop {
         let (width, height) = terminal::size().context("failed to read terminal size")?;
@@ -569,22 +576,14 @@ fn run_attach_loop(
                 },
             )?;
             last_size = (rows, cols);
+            snapshot = fetch_attach_snapshot(
+                paths,
+                &mut current_session,
+                &mut last_size,
+                width,
+                height,
+            )?;
         }
-
-        let response = request_response(
-            paths,
-            CommandRequest::Attach {
-                session: Some(current_session.clone()),
-            },
-        )?;
-        apply_attached_session(&response, &mut current_session, &mut last_size);
-        let snapshot = match response {
-            CommandResponse::Attached {
-                preview, snapshot, ..
-            } => snapshot.unwrap_or_else(|| fallback_snapshot(preview, width, height)),
-            CommandResponse::Error { message } => return Err(anyhow!(message)),
-            other => return Err(anyhow!("unexpected attach response: {other:?}")),
-        };
 
         let render_selection = copy_mode
             .as_ref()
@@ -684,9 +683,17 @@ fn run_attach_loop(
         status_message = None;
 
         if !event::poll(ATTACH_FRAME_INTERVAL).context("failed to poll terminal events")? {
+            snapshot = fetch_attach_snapshot(
+                paths,
+                &mut current_session,
+                &mut last_size,
+                width,
+                height,
+            )?;
             continue;
         }
 
+        let mut needs_refresh = false;
         match event::read().context("failed to read terminal event")? {
             Event::Key(key) => {
                 let current_overlay = std::mem::replace(&mut overlay, OverlayState::None);
@@ -706,6 +713,7 @@ fn run_attach_loop(
                             }
                             PromptResult::Close => {}
                             PromptResult::CloseAndClearSelection => {
+                                needs_refresh = matches!(key.code, KeyCode::Enter);
                                 selection_anchor = None;
                                 active_selection = None;
                             }
@@ -714,6 +722,8 @@ fn run_attach_loop(
                     OverlayState::ChooseTree(mut tree) => {
                         if handle_choose_tree_key(paths, &mut tree, key, &mut current_session)? {
                             overlay = OverlayState::ChooseTree(tree);
+                        } else {
+                            needs_refresh = true;
                         }
                     }
                     OverlayState::ChooseBuffer(mut chooser) => {
@@ -725,6 +735,8 @@ fn run_attach_loop(
                             &mut status_message,
                         )? {
                             overlay = OverlayState::ChooseBuffer(chooser);
+                        } else {
+                            needs_refresh = true;
                         }
                     }
                     OverlayState::Help => match key.code {
@@ -745,7 +757,8 @@ fn run_attach_loop(
                             copy_mode = None;
                         }
                         InputAction::SendBytes(bytes) => {
-                            send_input_bytes(paths, &current_session, &bytes)?
+                            send_input_bytes(paths, &current_session, &bytes)?;
+                            needs_refresh = true;
                         }
                         InputAction::SplitPane(axis) => {
                             let _ = request_response(
@@ -756,6 +769,7 @@ fn run_attach_loop(
                                     command: Vec::new(),
                                 },
                             )?;
+                            needs_refresh = true;
                         }
                         InputAction::SelectWindowIndex(index) => {
                             if let Some(window) = snapshot
@@ -769,6 +783,7 @@ fn run_attach_loop(
                                         target: format!("{}:{}", current_session, window.id),
                                     },
                                 )?;
+                                needs_refresh = true;
                             }
                         }
                         InputAction::OpenPrompt => {
@@ -798,6 +813,7 @@ fn run_attach_loop(
                                     command: Vec::new(),
                                 },
                             )?;
+                            needs_refresh = true;
                         }
                         InputAction::NextWindow => {
                             let _ = request_response(
@@ -807,6 +823,7 @@ fn run_attach_loop(
                                     direction: CycleDirection::Next,
                                 },
                             )?;
+                            needs_refresh = true;
                         }
                         InputAction::PrevWindow => {
                             let _ = request_response(
@@ -816,6 +833,7 @@ fn run_attach_loop(
                                     direction: CycleDirection::Prev,
                                 },
                             )?;
+                            needs_refresh = true;
                         }
                         InputAction::FocusPane(direction) => {
                             let _ = request_response(
@@ -825,6 +843,7 @@ fn run_attach_loop(
                                     direction: Some(direction),
                                 },
                             )?;
+                            needs_refresh = true;
                         }
                         InputAction::ResizePane(direction, amount) => {
                             let _ = request_response(
@@ -835,6 +854,7 @@ fn run_attach_loop(
                                     amount,
                                 },
                             )?;
+                            needs_refresh = true;
                         }
                         InputAction::KillPane => {
                             let _ = request_response(
@@ -843,6 +863,7 @@ fn run_attach_loop(
                                     target: current_session.clone(),
                                 },
                             )?;
+                            needs_refresh = true;
                         }
                         InputAction::PasteTopBuffer => {
                             let _ = request_response(
@@ -852,6 +873,7 @@ fn run_attach_loop(
                                     buffer: None,
                                 },
                             )?;
+                            needs_refresh = true;
                         }
                         InputAction::ListBuffers => {
                             let response = request_response(paths, CommandRequest::ListBuffers)?;
@@ -863,6 +885,7 @@ fn run_attach_loop(
                                 CommandRequest::DeleteBuffer { buffer: None },
                             )?;
                             status_message = Some(format_list_response(response));
+                            needs_refresh = true;
                         }
                         InputAction::ChooseBuffer => {
                             overlay = OverlayState::ChooseBuffer(build_choose_buffer(paths)?);
@@ -876,6 +899,7 @@ fn run_attach_loop(
                             );
                             *config = reloaded;
                             status_message = Some("config reloaded".into());
+                            needs_refresh = true;
                         }
                         InputAction::CopyMove(direction) => {
                             let pane_dims = copy_mode.as_ref().and_then(|copy| {
@@ -957,6 +981,7 @@ fn run_attach_loop(
                                         lines: -page,
                                     },
                                 )?;
+                                needs_refresh = true;
                             }
                         }
                         InputAction::CopyPageDown => {
@@ -981,6 +1006,7 @@ fn run_attach_loop(
                                         lines: page,
                                     },
                                 )?;
+                                needs_refresh = true;
                             }
                         }
                         InputAction::CopyStartSelection => {
@@ -1007,6 +1033,7 @@ fn run_attach_loop(
                                     status_message =
                                         copy_text_to_buffer_and_clipboard(paths, stdout, &text)?;
                                 }
+                                needs_refresh = true;
                             }
                         }
                     },
@@ -1015,6 +1042,7 @@ fn run_attach_loop(
             Event::Paste(text) => {
                 if matches!(overlay, OverlayState::None) && copy_mode.is_none() {
                     send_input_bytes(paths, &current_session, text.as_bytes())?;
+                    needs_refresh = true;
                 }
             }
             Event::Mouse(mouse) => {
@@ -1043,13 +1071,49 @@ fn run_attach_loop(
                             &config.ui,
                             TerminalSize { width, height },
                         )?;
+                    } else {
+                        needs_refresh = true;
                     }
                 }
             }
-            Event::Resize(_, _) | Event::FocusGained | Event::FocusLost => {}
+            Event::Resize(_, _) => needs_refresh = true,
+            Event::FocusGained | Event::FocusLost => {}
+        }
+
+        if needs_refresh {
+            snapshot = fetch_attach_snapshot(
+                paths,
+                &mut current_session,
+                &mut last_size,
+                width,
+                height,
+            )?;
         }
     }
     Ok(())
+}
+
+fn fetch_attach_snapshot(
+    paths: &RuntimePaths,
+    current_session: &mut String,
+    last_size: &mut (u16, u16),
+    width: u16,
+    height: u16,
+) -> Result<RenderSnapshot> {
+    let response = request_response(
+        paths,
+        CommandRequest::Attach {
+            session: Some(current_session.clone()),
+        },
+    )?;
+    apply_attached_session(&response, current_session, last_size);
+    match response {
+        CommandResponse::Attached {
+            preview, snapshot, ..
+        } => Ok(snapshot.unwrap_or_else(|| fallback_snapshot(preview, width, height))),
+        CommandResponse::Error { message } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected attach response: {other:?}")),
+    }
 }
 
 fn load_config(paths: &RuntimePaths) -> Result<ResolvedConfig> {
