@@ -43,6 +43,8 @@ use crate::{
     window::WindowSummary,
 };
 
+const ATTACH_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+
 #[derive(Debug, Clone)]
 struct PromptState {
     buffer: String,
@@ -681,7 +683,7 @@ fn run_attach_loop(
         }
         status_message = None;
 
-        if !event::poll(Duration::from_millis(50)).context("failed to poll terminal events")? {
+        if !event::poll(ATTACH_FRAME_INTERVAL).context("failed to poll terminal events")? {
             continue;
         }
 
