@@ -1019,7 +1019,7 @@ fn run_attach_loop(
             }
             Event::Mouse(mouse) => {
                 if matches!(overlay, OverlayState::None) && copy_mode.is_none() {
-                    handle_mouse_event(
+                    let local_repaint = handle_mouse_event(
                         paths,
                         &current_session,
                         &snapshot,
@@ -1031,6 +1031,19 @@ fn run_attach_loop(
                         &mut resize_drag,
                         &mut status_message,
                     )?;
+                    if local_repaint {
+                        render_session(
+                            stdout,
+                            &current_session,
+                            &snapshot,
+                            BottomBar::Status {
+                                message: status_message.as_deref(),
+                            },
+                            active_selection,
+                            &config.ui,
+                            TerminalSize { width, height },
+                        )?;
+                    }
                 }
             }
             Event::Resize(_, _) | Event::FocusGained | Event::FocusLost => {}
@@ -1893,14 +1906,14 @@ fn handle_mouse_event(
     active_selection: &mut Option<PaneSelection>,
     resize_drag: &mut Option<ResizeDrag>,
     status_message: &mut Option<String>,
-) -> Result<()> {
+) -> Result<bool> {
     let ui = &config.ui;
     if !config.mouse.enabled {
-        return Ok(());
+        return Ok(false);
     }
     if matches!(ui.status_position, StatusPosition::Top) {
         if mouse.row == 0 {
-            return Ok(());
+            return Ok(false);
         }
         mouse.row = mouse.row.saturating_sub(1);
     }
@@ -1940,6 +1953,7 @@ fn handle_mouse_event(
                         pane_id: pane.pane_id,
                         selection: Selection::new(row, col, row, col),
                     });
+                    return Ok(true);
                 }
             }
         }
@@ -1968,6 +1982,7 @@ fn handle_mouse_event(
                     pane_id: pane.pane_id,
                     selection: Selection::new(anchor.row, anchor.col, row, col).normalized(),
                 });
+                return Ok(true);
             }
         }
         MouseEventKind::Up(MouseButton::Left) => {
@@ -1994,10 +2009,11 @@ fn handle_mouse_event(
                 }
             }
             *active_selection = None;
+            return Ok(true);
         }
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
             if !config.mouse.wheel_scroll {
-                return Ok(());
+                return Ok(false);
             }
             let direction = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
                 crate::ipc::ScrollDirection::Up
@@ -2016,7 +2032,7 @@ fn handle_mouse_event(
         }
         _ => {}
     }
-    Ok(())
+    Ok(false)
 }
 
 fn pane_content_hit(
