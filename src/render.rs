@@ -3,12 +3,12 @@ use std::io::Write;
 use crossterm::{
     cursor::{MoveTo, Show},
     queue,
-    style::{Attribute, Print, SetAttribute},
+    style::{Attribute, Color, Print, SetAttribute, SetBackgroundColor, SetForegroundColor},
     terminal::{BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate},
 };
 
 use crate::{
-    config::{DividerCharset, ResolvedUiConfig, StatusPosition},
+    config::{DividerCharset, ResolvedUiConfig, StatusPosition, StyleConfig},
     copy_mode::Selection,
     ipc::{BufferSummary, PaneRender, RenderSnapshot},
     pane::Rect,
@@ -18,6 +18,39 @@ const CONNECT_UP: u8 = 0b0001;
 const CONNECT_DOWN: u8 = 0b0010;
 const CONNECT_LEFT: u8 = 0b0100;
 const CONNECT_RIGHT: u8 = 0b1000;
+
+fn queue_style<W: Write>(out: &mut W, style: &StyleConfig) -> std::io::Result<()> {
+    queue!(out, SetForegroundColor(Color::Reset), SetBackgroundColor(Color::Reset))?;
+    if let Some(fg) = style.fg {
+        queue!(out, SetForegroundColor(fg.to_crossterm()))?;
+    }
+    if let Some(bg) = style.bg {
+        queue!(out, SetBackgroundColor(bg.to_crossterm()))?;
+    }
+    if style.bold {
+        queue!(out, SetAttribute(Attribute::Bold))?;
+    }
+    if style.dim {
+        queue!(out, SetAttribute(Attribute::Dim))?;
+    }
+    if style.reverse {
+        queue!(out, SetAttribute(Attribute::Reverse))?;
+    }
+    if style.underline {
+        queue!(out, SetAttribute(Attribute::Underlined))?;
+    }
+    Ok(())
+}
+
+fn reset_style<W: Write>(out: &mut W) -> std::io::Result<()> {
+    queue!(
+        out,
+        SetAttribute(Attribute::Reset),
+        SetForegroundColor(Color::Reset),
+        SetBackgroundColor(Color::Reset)
+    )?;
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TerminalSize {
@@ -112,17 +145,17 @@ pub fn render_choose_tree<W: Write>(
         let content = format!("{}{}{}", "  ".repeat(line.depth), prefix, line.label);
         queue!(out, MoveTo(0, row))?;
         if line.selected {
-            queue!(
-                out,
-                SetAttribute(Attribute::Reverse),
-                Print(fit_width(&content, size.width)),
-                SetAttribute(Attribute::Reset)
-            )?;
-        } else {
+            queue_style(out, &ui.theme.chooser_selected)?;
             queue!(out, Print(fit_width(&content, size.width)))?;
+            reset_style(out)?;
+        } else {
+            queue_style(out, &ui.theme.help)?;
+            queue!(out, Print(fit_width(&content, size.width)))?;
+            reset_style(out)?;
         }
     }
 
+    queue_style(out, &ui.theme.chooser_border)?;
     queue!(
         out,
         MoveTo(0, body_start + list_height),
@@ -134,6 +167,7 @@ pub fn render_choose_tree<W: Write>(
             size.width,
         ))
     )?;
+    reset_style(out)?;
     let preview_area = Rect {
         x: 0,
         y: body_start + list_height.saturating_add(1),
@@ -141,7 +175,7 @@ pub fn render_choose_tree<W: Write>(
         height: body_height.saturating_sub(list_height.saturating_add(1)),
     };
     if preview_area.height > 0 {
-        render_preview_snapshot(out, preview_snapshot, preview_area)?;
+        render_preview_snapshot(out, preview_snapshot, preview_area, ui)?;
     }
 
     render_bottom_bar(
@@ -174,11 +208,13 @@ pub fn render_help_overlay<W: Write>(
         if index as u16 >= body_height {
             break;
         }
+        queue_style(out, &ui.theme.help)?;
         queue!(
             out,
             MoveTo(0, body_start + index as u16),
             Print(fit_width(line, size.width))
         )?;
+        reset_style(out)?;
     }
 
     render_bottom_bar(
@@ -218,17 +254,17 @@ pub fn render_buffer_chooser<W: Write>(
         let content = format!("{} ({}) {}", buffer.name, buffer.bytes, buffer.preview);
         queue!(out, MoveTo(0, row))?;
         if index == selected {
-            queue!(
-                out,
-                SetAttribute(Attribute::Reverse),
-                Print(fit_width(&content, size.width)),
-                SetAttribute(Attribute::Reset)
-            )?;
-        } else {
+            queue_style(out, &ui.theme.chooser_selected)?;
             queue!(out, Print(fit_width(&content, size.width)))?;
+            reset_style(out)?;
+        } else {
+            queue_style(out, &ui.theme.help)?;
+            queue!(out, Print(fit_width(&content, size.width)))?;
+            reset_style(out)?;
         }
     }
 
+    queue_style(out, &ui.theme.chooser_border)?;
     queue!(
         out,
         MoveTo(0, body_start + list_height),
@@ -240,12 +276,15 @@ pub fn render_buffer_chooser<W: Write>(
             size.width,
         ))
     )?;
+    reset_style(out)?;
     for (offset, line) in preview.lines().enumerate() {
         let row = body_start + list_height.saturating_add(1) + offset as u16;
         if row >= body_start + body_height {
             break;
         }
+        queue_style(out, &ui.theme.help)?;
         queue!(out, MoveTo(0, row), Print(fit_width(line, size.width)))?;
+        reset_style(out)?;
     }
 
     render_bottom_bar(
@@ -286,12 +325,19 @@ fn render_split_separators<W: Write>(
     snapshot: &RenderSnapshot,
     ui: &ResolvedUiConfig,
 ) -> std::io::Result<()> {
+    let style = if ui.dividers.highlight_active {
+        &ui.theme.active_divider
+    } else {
+        &ui.theme.divider
+    };
     for divider in &snapshot.dividers {
+        queue_style(out, style)?;
         queue!(
             out,
             MoveTo(divider.x, offset_row(divider.y, ui)),
             Print(connection_glyph(divider.mask, ui.dividers.charset))
         )?;
+        reset_style(out)?;
     }
     Ok(())
 }
@@ -331,6 +377,7 @@ fn render_preview_snapshot<W: Write>(
     out: &mut W,
     snapshot: &RenderSnapshot,
     area: Rect,
+    ui: &ResolvedUiConfig,
 ) -> std::io::Result<()> {
     if snapshot.panes.is_empty() || area.width < 8 || area.height < 4 {
         return Ok(());
@@ -356,17 +403,19 @@ fn render_preview_snapshot<W: Write>(
         if scaled.width < 6 || scaled.height < 4 {
             continue;
         }
-        draw_preview_box(out, scaled, pane.focused, &pane.title)?;
+        draw_preview_box(out, scaled, pane.focused, &pane.title, ui)?;
         let content = scaled.content();
         for (offset, row) in pane.rows_plain.iter().enumerate() {
             if offset as u16 >= content.height {
                 break;
             }
+            queue_style(out, &ui.theme.help)?;
             queue!(
                 out,
                 MoveTo(content.x, content.y + offset as u16),
                 Print(truncate(row, content.width))
             )?;
+            reset_style(out)?;
         }
     }
 
@@ -407,6 +456,7 @@ fn draw_preview_box<W: Write>(
     rect: Rect,
     focused: bool,
     title: &str,
+    ui: &ResolvedUiConfig,
 ) -> std::io::Result<()> {
     if rect.width < 2 || rect.height < 2 {
         return Ok(());
@@ -416,6 +466,7 @@ fn draw_preview_box<W: Write>(
     } else {
         Attribute::Dim
     };
+    queue_style(out, &ui.theme.chooser_border)?;
     let top = format!("┌{}┐", "─".repeat(rect.width.saturating_sub(2) as usize));
     let bottom = format!("└{}┘", "─".repeat(rect.width.saturating_sub(2) as usize));
     queue!(
@@ -440,12 +491,14 @@ fn draw_preview_box<W: Write>(
         SetAttribute(Attribute::Reset)
     )?;
     if rect.width > 4 {
+        queue_style(out, &ui.theme.chooser_border)?;
         queue!(
             out,
             MoveTo(rect.x.saturating_add(2), rect.y),
             Print(truncate(title, rect.width.saturating_sub(4)))
         )?;
     }
+    reset_style(out)?;
     Ok(())
 }
 
