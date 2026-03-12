@@ -405,17 +405,24 @@ fn render_preview_snapshot<W: Write>(
         }
         draw_preview_box(out, scaled, pane.focused, &pane.title, ui)?;
         let content = scaled.content();
-        for (offset, row) in pane.rows_plain.iter().enumerate() {
+        for (offset, (plain_row, formatted_row)) in pane
+            .rows_plain
+            .iter()
+            .zip(pane.rows_formatted.iter())
+            .enumerate()
+        {
             if offset as u16 >= content.height {
                 break;
             }
-            queue_style(out, &ui.theme.help)?;
-            queue!(
-                out,
-                MoveTo(content.x, content.y + offset as u16),
-                Print(truncate(row, content.width))
-            )?;
-            reset_style(out)?;
+            queue!(out, MoveTo(content.x, content.y + offset as u16))?;
+            if plain_row.chars().count() <= content.width as usize {
+                out.write_all(formatted_row.as_bytes())?;
+                out.write_all(b"\x1b[0m")?;
+            } else {
+                queue_style(out, &ui.theme.help)?;
+                queue!(out, Print(truncate(plain_row, content.width)))?;
+                reset_style(out)?;
+            }
         }
     }
 
