@@ -20,7 +20,11 @@ const CONNECT_LEFT: u8 = 0b0100;
 const CONNECT_RIGHT: u8 = 0b1000;
 
 fn queue_style<W: Write>(out: &mut W, style: &StyleConfig) -> std::io::Result<()> {
-    queue!(out, SetForegroundColor(Color::Reset), SetBackgroundColor(Color::Reset))?;
+    queue!(
+        out,
+        SetForegroundColor(Color::Reset),
+        SetBackgroundColor(Color::Reset)
+    )?;
     if let Some(fg) = style.fg {
         queue!(out, SetForegroundColor(fg.to_crossterm()))?;
     }
@@ -96,7 +100,12 @@ pub fn render_session<W: Write>(
     ui: &ResolvedUiConfig,
     size: TerminalSize,
 ) -> std::io::Result<()> {
-    queue!(out, BeginSynchronizedUpdate, Clear(ClearType::All), MoveTo(0, 0))?;
+    queue!(
+        out,
+        BeginSynchronizedUpdate,
+        Clear(ClearType::All),
+        MoveTo(0, 0)
+    )?;
 
     for pane in &snapshot.panes {
         render_pane(out, pane, ui)?;
@@ -126,7 +135,12 @@ pub fn render_choose_tree<W: Write>(
     ui: &ResolvedUiConfig,
     size: TerminalSize,
 ) -> std::io::Result<()> {
-    queue!(out, BeginSynchronizedUpdate, Clear(ClearType::All), MoveTo(0, 0))?;
+    queue!(
+        out,
+        BeginSynchronizedUpdate,
+        Clear(ClearType::All),
+        MoveTo(0, 0)
+    )?;
 
     let body_height = size.height.saturating_sub(1);
     let body_start = body_start_row(ui);
@@ -200,7 +214,12 @@ pub fn render_help_overlay<W: Write>(
     ui: &ResolvedUiConfig,
     size: TerminalSize,
 ) -> std::io::Result<()> {
-    queue!(out, BeginSynchronizedUpdate, Clear(ClearType::All), MoveTo(0, 0))?;
+    queue!(
+        out,
+        BeginSynchronizedUpdate,
+        Clear(ClearType::All),
+        MoveTo(0, 0)
+    )?;
     let body_height = size.height.saturating_sub(1);
     let body_start = body_start_row(ui);
 
@@ -241,7 +260,12 @@ pub fn render_buffer_chooser<W: Write>(
     ui: &ResolvedUiConfig,
     size: TerminalSize,
 ) -> std::io::Result<()> {
-    queue!(out, BeginSynchronizedUpdate, Clear(ClearType::All), MoveTo(0, 0))?;
+    queue!(
+        out,
+        BeginSynchronizedUpdate,
+        Clear(ClearType::All),
+        MoveTo(0, 0)
+    )?;
     let body_height = size.height.saturating_sub(1);
     let body_start = body_start_row(ui);
     let list_height = body_height.min((buffers.len() as u16).saturating_add(1).min(8));
@@ -1128,11 +1152,7 @@ fn truncate_ansi_preserving_style(value: &str, width: usize) -> String {
         visible += 1;
     }
 
-    if visible == 0 {
-        String::new()
-    } else {
-        out
-    }
+    if visible == 0 { String::new() } else { out }
 }
 
 #[cfg(test)]
