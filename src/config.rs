@@ -291,6 +291,10 @@ pub enum Action {
     ResizeUp,
     ResizeRight,
     KillPane,
+    PasteTopBuffer,
+    ListBuffers,
+    DeleteTopBuffer,
+    ChooseBuffer,
     EnterCopyMode,
     ExitCopyMode,
     CopyMoveLeft,
@@ -649,6 +653,12 @@ fn resolve_table(
 }
 
 pub fn parse_key_pattern(value: &str) -> Result<KeyPattern> {
+    if value == "-" {
+        return Ok(KeyPattern {
+            code: KeyPatternCode::Char('-'),
+            modifiers: KeyPatternModifiers::default(),
+        });
+    }
     let mut modifiers = KeyPatternModifiers::default();
     let mut parts = value.split('-').peekable();
     let mut last = None;
@@ -753,6 +763,10 @@ fn parse_action_name(value: &str) -> Result<Action> {
         "resize_up" => Action::ResizeUp,
         "resize_right" => Action::ResizeRight,
         "kill_pane" => Action::KillPane,
+        "paste_top_buffer" => Action::PasteTopBuffer,
+        "list_buffers" => Action::ListBuffers,
+        "delete_top_buffer" => Action::DeleteTopBuffer,
+        "choose_buffer" => Action::ChooseBuffer,
         "enter_copy_mode" => Action::EnterCopyMode,
         "exit_copy_mode" => Action::ExitCopyMode,
         "copy_move_left" => Action::CopyMoveLeft,
@@ -797,6 +811,10 @@ fn default_leader_bindings() -> BTreeMap<String, String> {
     bindings.insert("resize_up".into(), "K".into());
     bindings.insert("resize_right".into(), "L".into());
     bindings.insert("kill_pane".into(), "x".into());
+    bindings.insert("paste_top_buffer".into(), "]".into());
+    bindings.insert("list_buffers".into(), "#".into());
+    bindings.insert("delete_top_buffer".into(), "-".into());
+    bindings.insert("choose_buffer".into(), "=".into());
     bindings.insert("select_window_0".into(), "0".into());
     bindings.insert("select_window_1".into(), "1".into());
     bindings.insert("select_window_2".into(), "2".into());
@@ -898,6 +916,25 @@ mod tests {
         assert!(resolved.keys.leader.iter().any(|(pattern, action)| {
             *action == Action::NewWindow && *pattern == parse_key_pattern("w").expect("pattern")
         }));
+    }
+
+    #[test]
+    fn defaults_include_buffer_bindings() {
+        let resolved = Config::default().resolve().expect("resolve config");
+        assert!(
+            resolved
+                .keys
+                .leader
+                .iter()
+                .any(|(_, action)| *action == Action::PasteTopBuffer)
+        );
+        assert!(
+            resolved
+                .keys
+                .leader
+                .iter()
+                .any(|(_, action)| *action == Action::ChooseBuffer)
+        );
     }
 
     #[test]

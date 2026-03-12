@@ -1,21 +1,57 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InteractiveCommand {
-    SplitWindow { horizontal: bool },
+    SplitWindow {
+        horizontal: bool,
+    },
     NewWindow,
-    SelectWindow { target: String },
+    SelectWindow {
+        target: String,
+    },
     NextWindow,
     PreviousWindow,
     KillPane,
     KillWindow,
-    AttachSession { target: String },
-    SwitchClient { target: String },
+    AttachSession {
+        target: String,
+    },
+    SwitchClient {
+        target: String,
+    },
     ListSessions,
     ListWindows,
     ListPanes,
+    ListBuffers,
+    ShowBuffer {
+        buffer: Option<String>,
+    },
+    DeleteBuffer {
+        buffer: Option<String>,
+    },
+    PasteBuffer {
+        buffer: Option<String>,
+        target: Option<String>,
+    },
+    SetBuffer {
+        buffer: Option<String>,
+        data: String,
+    },
+    SaveBuffer {
+        buffer: Option<String>,
+        path: String,
+    },
+    LoadBuffer {
+        buffer: Option<String>,
+        path: String,
+    },
+    ChooseBuffer,
     ChooseTree,
     DetachClient,
-    RenameWindow { name: String },
-    SendKeys { keys: Vec<String> },
+    RenameWindow {
+        name: String,
+    },
+    SendKeys {
+        keys: Vec<String>,
+    },
     ReloadConfig,
 }
 
@@ -31,7 +67,15 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &["attach"],
     },
     CommandSpec {
+        canonical: "choose-buffer",
+        aliases: &[],
+    },
+    CommandSpec {
         canonical: "choose-tree",
+        aliases: &[],
+    },
+    CommandSpec {
+        canonical: "delete-buffer",
         aliases: &[],
     },
     CommandSpec {
@@ -47,6 +91,10 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &[],
     },
     CommandSpec {
+        canonical: "list-buffers",
+        aliases: &[],
+    },
+    CommandSpec {
         canonical: "list-panes",
         aliases: &[],
     },
@@ -59,11 +107,19 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &[],
     },
     CommandSpec {
+        canonical: "load-buffer",
+        aliases: &[],
+    },
+    CommandSpec {
         canonical: "new-window",
         aliases: &[],
     },
     CommandSpec {
         canonical: "next-window",
+        aliases: &[],
+    },
+    CommandSpec {
+        canonical: "paste-buffer",
         aliases: &[],
     },
     CommandSpec {
@@ -75,7 +131,15 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &[],
     },
     CommandSpec {
+        canonical: "save-buffer",
+        aliases: &[],
+    },
+    CommandSpec {
         canonical: "rename-window",
+        aliases: &[],
+    },
+    CommandSpec {
+        canonical: "set-buffer",
         aliases: &[],
     },
     CommandSpec {
@@ -84,6 +148,10 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     },
     CommandSpec {
         canonical: "send-keys",
+        aliases: &[],
+    },
+    CommandSpec {
+        canonical: "show-buffer",
         aliases: &[],
     },
     CommandSpec {
@@ -98,20 +166,28 @@ const COMMAND_SPECS: &[CommandSpec] = &[
 
 pub const COMMAND_NAMES: &[&str] = &[
     "attach-session",
+    "choose-buffer",
     "choose-tree",
+    "delete-buffer",
     "detach-client",
+    "list-buffers",
     "kill-pane",
     "kill-window",
+    "load-buffer",
     "list-panes",
     "list-sessions",
     "list-windows",
     "new-window",
     "next-window",
+    "paste-buffer",
     "previous-window",
     "reload-config",
+    "save-buffer",
     "rename-window",
+    "set-buffer",
     "select-window",
     "send-keys",
+    "show-buffer",
     "split-window",
     "switch-client",
 ];
@@ -157,8 +233,18 @@ pub fn parse(input: &str) -> Result<InteractiveCommand, String> {
         "kill-window" => parse_no_args(command, args).map(|_| InteractiveCommand::KillWindow),
         "attach-session" => parse_required_target(command, args)
             .map(|target| InteractiveCommand::AttachSession { target }),
+        "choose-buffer" => parse_no_args(command, args).map(|_| InteractiveCommand::ChooseBuffer),
         "switch-client" => parse_required_target(command, args)
             .map(|target| InteractiveCommand::SwitchClient { target }),
+        "list-buffers" => parse_no_args(command, args).map(|_| InteractiveCommand::ListBuffers),
+        "show-buffer" => parse_optional_buffer_arg(command, args)
+            .map(|buffer| InteractiveCommand::ShowBuffer { buffer }),
+        "delete-buffer" => parse_optional_buffer_arg(command, args)
+            .map(|buffer| InteractiveCommand::DeleteBuffer { buffer }),
+        "paste-buffer" => parse_paste_buffer(args),
+        "set-buffer" => parse_set_buffer(args),
+        "save-buffer" => parse_save_or_load_buffer(command, args, true),
+        "load-buffer" => parse_save_or_load_buffer(command, args, false),
         "list-sessions" => parse_no_args(command, args).map(|_| InteractiveCommand::ListSessions),
         "list-windows" => parse_no_args(command, args).map(|_| InteractiveCommand::ListWindows),
         "list-panes" => parse_no_args(command, args).map(|_| InteractiveCommand::ListPanes),
@@ -222,6 +308,82 @@ fn parse_required_target(command: &str, args: &[String]) -> Result<String, Strin
         [flag, target] if flag == "-t" => Ok(target.clone()),
         [flag] if flag == "-t" => Err(format!("{command} requires a value after -t")),
         [flag, ..] => Err(format!("{command} expected -t <target>, found '{flag}'")),
+    }
+}
+
+fn parse_optional_buffer_arg(command: &str, args: &[String]) -> Result<Option<String>, String> {
+    match args {
+        [] => Ok(None),
+        [flag, value] if flag == "-b" => Ok(Some(value.clone())),
+        [flag] if flag == "-b" => Err(format!("{command} requires a value after -b")),
+        [flag, ..] => Err(format!("{command} expected -b <buffer>, found '{flag}'")),
+    }
+}
+
+fn parse_paste_buffer(args: &[String]) -> Result<InteractiveCommand, String> {
+    let mut buffer = None;
+    let mut target = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "-b" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err("paste-buffer requires a value after -b".into());
+                };
+                buffer = Some(value.clone());
+            }
+            "-t" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err("paste-buffer requires a value after -t".into());
+                };
+                target = Some(value.clone());
+            }
+            other => {
+                return Err(format!(
+                    "paste-buffer expected -b <buffer> or -t <target>, found '{other}'"
+                ));
+            }
+        }
+        index += 1;
+    }
+    Ok(InteractiveCommand::PasteBuffer { buffer, target })
+}
+
+fn parse_set_buffer(args: &[String]) -> Result<InteractiveCommand, String> {
+    if args.is_empty() {
+        return Err("set-buffer requires text".into());
+    }
+    if args[0] == "-b" {
+        if args.len() < 3 {
+            return Err("set-buffer requires -b <buffer> <text>".into());
+        }
+        return Ok(InteractiveCommand::SetBuffer {
+            buffer: Some(args[1].clone()),
+            data: args[2..].join(" "),
+        });
+    }
+    Ok(InteractiveCommand::SetBuffer {
+        buffer: None,
+        data: args.join(" "),
+    })
+}
+
+fn parse_save_or_load_buffer(
+    command: &str,
+    args: &[String],
+    save: bool,
+) -> Result<InteractiveCommand, String> {
+    let (buffer, path) = match args {
+        [path] => (None, path.clone()),
+        [flag, name, path] if flag == "-b" => (Some(name.clone()), path.clone()),
+        _ => return Err(format!("{command} expects [ -b <buffer> ] <path>")),
+    };
+    if save {
+        Ok(InteractiveCommand::SaveBuffer { buffer, path })
+    } else {
+        Ok(InteractiveCommand::LoadBuffer { buffer, path })
     }
 }
 
@@ -351,6 +513,25 @@ mod tests {
         assert_eq!(
             parse("ls").expect("parse"),
             InteractiveCommand::ListSessions
+        );
+    }
+
+    #[test]
+    fn parses_paste_buffer_with_target() {
+        assert_eq!(
+            parse("paste-buffer -b buffer0002 -t work:1.0").expect("parse"),
+            InteractiveCommand::PasteBuffer {
+                buffer: Some("buffer0002".into()),
+                target: Some("work:1.0".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_choose_buffer() {
+        assert_eq!(
+            parse("choose-buffer").expect("parse"),
+            InteractiveCommand::ChooseBuffer
         );
     }
 

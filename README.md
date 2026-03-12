@@ -37,6 +37,9 @@ Implemented now:
 - chooser collapsed by default with `Tab` and `+` / `-` expand-collapse controls
 - mouse focus, drag-selection copy, wheel scroll, and border resize
 - modal copy mode with pane navigation, scrollback paging, selection, and yank
+- daemon-owned paste buffers with CLI/prompt support for list/show/set/delete/paste/save/load
+- `Ctrl-b ]`, `Ctrl-b #`, `Ctrl-b -`, and `Ctrl-b =` for top-buffer paste, list, delete, and choose-buffer flows
+- keyboard and mouse copy now create paste buffers before mirroring to OSC52
 - persistent session/window/pane metadata across daemon restarts, with stale session listing when processes are gone
 - live pane/process recovery across `admuxd` restart through per-pane helper processes
 - resize handling that preserves pane state while shrinking and restores PTY history when panes expand again
@@ -44,7 +47,6 @@ Implemented now:
 
 Not finished yet:
 
-- tmux paste-buffer and choose-buffer workflows
 - fuller choose-tree / chooser parity
 - broader tmux default-key and command-surface parity
 
@@ -64,6 +66,9 @@ cargo run --bin admux -- split-pane work --vertical
 cargo run --bin admux -- list-panes work
 cargo run --bin admux -- new-window work --name logs -- sh -lc "tail -f /var/log/messages"
 cargo run --bin admux -- list-windows work
+cargo run --bin admux -- set-buffer "hello world"
+cargo run --bin admux -- list-buffers
+cargo run --bin admux -- paste-buffer --target work
 cargo run --bin admux -- attach work
 cargo run --bin admux -- kill work
 ```
@@ -75,6 +80,10 @@ Interactive defaults:
 - `Ctrl-b 0` through `Ctrl-b 9` select windows by index
 - `Ctrl-b :` open the command prompt
 - `Ctrl-b [` enter copy mode
+- `Ctrl-b ]` paste the top buffer
+- `Ctrl-b #` list buffers in the status row
+- `Ctrl-b -` delete the top buffer
+- `Ctrl-b =` open the buffer chooser
 - `Ctrl-b s` open the session chooser
 - `Ctrl-b ?` open help
 - `Ctrl-b d` detach

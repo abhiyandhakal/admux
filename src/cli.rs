@@ -15,6 +15,13 @@ pub enum ClientCommand {
     Ls,
     ListWindows(SessionArgs),
     ListPanes(TargetArgs),
+    ListBuffers,
+    ShowBuffer(BufferArgs),
+    DeleteBuffer(BufferArgs),
+    PasteBuffer(PasteBufferArgs),
+    SetBuffer(SetBufferArgs),
+    SaveBuffer(SaveLoadBufferArgs),
+    LoadBuffer(SaveLoadBufferArgs),
     Kill(KillArgs),
     KillWindow(TargetStringArgs),
     KillPane(TargetStringArgs),
@@ -59,6 +66,34 @@ pub struct TargetArgs {
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
 pub struct TargetStringArgs {
     pub target: String,
+}
+
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+pub struct BufferArgs {
+    #[arg(long = "buffer")]
+    pub buffer: Option<String>,
+}
+
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+pub struct PasteBufferArgs {
+    #[arg(long = "buffer")]
+    pub buffer: Option<String>,
+    #[arg(long)]
+    pub target: Option<String>,
+}
+
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+pub struct SetBufferArgs {
+    #[arg(long = "buffer")]
+    pub buffer: Option<String>,
+    pub data: String,
+}
+
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+pub struct SaveLoadBufferArgs {
+    #[arg(long = "buffer")]
+    pub buffer: Option<String>,
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
@@ -195,6 +230,25 @@ mod tests {
                 horizontal: false,
                 vertical: true,
                 command: Vec::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_paste_buffer_command() {
+        let cli = AdmuxCli::parse_from([
+            "admux",
+            "paste-buffer",
+            "--buffer",
+            "buffer0001",
+            "--target",
+            "work:1.0",
+        ]);
+        assert_eq!(
+            cli.command,
+            ClientCommand::PasteBuffer(PasteBufferArgs {
+                buffer: Some("buffer0001".into()),
+                target: Some("work:1.0".into()),
             })
         );
     }

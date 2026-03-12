@@ -364,6 +364,33 @@ This document records each completed implementation slice in detail, including t
   - each pane now runs behind its own `admux-pane` helper process
   - persisted pane metadata includes helper socket paths
   - restarted `admuxd` reconnects to live helpers and rebuilds sessions instead of treating them as stale-only
-  - the direct binary smoke reattached after daemon restart and still showed the original live shell output
+- the direct binary smoke reattached after daemon restart and still showed the original live shell output
+- Commit: pending current worktree
+- Status: complete
+
+## Paste buffer slice
+
+- Goal: add tmux-style global paste buffers and wire copy/yank plus a first choose-buffer flow onto them.
+- Files changed:
+  - buffer/runtime and persistence: `src/buffer.rs`, `src/persistence.rs`, `src/server.rs`, `src/ipc.rs`, `src/lib.rs`
+  - client/interactive flow: `src/client.rs`, `src/input.rs`, `src/commands.rs`, `src/cli.rs`, `src/render.rs`
+  - config defaults: `src/config.rs`
+  - docs: `README.md`, `docs/detailed-status.md`
+- Verification:
+  - `cargo test`
+  - direct built-binary smoke:
+    - `target/debug/admuxd serve --socket <temp-socket> --state <temp-state> --config <temp-config>`
+    - `ADMUX_SOCKET=<temp-socket> ADMUX_STATE=<temp-state> ADMUX_CONFIG=<temp-config> target/debug/admux new -d --name smoke -- sh -lc 'cat'`
+    - `ADMUX_SOCKET=<temp-socket> ADMUX_STATE=<temp-state> ADMUX_CONFIG=<temp-config> target/debug/admux set-buffer "hello world"`
+    - `ADMUX_SOCKET=<temp-socket> ADMUX_STATE=<temp-state> ADMUX_CONFIG=<temp-config> target/debug/admux list-buffers`
+    - `ADMUX_SOCKET=<temp-socket> ADMUX_STATE=<temp-state> ADMUX_CONFIG=<temp-config> target/debug/admux paste-buffer --target smoke`
+    - `ADMUX_SOCKET=<temp-socket> ADMUX_STATE=<temp-state> ADMUX_CONFIG=<temp-config> target/debug/admux show-buffer`
+    - `ADMUX_SOCKET=<temp-socket> ADMUX_STATE=<temp-state> ADMUX_CONFIG=<temp-config> target/debug/admux delete-buffer`
+- Observed result:
+  - daemon now persists a global paste-buffer store alongside session metadata
+  - prompt commands and direct CLI now support buffer listing, inspection, mutation, saving/loading, and pasting
+  - `Ctrl-b ]`, `Ctrl-b #`, `Ctrl-b -`, and `Ctrl-b =` now work with the new buffer store
+  - copy-mode yank and mouse selection copy both create a real paste buffer before mirroring to OSC52
+  - choose-buffer provides a first chooser-backed buffer workflow with preview and paste/delete actions
 - Commit: pending current worktree
 - Status: complete

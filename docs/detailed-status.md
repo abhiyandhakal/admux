@@ -68,6 +68,9 @@
   - mouse focus, selection copy, wheel scroll, and border resize
   - nested `admux new` redirects the outer client to the new session instead of nesting another fullscreen client in the pane
   - modal copy mode on `Ctrl-b [` with vi-style movement, scrollback paging, selection, and yank
+  - daemon-owned global paste buffers with prompt, CLI, and leader-key workflows
+  - choose-buffer overlay with preview, paste-on-enter, and delete-on-`d`
+  - copy-mode yank and mouse selection copy now create a real paste buffer before sending OSC52
 
 ### Input and copy-mode foundations
 
@@ -93,6 +96,7 @@
 - direct binary smoke for window-local pane numbering
 - prompt command parser and completion tests
 - chooser search helper tests
+- buffer store and buffer command tests
 
 ### Manual
 
@@ -132,7 +136,6 @@ Observed result:
 
 ## Known gaps
 
-- tmux paste-buffer and choose-buffer parity is not implemented yet
 - chooser parity is still narrower than tmux’s full chooser family
 - several tmux default pane/window/session actions are still missing
 
@@ -164,6 +167,7 @@ Observed result:
 - `src/cli.rs`: clap CLI definitions
 - `src/client.rs`: client request flow, autostart, attach behavior
 - `src/commands.rs`: tmux-style interactive command parsing and completion
+- `src/buffer.rs`: daemon-owned paste buffer store
 - `src/config.rs`: TOML config types and loaders
 - `src/ipc.rs`: request/response protocol
 - `src/paths.rs`: runtime/config path resolution

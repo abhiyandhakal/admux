@@ -10,9 +10,10 @@ use std::{
 use anyhow::{Context, Result, bail};
 
 use crate::{
+    buffer::BufferStore,
     config::{Config, ResolvedConfig},
     ipc::{
-        CURRENT_PROTOCOL_VERSION, CommandRequest, CommandResponse, CycleDirection,
+        BufferSummary, CURRENT_PROTOCOL_VERSION, CommandRequest, CommandResponse, CycleDirection,
         NavigationDirection, ProtocolVersion, SessionSummary,
     },
     pane::{PaneId, WindowId},
@@ -27,6 +28,7 @@ pub enum ServerState {
 }
 
 pub struct SessionStore {
+    buffers: BufferStore,
     sessions: BTreeMap<String, Session>,
     persisted_sessions: BTreeMap<String, PersistedSession>,
     state_path: Option<std::path::PathBuf>,
@@ -41,6 +43,7 @@ pub struct SessionStore {
 impl Default for SessionStore {
     fn default() -> Self {
         Self {
+            buffers: BufferStore::default(),
             sessions: BTreeMap::new(),
             persisted_sessions: BTreeMap::new(),
             state_path: None,
@@ -71,6 +74,7 @@ impl SessionStore {
     ) -> Result<Self> {
         let persisted = load_state(&state_path)?;
         let mut store = Self {
+            buffers: BufferStore::from_persisted(persisted.buffers),
             persisted_sessions: persisted.sessions,
             state_path: Some(state_path),
             helper_dir,
@@ -189,6 +193,85 @@ impl SessionStore {
             }
             CommandRequest::ListSessions => CommandResponse::SessionList {
                 sessions: self.list_session_summaries(),
+            },
+            CommandRequest::ListBuffers => CommandResponse::BufferList {
+                buffers: self.list_buffer_summaries(),
+            },
+            CommandRequest::ShowBuffer { buffer } => match self.buffers.get(buffer.as_deref()) {
+                Some(buffer) => CommandResponse::BufferShown {
+                    name: buffer.name.clone(),
+                    data: buffer.data.clone(),
+                },
+                None => CommandResponse::Error {
+                    message: "no matching paste buffer".into(),
+                },
+            },
+            CommandRequest::SetBuffer {
+                buffer,
+                data,
+                append,
+            } => {
+                let name = self.buffers.set(buffer, data, append).name.clone();
+                CommandResponse::BufferSet { name }
+            }
+            CommandRequest::DeleteBuffer { buffer } => match self.buffers.delete(buffer.as_deref())
+            {
+                Some(buffer) => CommandResponse::BufferDeleted { name: buffer.name },
+                None => CommandResponse::Error {
+                    message: "no matching paste buffer".into(),
+                },
+            },
+            CommandRequest::PasteBuffer { target, buffer } => {
+                match self.buffers.get(buffer.as_deref()) {
+                    Some(buffer) => match parse_target(&target) {
+                        Ok(target) => match self.sessions.get(&target.session) {
+                            Some(session) => match session.send_keys(
+                                target.window,
+                                target.pane,
+                                &[buffer.data.clone()],
+                            ) {
+                                Ok(_) => CommandResponse::BufferPasted {
+                                    name: buffer.name.clone(),
+                                },
+                                Err(error) => CommandResponse::Error {
+                                    message: error.to_string(),
+                                },
+                            },
+                            None => CommandResponse::Error {
+                                message: format!("unknown session {}", target.session),
+                            },
+                        },
+                        Err(message) => CommandResponse::Error { message },
+                    },
+                    None => CommandResponse::Error {
+                        message: "no matching paste buffer".into(),
+                    },
+                }
+            }
+            CommandRequest::SaveBuffer { buffer, path } => {
+                match self.buffers.get(buffer.as_deref()) {
+                    Some(buffer) => match std::fs::write(&path, &buffer.data) {
+                        Ok(_) => CommandResponse::BufferSaved {
+                            name: buffer.name.clone(),
+                            path,
+                        },
+                        Err(error) => CommandResponse::Error {
+                            message: format!("failed to save buffer: {error}"),
+                        },
+                    },
+                    None => CommandResponse::Error {
+                        message: "no matching paste buffer".into(),
+                    },
+                }
+            }
+            CommandRequest::LoadBuffer { path, buffer } => match std::fs::read_to_string(&path) {
+                Ok(data) => {
+                    let name = self.buffers.set(buffer, data, false).name.clone();
+                    CommandResponse::BufferLoaded { name }
+                }
+                Err(error) => CommandResponse::Error {
+                    message: format!("failed to load buffer: {error}"),
+                },
             },
             CommandRequest::ListWindows { session } => {
                 if let Some(session) = self.sessions.get(&session) {
@@ -531,6 +614,18 @@ impl SessionStore {
             .collect()
     }
 
+    fn list_buffer_summaries(&self) -> Vec<BufferSummary> {
+        self.buffers
+            .summaries()
+            .into_iter()
+            .map(|(name, bytes, preview)| BufferSummary {
+                name,
+                bytes,
+                preview,
+            })
+            .collect()
+    }
+
     fn persist_metadata(&mut self) {
         for (name, session) in &self.sessions {
             self.persisted_sessions
@@ -542,6 +637,7 @@ impl SessionStore {
         let state = PersistedState {
             last_session: self.last_session.clone(),
             next_window_id: self.next_window_id,
+            buffers: self.buffers.snapshot(),
             sessions: self.persisted_sessions.clone(),
         };
         let _ = save_state(path, &state);
@@ -885,6 +981,45 @@ mod tests {
     }
 
     #[test]
+    fn buffer_store_roundtrips_through_server_requests() {
+        let mut store = SessionStore::default();
+
+        assert_eq!(
+            store.handle(CommandRequest::SetBuffer {
+                buffer: None,
+                data: "alpha".into(),
+                append: false,
+            }),
+            CommandResponse::BufferSet {
+                name: "buffer0001".into(),
+            }
+        );
+        assert_eq!(
+            store.handle(CommandRequest::ListBuffers),
+            CommandResponse::BufferList {
+                buffers: vec![BufferSummary {
+                    name: "buffer0001".into(),
+                    bytes: 5,
+                    preview: "alpha".into(),
+                }],
+            }
+        );
+        assert_eq!(
+            store.handle(CommandRequest::ShowBuffer { buffer: None }),
+            CommandResponse::BufferShown {
+                name: "buffer0001".into(),
+                data: "alpha".into(),
+            }
+        );
+        assert_eq!(
+            store.handle(CommandRequest::DeleteBuffer { buffer: None }),
+            CommandResponse::BufferDeleted {
+                name: "buffer0001".into(),
+            }
+        );
+    }
+
+    #[test]
     fn split_command_creates_second_pane() {
         let mut store = SessionStore::default();
         let _ = store.handle(CommandRequest::NewSession {
@@ -1021,6 +1156,11 @@ mod tests {
             command: vec!["sh".into()],
             switch_from: None,
         });
+        let _ = store.handle(CommandRequest::SetBuffer {
+            buffer: None,
+            data: "hello".into(),
+            append: false,
+        });
         drop(store);
 
         let mut restarted =
@@ -1047,6 +1187,13 @@ mod tests {
             }),
             CommandResponse::Attached { session, .. } if session == "work"
         ));
+        assert_eq!(
+            restarted.handle(CommandRequest::ShowBuffer { buffer: None }),
+            CommandResponse::BufferShown {
+                name: "buffer0001".into(),
+                data: "hello".into(),
+            }
+        );
     }
 
     #[test]

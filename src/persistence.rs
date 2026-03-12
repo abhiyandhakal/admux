@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    buffer::PasteBuffer,
     pane::{PaneId, WindowId},
     session::{PaneRuntime, Session, WindowRuntime},
 };
@@ -16,6 +17,8 @@ use crate::{
 pub struct PersistedState {
     pub last_session: Option<String>,
     pub next_window_id: u64,
+    #[serde(default)]
+    pub buffers: Vec<PasteBuffer>,
     pub sessions: BTreeMap<String, PersistedSession>,
 }
 
@@ -133,6 +136,12 @@ mod tests {
         let mut state = PersistedState {
             last_session: Some("work".into()),
             next_window_id: 2,
+            buffers: vec![PasteBuffer {
+                name: "buffer0001".into(),
+                data: "hello".into(),
+                explicit_name: false,
+                created_seq: 1,
+            }],
             sessions: BTreeMap::new(),
         };
         state.sessions.insert(

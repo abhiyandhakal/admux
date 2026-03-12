@@ -21,21 +21,24 @@ use crossterm::{
 };
 
 use crate::{
-    cli::{AdmuxCli, ClientCommand, NewWindowArgs, ResizePaneArgs, SelectPaneArgs, SplitPaneArgs},
+    cli::{
+        AdmuxCli, ClientCommand, NewWindowArgs, PasteBufferArgs, ResizePaneArgs, SelectPaneArgs,
+        SetBufferArgs, SplitPaneArgs,
+    },
     commands::{InteractiveCommand, complete as complete_commands, parse as parse_command},
     config::{Config, ResolvedConfig, StatusPosition},
     copy_mode::{CopyMode, Selection},
     input::{InputAction, InputMode, InputState},
     ipc::{
-        CommandRequest, CommandResponse, CycleDirection, NavigationDirection, PaneCursor,
-        PaneRender, RenderSnapshot, SwitchSource,
+        BufferSummary, CommandRequest, CommandResponse, CycleDirection, NavigationDirection,
+        PaneCursor, PaneRender, RenderSnapshot, SwitchSource,
     },
     layout::SplitAxis,
     pane::Rect,
     paths::RuntimePaths,
     render::{
-        BottomBar, PaneSelection, TerminalSize, TreeLine, render_choose_tree, render_help_overlay,
-        render_session,
+        BottomBar, PaneSelection, TerminalSize, TreeLine, render_buffer_chooser,
+        render_choose_tree, render_help_overlay, render_session,
     },
     window::WindowSummary,
 };
@@ -76,10 +79,17 @@ struct ChooseTreeState {
 }
 
 #[derive(Debug, Clone)]
+struct ChooseBufferState {
+    buffers: Vec<BufferSummary>,
+    selected: usize,
+}
+
+#[derive(Debug, Clone)]
 enum OverlayState {
     None,
     Prompt(PromptState),
     ChooseTree(ChooseTreeState),
+    ChooseBuffer(ChooseBufferState),
     Help,
 }
 
@@ -158,6 +168,34 @@ pub fn run(cli: AdmuxCli) -> Result<()> {
         },
         ClientCommand::ListPanes(args) => CommandRequest::ListPanes {
             target: args.target,
+        },
+        ClientCommand::ListBuffers => CommandRequest::ListBuffers,
+        ClientCommand::ShowBuffer(args) => CommandRequest::ShowBuffer {
+            buffer: args.buffer,
+        },
+        ClientCommand::DeleteBuffer(args) => CommandRequest::DeleteBuffer {
+            buffer: args.buffer,
+        },
+        ClientCommand::PasteBuffer(PasteBufferArgs { buffer, target }) => {
+            CommandRequest::PasteBuffer {
+                target: target
+                    .or_else(|| std::env::var("ADMUX_SESSION").ok())
+                    .unwrap_or_default(),
+                buffer,
+            }
+        }
+        ClientCommand::SetBuffer(SetBufferArgs { buffer, data }) => CommandRequest::SetBuffer {
+            buffer,
+            data,
+            append: false,
+        },
+        ClientCommand::SaveBuffer(args) => CommandRequest::SaveBuffer {
+            buffer: args.buffer,
+            path: args.path,
+        },
+        ClientCommand::LoadBuffer(args) => CommandRequest::LoadBuffer {
+            path: args.path,
+            buffer: args.buffer,
         },
         ClientCommand::Kill(args) => CommandRequest::KillSession {
             session: args.session,
@@ -438,6 +476,19 @@ fn print_response(paths: &RuntimePaths, response: CommandResponse) -> Result<()>
                 println!("{marker} {} {} ({})", pane.id, pane.title, pane.window_id);
             }
         }
+        CommandResponse::BufferList { buffers } => {
+            for buffer in buffers {
+                println!("{} {} {}", buffer.name, buffer.bytes, buffer.preview);
+            }
+        }
+        CommandResponse::BufferShown { data, .. } => print!("{data}"),
+        CommandResponse::BufferSet { name } => println!("set {name}"),
+        CommandResponse::BufferDeleted { name } => println!("deleted {name}"),
+        CommandResponse::BufferPasted { name } => println!("pasted {name}"),
+        CommandResponse::BufferSaved { name, path } => {
+            println!("saved {name} {}", path.display());
+        }
+        CommandResponse::BufferLoaded { name } => println!("loaded {name}"),
         CommandResponse::SessionKilled { session } => println!("killed {session}"),
         CommandResponse::WindowKilled { session, window_id } => {
             println!("killed {session}:{window_id}");
@@ -604,6 +655,19 @@ fn run_attach_loop(
                     TerminalSize { width, height },
                 )?;
             }
+            OverlayState::ChooseBuffer(chooser) => {
+                let preview = buffer_preview(paths, chooser)?;
+                render_buffer_chooser(
+                    stdout,
+                    &current_session,
+                    &snapshot,
+                    &chooser.buffers,
+                    chooser.selected,
+                    &preview,
+                    &config.ui,
+                    TerminalSize { width, height },
+                )?;
+            }
             OverlayState::Help => {
                 render_help_overlay(
                     stdout,
@@ -648,6 +712,17 @@ fn run_attach_loop(
                     OverlayState::ChooseTree(mut tree) => {
                         if handle_choose_tree_key(paths, &mut tree, key, &mut current_session)? {
                             overlay = OverlayState::ChooseTree(tree);
+                        }
+                    }
+                    OverlayState::ChooseBuffer(mut chooser) => {
+                        if handle_choose_buffer_key(
+                            paths,
+                            &mut chooser,
+                            key,
+                            &current_session,
+                            &mut status_message,
+                        )? {
+                            overlay = OverlayState::ChooseBuffer(chooser);
                         }
                     }
                     OverlayState::Help => match key.code {
@@ -766,6 +841,29 @@ fn run_attach_loop(
                                     target: current_session.clone(),
                                 },
                             )?;
+                        }
+                        InputAction::PasteTopBuffer => {
+                            let _ = request_response(
+                                paths,
+                                CommandRequest::PasteBuffer {
+                                    target: current_session.clone(),
+                                    buffer: None,
+                                },
+                            )?;
+                        }
+                        InputAction::ListBuffers => {
+                            let response = request_response(paths, CommandRequest::ListBuffers)?;
+                            status_message = Some(format_list_response(response));
+                        }
+                        InputAction::DeleteTopBuffer => {
+                            let response = request_response(
+                                paths,
+                                CommandRequest::DeleteBuffer { buffer: None },
+                            )?;
+                            status_message = Some(format_list_response(response));
+                        }
+                        InputAction::ChooseBuffer => {
+                            overlay = OverlayState::ChooseBuffer(build_choose_buffer(paths)?);
                         }
                         InputAction::ReloadConfig => {
                             let _ = request_response(paths, CommandRequest::ReloadConfig)?;
@@ -904,13 +1002,8 @@ fn run_attach_loop(
                                     },
                                 )?;
                                 if let CommandResponse::SelectionCopied { text } = copied {
-                                    let copied_chars = text.chars().count();
-                                    if copied_chars > 0 {
-                                        copy_via_osc52(stdout, &text)
-                                            .context("failed to send OSC52 clipboard copy")?;
-                                        status_message =
-                                            Some(format!("copied {copied_chars} chars"));
-                                    }
+                                    status_message =
+                                        copy_text_to_buffer_and_clipboard(paths, stdout, &text)?;
                                 }
                             }
                         }
@@ -1132,6 +1225,60 @@ fn execute_prompt_command(
             )?;
             Ok(Some(format_list_response(response)))
         }
+        InteractiveCommand::ListBuffers => {
+            let response = request_response(paths, CommandRequest::ListBuffers)?;
+            Ok(Some(format_list_response(response)))
+        }
+        InteractiveCommand::ShowBuffer { buffer } => {
+            let response = request_response(paths, CommandRequest::ShowBuffer { buffer })?;
+            Ok(Some(format_list_response(response)))
+        }
+        InteractiveCommand::DeleteBuffer { buffer } => {
+            let response = request_response(paths, CommandRequest::DeleteBuffer { buffer })?;
+            Ok(Some(format_list_response(response)))
+        }
+        InteractiveCommand::PasteBuffer { buffer, target } => {
+            let response = request_response(
+                paths,
+                CommandRequest::PasteBuffer {
+                    target: target.unwrap_or_else(|| current_session.clone()),
+                    buffer,
+                },
+            )?;
+            Ok(Some(format_list_response(response)))
+        }
+        InteractiveCommand::SetBuffer { buffer, data } => {
+            let response = request_response(
+                paths,
+                CommandRequest::SetBuffer {
+                    buffer,
+                    data,
+                    append: false,
+                },
+            )?;
+            Ok(Some(format_list_response(response)))
+        }
+        InteractiveCommand::SaveBuffer { buffer, path } => {
+            let response = request_response(
+                paths,
+                CommandRequest::SaveBuffer {
+                    buffer,
+                    path: path.into(),
+                },
+            )?;
+            Ok(Some(format_list_response(response)))
+        }
+        InteractiveCommand::LoadBuffer { buffer, path } => {
+            let response = request_response(
+                paths,
+                CommandRequest::LoadBuffer {
+                    path: path.into(),
+                    buffer,
+                },
+            )?;
+            Ok(Some(format_list_response(response)))
+        }
+        InteractiveCommand::ChooseBuffer => Ok(Some("use Ctrl-b =".into())),
         InteractiveCommand::ChooseTree => Ok(Some("use Ctrl-b s".into())),
         InteractiveCommand::DetachClient => Ok(Some("use Ctrl-b d".into())),
         InteractiveCommand::RenameWindow { name } => {
@@ -1185,6 +1332,17 @@ fn format_list_response(response: CommandResponse) -> String {
             .map(|pane| pane.id.to_string())
             .collect::<Vec<_>>()
             .join(" "),
+        CommandResponse::BufferList { buffers } => buffers
+            .into_iter()
+            .map(|buffer| format!("{}({})", buffer.name, buffer.bytes))
+            .collect::<Vec<_>>()
+            .join(" "),
+        CommandResponse::BufferShown { data, .. } => data,
+        CommandResponse::BufferSet { name } => format!("set {name}"),
+        CommandResponse::BufferDeleted { name } => format!("deleted {name}"),
+        CommandResponse::BufferPasted { name } => format!("pasted {name}"),
+        CommandResponse::BufferSaved { name, path } => format!("saved {name} {}", path.display()),
+        CommandResponse::BufferLoaded { name } => format!("loaded {name}"),
         CommandResponse::Error { message } => message,
         _ => String::new(),
     }
@@ -1223,6 +1381,17 @@ fn build_choose_tree(paths: &RuntimePaths, current_session: &str) -> Result<Choo
     };
     rebuild_choose_tree(paths, &mut state)?;
     Ok(state)
+}
+
+fn build_choose_buffer(paths: &RuntimePaths) -> Result<ChooseBufferState> {
+    let buffers = match request_response(paths, CommandRequest::ListBuffers)? {
+        CommandResponse::BufferList { buffers } => buffers,
+        other => return Err(anyhow!("unexpected buffer list response: {other:?}")),
+    };
+    Ok(ChooseBufferState {
+        buffers,
+        selected: 0,
+    })
 }
 
 fn rebuild_choose_tree(paths: &RuntimePaths, state: &mut ChooseTreeState) -> Result<()> {
@@ -1361,6 +1530,21 @@ fn chooser_preview(
     Ok((session, snapshot))
 }
 
+fn buffer_preview(paths: &RuntimePaths, chooser: &ChooseBufferState) -> Result<String> {
+    let Some(buffer) = chooser.buffers.get(chooser.selected) else {
+        return Ok(String::new());
+    };
+    match request_response(
+        paths,
+        CommandRequest::ShowBuffer {
+            buffer: Some(buffer.name.clone()),
+        },
+    )? {
+        CommandResponse::BufferShown { data, .. } => Ok(data),
+        other => Err(anyhow!("unexpected buffer preview response: {other:?}")),
+    }
+}
+
 fn handle_choose_tree_key(
     paths: &RuntimePaths,
     tree: &mut ChooseTreeState,
@@ -1471,6 +1655,58 @@ fn handle_choose_tree_key(
         _ => {}
     }
     rebuild_choose_tree(paths, tree)?;
+    Ok(true)
+}
+
+fn handle_choose_buffer_key(
+    paths: &RuntimePaths,
+    chooser: &mut ChooseBufferState,
+    key: crossterm::event::KeyEvent,
+    current_session: &str,
+    status_message: &mut Option<String>,
+) -> Result<bool> {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => return Ok(false),
+        KeyCode::Up => {
+            if chooser.selected > 0 {
+                chooser.selected -= 1;
+            }
+        }
+        KeyCode::Down => {
+            if chooser.selected + 1 < chooser.buffers.len() {
+                chooser.selected += 1;
+            }
+        }
+        KeyCode::Char('d') => {
+            if let Some(buffer) = chooser.buffers.get(chooser.selected) {
+                let response = request_response(
+                    paths,
+                    CommandRequest::DeleteBuffer {
+                        buffer: Some(buffer.name.clone()),
+                    },
+                )?;
+                *status_message = Some(format_list_response(response));
+                *chooser = build_choose_buffer(paths)?;
+                if !chooser.buffers.is_empty() {
+                    chooser.selected = chooser.selected.min(chooser.buffers.len() - 1);
+                }
+            }
+        }
+        KeyCode::Enter | KeyCode::Char('p') => {
+            if let Some(buffer) = chooser.buffers.get(chooser.selected) {
+                let response = request_response(
+                    paths,
+                    CommandRequest::PasteBuffer {
+                        target: current_session.to_string(),
+                        buffer: Some(buffer.name.clone()),
+                    },
+                )?;
+                *status_message = Some(format_list_response(response));
+            }
+            return Ok(false);
+        }
+        _ => {}
+    }
     Ok(true)
 }
 
@@ -1633,6 +1869,10 @@ fn help_lines() -> Vec<String> {
         "Ctrl-b x      kill active pane".into(),
         "Ctrl-b :      command prompt".into(),
         "Ctrl-b [      copy mode".into(),
+        "Ctrl-b ]      paste top buffer".into(),
+        "Ctrl-b #      list buffers".into(),
+        "Ctrl-b -      delete top buffer".into(),
+        "Ctrl-b =      choose buffer".into(),
         "Ctrl-b s      choose-tree".into(),
         "Ctrl-b d      detach".into(),
         "Ctrl-b ?      help".into(),
@@ -1748,12 +1988,7 @@ fn handle_mouse_event(
                     },
                 )?;
                 if let CommandResponse::SelectionCopied { text } = copied {
-                    let copied_chars = text.chars().count();
-                    if copied_chars > 0 {
-                        copy_via_osc52(stdout, &text)
-                            .context("failed to send OSC52 clipboard copy")?;
-                        *status_message = Some(format!("copied {copied_chars} chars"));
-                    }
+                    *status_message = copy_text_to_buffer_and_clipboard(paths, stdout, &text)?;
                 }
             }
             *active_selection = None;
@@ -1906,6 +2141,33 @@ fn copy_via_osc52(out: &mut impl Write, text: &str) -> Result<()> {
     write!(out, "\x1b]52;c;{encoded}\x07").context("failed to write OSC52 sequence")?;
     out.flush().context("failed to flush OSC52 sequence")?;
     Ok(())
+}
+
+fn copy_text_to_buffer_and_clipboard(
+    paths: &RuntimePaths,
+    out: &mut impl Write,
+    text: &str,
+) -> Result<Option<String>> {
+    let copied_chars = text.chars().count();
+    if copied_chars == 0 {
+        return Ok(None);
+    }
+    let buffer_name = match request_response(
+        paths,
+        CommandRequest::SetBuffer {
+            buffer: None,
+            data: text.to_string(),
+            append: false,
+        },
+    )? {
+        CommandResponse::BufferSet { name } => name,
+        CommandResponse::Error { message } => return Err(anyhow!(message)),
+        other => return Err(anyhow!("unexpected set-buffer response: {other:?}")),
+    };
+    copy_via_osc52(out, text).context("failed to send OSC52 clipboard copy")?;
+    Ok(Some(format!(
+        "copied {copied_chars} chars to {buffer_name}"
+    )))
 }
 
 #[cfg(test)]

@@ -10,7 +10,7 @@ use crossterm::{
 use crate::{
     config::{DividerCharset, ResolvedUiConfig, StatusPosition},
     copy_mode::Selection,
-    ipc::{PaneRender, RenderSnapshot},
+    ipc::{BufferSummary, PaneRender, RenderSnapshot},
     pane::Rect,
 };
 
@@ -185,6 +185,72 @@ pub fn render_help_overlay<W: Write>(
         snapshot,
         BottomBar::Status {
             message: Some("help | q cancel"),
+        },
+        ui,
+        size,
+    )?;
+    out.flush()
+}
+
+pub fn render_buffer_chooser<W: Write>(
+    out: &mut W,
+    session: &str,
+    snapshot: &RenderSnapshot,
+    buffers: &[BufferSummary],
+    selected: usize,
+    preview: &str,
+    ui: &ResolvedUiConfig,
+    size: TerminalSize,
+) -> std::io::Result<()> {
+    queue!(out, Clear(ClearType::All), MoveTo(0, 0))?;
+    let body_height = size.height.saturating_sub(1);
+    let body_start = body_start_row(ui);
+    let list_height = body_height.min((buffers.len() as u16).saturating_add(1).min(8));
+
+    for (index, buffer) in buffers.iter().enumerate() {
+        if index as u16 >= list_height {
+            break;
+        }
+        let row = body_start + index as u16;
+        let content = format!("{} ({}) {}", buffer.name, buffer.bytes, buffer.preview);
+        queue!(out, MoveTo(0, row))?;
+        if index == selected {
+            queue!(
+                out,
+                SetAttribute(Attribute::Reverse),
+                Print(fit_width(&content, size.width)),
+                SetAttribute(Attribute::Reset)
+            )?;
+        } else {
+            queue!(out, Print(fit_width(&content, size.width)))?;
+        }
+    }
+
+    queue!(
+        out,
+        MoveTo(0, body_start + list_height),
+        Print(fit_width(
+            &format!(
+                " buffers {}",
+                "-".repeat(size.width.saturating_sub(9) as usize)
+            ),
+            size.width,
+        ))
+    )?;
+    for (offset, line) in preview.lines().enumerate() {
+        let row = body_start + list_height.saturating_add(1) + offset as u16;
+        if row >= body_start + body_height {
+            break;
+        }
+        queue!(out, MoveTo(0, row), Print(fit_width(line, size.width)))?;
+    }
+
+    render_bottom_bar(
+        out,
+        session,
+        snapshot,
+        BottomBar::Status {
+            message: Some("choose-buffer | Enter paste | d delete | q cancel"),
         },
         ui,
         size,

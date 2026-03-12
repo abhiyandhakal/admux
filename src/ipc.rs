@@ -11,7 +11,7 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtocolVersion(pub u16);
 
-pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(3);
+pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(4);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommandRequest {
@@ -33,6 +33,30 @@ pub enum CommandRequest {
     },
     ListPanes {
         target: String,
+    },
+    ListBuffers,
+    ShowBuffer {
+        buffer: Option<String>,
+    },
+    SetBuffer {
+        buffer: Option<String>,
+        data: String,
+        append: bool,
+    },
+    DeleteBuffer {
+        buffer: Option<String>,
+    },
+    PasteBuffer {
+        target: String,
+        buffer: Option<String>,
+    },
+    SaveBuffer {
+        buffer: Option<String>,
+        path: PathBuf,
+    },
+    LoadBuffer {
+        path: PathBuf,
+        buffer: Option<String>,
     },
     KillSession {
         session: String,
@@ -142,6 +166,29 @@ pub enum CommandResponse {
     PaneList {
         panes: Vec<PaneSummary>,
     },
+    BufferList {
+        buffers: Vec<BufferSummary>,
+    },
+    BufferShown {
+        name: String,
+        data: String,
+    },
+    BufferSet {
+        name: String,
+    },
+    BufferDeleted {
+        name: String,
+    },
+    BufferPasted {
+        name: String,
+    },
+    BufferSaved {
+        name: String,
+        path: PathBuf,
+    },
+    BufferLoaded {
+        name: String,
+    },
     SessionKilled {
         session: String,
     },
@@ -236,6 +283,13 @@ pub struct SessionSummary {
     pub name: String,
     #[serde(default)]
     pub stale: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BufferSummary {
+    pub name: String,
+    pub bytes: usize,
+    pub preview: String,
 }
 
 #[cfg(test)]

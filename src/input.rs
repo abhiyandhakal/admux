@@ -26,6 +26,10 @@ pub enum InputAction {
     FocusPane(NavigationDirection),
     ResizePane(NavigationDirection, u16),
     KillPane,
+    PasteTopBuffer,
+    ListBuffers,
+    DeleteTopBuffer,
+    ChooseBuffer,
     OpenPrompt,
     OpenSessions,
     OpenHelp,
@@ -152,6 +156,10 @@ impl InputState {
                 InputAction::ResizePane(NavigationDirection::Right, self.resize_step)
             }
             Action::KillPane => InputAction::KillPane,
+            Action::PasteTopBuffer => InputAction::PasteTopBuffer,
+            Action::ListBuffers => InputAction::ListBuffers,
+            Action::DeleteTopBuffer => InputAction::DeleteTopBuffer,
+            Action::ChooseBuffer => InputAction::ChooseBuffer,
             Action::EnterCopyMode => InputAction::EnterCopyMode,
             Action::ExitCopyMode => InputAction::ExitCopyMode,
             Action::CopyMoveLeft => InputAction::CopyMove(NavigationDirection::Left),
@@ -256,6 +264,16 @@ mod tests {
         assert_eq!(
             state.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT)),
             InputAction::OpenHelp
+        );
+    }
+
+    #[test]
+    fn leader_bracket_pastes_top_buffer() {
+        let mut state = configured_state("");
+        let _ = state.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        assert_eq!(
+            state.handle_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE)),
+            InputAction::PasteTopBuffer
         );
     }
 

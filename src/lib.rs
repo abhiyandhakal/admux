@@ -1,3 +1,4 @@
+pub mod buffer;
 pub mod cli;
 pub mod client;
 pub mod clipboard;
