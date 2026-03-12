@@ -94,6 +94,8 @@ impl SessionStore {
                 store.helper_dir.clone(),
             ) {
                 store.sessions.insert(name, session);
+            } else {
+                store.persisted_sessions.remove(&name);
             }
         }
         Ok(store)
@@ -1212,6 +1214,68 @@ mod tests {
                 name: "buffer0001".into(),
                 data: "hello".into(),
             }
+        );
+    }
+
+    #[test]
+    fn unrecoverable_persisted_sessions_are_pruned_on_startup() {
+        let dir = tempdir().expect("tempdir");
+        let state_path = dir.path().join("state.json");
+        let config_path = dir.path().join("config.toml");
+        fs::write(
+            &state_path,
+            serde_json::to_vec_pretty(&PersistedState {
+                last_session: Some("ghost".into()),
+                next_window_id: 1,
+                buffers: Vec::new(),
+                sessions: [(
+                    "ghost".into(),
+                    PersistedSession {
+                        name: "ghost".into(),
+                        cwd: None,
+                        command: vec!["sh".into()],
+                        rows: 24,
+                        cols: 80,
+                        window_order: vec![WindowId(1)],
+                        active_window: WindowId(1),
+                        last_window: None,
+                        windows: [(
+                            WindowId(1),
+                            crate::persistence::PersistedWindow {
+                                id: WindowId(1),
+                                name: "shell".into(),
+                                layout: crate::layout::LayoutTree::new(PaneId(0)),
+                                next_pane_id: 1,
+                                panes: [(
+                                    PaneId(0),
+                                    crate::persistence::PersistedPane {
+                                        id: PaneId(0),
+                                        title: "shell".into(),
+                                        socket_path: Some(dir.path().join("missing-helper.sock")),
+                                    },
+                                )]
+                                .into_iter()
+                                .collect(),
+                            },
+                        )]
+                        .into_iter()
+                        .collect(),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            })
+            .expect("encode state"),
+        )
+        .expect("write state");
+
+        let mut store =
+            SessionStore::with_paths(state_path, config_path, dir.path().join("panes"))
+                .expect("start store");
+
+        assert_eq!(
+            store.handle(CommandRequest::ListSessions),
+            CommandResponse::SessionList { sessions: vec![] }
         );
     }
 
