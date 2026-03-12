@@ -4,7 +4,7 @@ use crossterm::{
     cursor::{MoveTo, Show},
     queue,
     style::{Attribute, Print, SetAttribute},
-    terminal::{Clear, ClearType},
+    terminal::{BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate},
 };
 
 use crate::{
@@ -63,7 +63,7 @@ pub fn render_session<W: Write>(
     ui: &ResolvedUiConfig,
     size: TerminalSize,
 ) -> std::io::Result<()> {
-    queue!(out, Clear(ClearType::All), MoveTo(0, 0))?;
+    queue!(out, BeginSynchronizedUpdate, Clear(ClearType::All), MoveTo(0, 0))?;
 
     for pane in &snapshot.panes {
         render_pane(out, pane, ui)?;
@@ -78,6 +78,7 @@ pub fn render_session<W: Write>(
     } else {
         render_cursor(out, snapshot, ui)?;
     }
+    queue!(out, EndSynchronizedUpdate)?;
     out.flush()
 }
 
@@ -92,7 +93,7 @@ pub fn render_choose_tree<W: Write>(
     ui: &ResolvedUiConfig,
     size: TerminalSize,
 ) -> std::io::Result<()> {
-    queue!(out, Clear(ClearType::All), MoveTo(0, 0))?;
+    queue!(out, BeginSynchronizedUpdate, Clear(ClearType::All), MoveTo(0, 0))?;
 
     let body_height = size.height.saturating_sub(1);
     let body_start = body_start_row(ui);
@@ -153,6 +154,7 @@ pub fn render_choose_tree<W: Write>(
         ui,
         size,
     )?;
+    queue!(out, EndSynchronizedUpdate)?;
     out.flush()
 }
 
@@ -164,7 +166,7 @@ pub fn render_help_overlay<W: Write>(
     ui: &ResolvedUiConfig,
     size: TerminalSize,
 ) -> std::io::Result<()> {
-    queue!(out, Clear(ClearType::All), MoveTo(0, 0))?;
+    queue!(out, BeginSynchronizedUpdate, Clear(ClearType::All), MoveTo(0, 0))?;
     let body_height = size.height.saturating_sub(1);
     let body_start = body_start_row(ui);
 
@@ -189,6 +191,7 @@ pub fn render_help_overlay<W: Write>(
         ui,
         size,
     )?;
+    queue!(out, EndSynchronizedUpdate)?;
     out.flush()
 }
 
@@ -202,7 +205,7 @@ pub fn render_buffer_chooser<W: Write>(
     ui: &ResolvedUiConfig,
     size: TerminalSize,
 ) -> std::io::Result<()> {
-    queue!(out, Clear(ClearType::All), MoveTo(0, 0))?;
+    queue!(out, BeginSynchronizedUpdate, Clear(ClearType::All), MoveTo(0, 0))?;
     let body_height = size.height.saturating_sub(1);
     let body_start = body_start_row(ui);
     let list_height = body_height.min((buffers.len() as u16).saturating_add(1).min(8));
@@ -255,6 +258,7 @@ pub fn render_buffer_chooser<W: Write>(
         ui,
         size,
     )?;
+    queue!(out, EndSynchronizedUpdate)?;
     out.flush()
 }
 
