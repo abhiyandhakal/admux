@@ -38,12 +38,15 @@ Implemented now:
 - mouse focus, drag-selection copy, wheel scroll, and border resize
 - modal copy mode with pane navigation, scrollback paging, selection, and yank
 - persistent session/window/pane metadata across daemon restarts, with stale session listing when processes are gone
+- live pane/process recovery across `admuxd` restart through per-pane helper processes
 - resize handling that preserves pane state while shrinking and restores PTY history when panes expand again
 - unit, integration, and binary smoke coverage
 
 Not finished yet:
 
-- live pane/process recovery across daemon restart
+- tmux paste-buffer and choose-buffer workflows
+- fuller choose-tree / chooser parity
+- broader tmux default-key and command-surface parity
 
 ## Build and run
 

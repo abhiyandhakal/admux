@@ -47,6 +47,8 @@ pub struct PersistedWindow {
 pub struct PersistedPane {
     pub id: PaneId,
     pub title: String,
+    #[serde(default)]
+    pub socket_path: Option<PathBuf>,
 }
 
 impl PersistedSession {
@@ -90,6 +92,7 @@ impl PersistedPane {
         Self {
             id: pane.id,
             title: pane.title.clone(),
+            socket_path: Some(pane.process.socket_path().to_path_buf()),
         }
     }
 }

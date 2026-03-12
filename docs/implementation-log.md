@@ -344,3 +344,26 @@ This document records each completed implementation slice in detail, including t
   - daemon-side defaults can set session naming prefixes, shell fallback, resize step, scrollback size, and default window naming policy for future panes
 - Commit: pending current worktree
 - Status: complete
+
+## Live recovery slice
+
+- Goal: make live pane processes survive `admuxd` restart instead of falling back to stale metadata only.
+- Files changed:
+  - pane helper/runtime split: `src/pty.rs`, `src/bin/admux-pane.rs`
+  - session/restore wiring: `src/session.rs`, `src/server.rs`, `src/persistence.rs`
+  - docs: `README.md`, `docs/detailed-status.md`
+- Verification:
+  - `cargo test`
+  - direct built-binary smoke:
+    - `target/debug/admuxd serve --socket <temp-socket> --state <temp-state> --config <temp-config>`
+    - `ADMUX_SOCKET=<temp-socket> ADMUX_STATE=<temp-state> ADMUX_CONFIG=<temp-config> target/debug/admux new -d --name recover -- sh -lc "printf recovered; sleep 20"`
+    - kill the first `admuxd`
+    - restart `target/debug/admuxd serve` on the same socket/state/config
+    - `ADMUX_NONINTERACTIVE=1 target/debug/admux attach recover`
+- Observed result:
+  - each pane now runs behind its own `admux-pane` helper process
+  - persisted pane metadata includes helper socket paths
+  - restarted `admuxd` reconnects to live helpers and rebuilds sessions instead of treating them as stale-only
+  - the direct binary smoke reattached after daemon restart and still showed the original live shell output
+- Commit: pending current worktree
+- Status: complete

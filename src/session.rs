@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Result, anyhow};
 
@@ -9,6 +12,7 @@ use crate::{
     },
     layout::{Direction, LayoutTree, SplitAxis},
     pane::{PaneId, PaneSnapshot, Rect, WindowId},
+    persistence::PersistedSession,
     pty::PaneProcess,
     window::WindowSummary,
 };
@@ -29,6 +33,7 @@ pub struct Session {
     pub default_shell: Option<String>,
     pub scrollback_lines: usize,
     pub window_defaults: WindowDefaults,
+    pub helper_dir: PathBuf,
 }
 
 pub struct WindowRuntime {
@@ -69,6 +74,7 @@ impl Session {
         default_shell: Option<String>,
         scrollback_lines: usize,
         window_defaults: WindowDefaults,
+        helper_dir: PathBuf,
     ) -> Result<Self> {
         let mut windows = BTreeMap::new();
         let initial_name = default_window_name(&command, &window_defaults);
@@ -83,6 +89,7 @@ impl Session {
                 default_shell.as_deref(),
                 scrollback_lines,
                 &window_defaults,
+                &helper_dir,
             )?,
         );
 
@@ -99,6 +106,70 @@ impl Session {
             default_shell,
             scrollback_lines,
             window_defaults,
+            helper_dir,
+        };
+        session.sync_pane_sizes()?;
+        Ok(session)
+    }
+
+    pub fn from_persisted(
+        persisted: &PersistedSession,
+        default_shell: Option<String>,
+        scrollback_lines: usize,
+        window_defaults: WindowDefaults,
+        helper_dir: PathBuf,
+    ) -> Result<Self> {
+        let mut windows = BTreeMap::new();
+        for window_id in &persisted.window_order {
+            let persisted_window = persisted
+                .windows
+                .get(window_id)
+                .ok_or_else(|| anyhow!("missing persisted window {}", window_id.0))?;
+            let mut panes = BTreeMap::new();
+            for pane_id in persisted_window.layout.panes() {
+                let persisted_pane = persisted_window
+                    .panes
+                    .get(&pane_id)
+                    .ok_or_else(|| anyhow!("missing persisted pane {}", pane_id.0))?;
+                let socket_path = persisted_pane
+                    .socket_path
+                    .clone()
+                    .ok_or_else(|| anyhow!("persisted pane {} has no helper socket", pane_id.0))?;
+                panes.insert(
+                    pane_id,
+                    PaneRuntime {
+                        id: pane_id,
+                        title: persisted_pane.title.clone(),
+                        process: PaneProcess::connect(socket_path)?,
+                    },
+                );
+            }
+            windows.insert(
+                *window_id,
+                WindowRuntime {
+                    id: persisted_window.id,
+                    name: persisted_window.name.clone(),
+                    layout: persisted_window.layout.clone(),
+                    next_pane_id: persisted_window.next_pane_id,
+                    panes,
+                },
+            );
+        }
+
+        let mut session = Self {
+            name: persisted.name.clone(),
+            cwd: persisted.cwd.clone(),
+            command: persisted.command.clone(),
+            rows: persisted.rows,
+            cols: persisted.cols,
+            windows,
+            window_order: persisted.window_order.clone(),
+            active_window: persisted.active_window,
+            last_window: persisted.last_window,
+            default_shell,
+            scrollback_lines,
+            window_defaults,
+            helper_dir,
         };
         session.sync_pane_sizes()?;
         Ok(session)
@@ -173,18 +244,16 @@ impl Session {
             .filter_map(|pane_id| {
                 let pane = window.panes.get(&pane_id)?;
                 let rect = *rects.get(&pane_id)?;
-                let rows_plain = pane.process.visible_rows(rect.width, rect.height);
-                let rows_formatted = pane.process.visible_rows_formatted(rect.width, rect.height);
-                let (cursor_row, cursor_col) = pane.process.cursor_position();
-                let cursor = clamp_cursor(rect, cursor_row, cursor_col);
+                let render = pane.process.render(rect.width, rect.height).ok()?;
+                let cursor = clamp_cursor(rect, render.cursor_row, render.cursor_col);
 
                 Some(PaneRender {
                     pane_id: pane.id.0,
                     title: pane.title.clone(),
                     rect,
                     focused: pane_id == window.layout.active,
-                    rows_plain,
-                    rows_formatted,
+                    rows_plain: render.rows_plain,
+                    rows_formatted: render.rows_formatted,
                     cursor,
                 })
             })
@@ -340,6 +409,7 @@ impl Session {
             Some((&self.name, active_window, pane_id)),
             self.default_shell.as_deref(),
             self.scrollback_lines,
+            &self.helper_dir,
         )?;
         let pane = PaneRuntime {
             id: pane_id,
@@ -375,6 +445,7 @@ impl Session {
             self.default_shell.as_deref(),
             self.scrollback_lines,
             &self.window_defaults,
+            &self.helper_dir,
         )?;
         let pane_id = window.layout.active;
         self.windows.insert(window_id, window);
@@ -603,6 +674,7 @@ impl WindowRuntime {
         default_shell: Option<&str>,
         scrollback_lines: usize,
         window_defaults: &WindowDefaults,
+        helper_dir: &Path,
     ) -> Result<Self> {
         let pane_id = PaneId(0);
         let process = PaneProcess::spawn(
@@ -611,6 +683,7 @@ impl WindowRuntime {
             Some((session_name, id, pane_id)),
             default_shell,
             scrollback_lines,
+            helper_dir,
         )?;
         let pane = PaneRuntime {
             id: pane_id,
@@ -693,9 +766,11 @@ fn clamp_cursor(content: Rect, row: u16, col: u16) -> Option<PaneCursor> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn new_window_uses_full_viewport_width_for_pty() {
+        let helper_dir = tempdir().expect("tempdir");
         let mut session = Session::new(
             "work".into(),
             None,
@@ -704,6 +779,7 @@ mod tests {
             None,
             10_000,
             WindowDefaults::default(),
+            helper_dir.path().to_path_buf(),
         )
         .expect("create session");
         session.set_viewport(30, 120).expect("set viewport");
@@ -740,6 +816,7 @@ mod tests {
 
     #[test]
     fn selecting_window_tracks_last_window() {
+        let helper_dir = tempdir().expect("tempdir");
         let mut session = Session::new(
             "work".into(),
             None,
@@ -748,6 +825,7 @@ mod tests {
             None,
             10_000,
             WindowDefaults::default(),
+            helper_dir.path().to_path_buf(),
         )
         .expect("create session");
 
@@ -770,6 +848,7 @@ mod tests {
 
     #[test]
     fn pane_ids_are_window_local_and_stable() {
+        let helper_dir = tempdir().expect("tempdir");
         let mut session = Session::new(
             "work".into(),
             None,
@@ -778,6 +857,7 @@ mod tests {
             None,
             10_000,
             WindowDefaults::default(),
+            helper_dir.path().to_path_buf(),
         )
         .expect("create session");
 

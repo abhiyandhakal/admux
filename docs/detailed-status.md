@@ -24,6 +24,7 @@
 
 - session store in the daemon
 - PTY-backed command spawning through `portable-pty`
+- per-pane `admux-pane` helper processes now own PTYs so live panes survive `admuxd` restart
 - session now owns ordered windows and each window owns a split-tree of panes
 - pane numbers are window-local, starting at `0` in each window and remaining stable for the pane lifetime
 - VT100-backed screen parsing of PTY output
@@ -31,7 +32,8 @@
 - pane/window/session cleanup when child processes exit
 - resize path from the client into all pane PTYs plus stored viewport geometry
 - PTY resize handling now keeps the current screen stable while shrinking and rebuilds from raw history when panes expand again
-- session/window/pane metadata persists across daemon restarts, with stale session listings when live PTYs are gone
+- session/window/pane metadata persists across daemon restarts
+- restarted `admuxd` reconnects to live pane helpers and rebuilds sessions instead of dropping them to stale-only metadata
 
 ### Layout and pane foundations
 
@@ -130,7 +132,9 @@ Observed result:
 
 ## Known gaps
 
-- live pane/process recovery after `admuxd` restart is still out of scope
+- tmux paste-buffer and choose-buffer parity is not implemented yet
+- chooser parity is still narrower than tmux’s full chooser family
+- several tmux default pane/window/session actions are still missing
 
 ## Config system
 

@@ -3,7 +3,7 @@ use std::{
     fs,
     io::{Read, Write},
     os::unix::net::{UnixListener, UnixStream},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -30,6 +30,7 @@ pub struct SessionStore {
     sessions: BTreeMap<String, Session>,
     persisted_sessions: BTreeMap<String, PersistedSession>,
     state_path: Option<std::path::PathBuf>,
+    helper_dir: PathBuf,
     pending_switches: BTreeMap<String, String>,
     last_session: Option<String>,
     next_window_id: u64,
@@ -43,6 +44,7 @@ impl Default for SessionStore {
             sessions: BTreeMap::new(),
             persisted_sessions: BTreeMap::new(),
             state_path: None,
+            helper_dir: PathBuf::from("/tmp/admux-helpers"),
             pending_switches: BTreeMap::new(),
             last_session: None,
             next_window_id: 0,
@@ -65,17 +67,31 @@ impl SessionStore {
     pub fn with_paths(
         state_path: std::path::PathBuf,
         config_path: std::path::PathBuf,
+        helper_dir: PathBuf,
     ) -> Result<Self> {
         let persisted = load_state(&state_path)?;
         let mut store = Self {
             persisted_sessions: persisted.sessions,
             state_path: Some(state_path),
+            helper_dir,
             last_session: persisted.last_session,
             next_window_id: persisted.next_window_id,
             config_path: Some(config_path),
             ..Self::default()
         };
         store.reload_config()?;
+        let persisted_sessions = store.persisted_sessions.clone();
+        for (name, persisted) in persisted_sessions {
+            if let Ok(session) = Session::from_persisted(
+                &persisted,
+                store.config.behavior.default_shell.clone(),
+                store.config.behavior.scrollback_lines,
+                store.config.defaults.window.clone(),
+                store.helper_dir.clone(),
+            ) {
+                store.sessions.insert(name, session);
+            }
+        }
         Ok(store)
     }
 
@@ -107,6 +123,7 @@ impl SessionStore {
                     self.config.behavior.default_shell.clone(),
                     self.config.behavior.scrollback_lines,
                     self.config.defaults.window.clone(),
+                    self.helper_dir.clone(),
                 ) {
                     Ok(session) => {
                         self.sessions.insert(name.clone(), session);
@@ -738,6 +755,12 @@ pub fn serve(socket_path: &Path, state_path: &Path, config_path: &Path) -> Resul
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create socket directory {}", parent.display()))?;
     }
+    let helper_dir = socket_path
+        .parent()
+        .map(|parent| parent.join("panes"))
+        .unwrap_or_else(|| PathBuf::from("/tmp/admux-panes"));
+    fs::create_dir_all(&helper_dir)
+        .with_context(|| format!("failed to create helper directory {}", helper_dir.display()))?;
     if socket_path.exists() {
         fs::remove_file(socket_path)
             .with_context(|| format!("failed to remove stale socket {}", socket_path.display()))?;
@@ -748,6 +771,7 @@ pub fn serve(socket_path: &Path, state_path: &Path, config_path: &Path) -> Resul
     let state = Arc::new(Mutex::new(SessionStore::with_paths(
         state_path.to_path_buf(),
         config_path.to_path_buf(),
+        helper_dir,
     )?));
     for stream in listener.incoming() {
         let mut stream = stream.context("failed to accept client")?;
@@ -837,7 +861,7 @@ mod tests {
         let created = store.handle(CommandRequest::NewSession {
             name: Some("work".into()),
             cwd: None,
-            command: vec!["sh".into(), "-lc".into(), "printf test".into()],
+            command: vec!["sh".into()],
             switch_from: None,
         });
         assert!(matches!(
@@ -985,8 +1009,12 @@ mod tests {
         let state_path = dir.path().join("state.json");
         let config_path = dir.path().join("config.toml");
 
-        let mut store = SessionStore::with_paths(state_path.clone(), config_path.clone())
-            .expect("create persisted store");
+        let mut store = SessionStore::with_paths(
+            state_path.clone(),
+            config_path.clone(),
+            dir.path().join("panes"),
+        )
+        .expect("create persisted store");
         let _ = store.handle(CommandRequest::NewSession {
             name: Some("work".into()),
             cwd: None,
@@ -996,13 +1024,14 @@ mod tests {
         drop(store);
 
         let mut restarted =
-            SessionStore::with_paths(state_path, config_path).expect("reload persisted store");
+            SessionStore::with_paths(state_path, config_path, dir.path().join("panes"))
+                .expect("reload persisted store");
         assert_eq!(
             restarted.handle(CommandRequest::ListSessions),
             CommandResponse::SessionList {
                 sessions: vec![SessionSummary {
                     name: "work".into(),
-                    stale: true,
+                    stale: false,
                 }],
             }
         );
@@ -1016,7 +1045,7 @@ mod tests {
             restarted.handle(CommandRequest::Attach {
                 session: Some("work".into()),
             }),
-            CommandResponse::Error { message } if message.contains("persisted metadata")
+            CommandResponse::Attached { session, .. } if session == "work"
         ));
     }
 
@@ -1038,8 +1067,8 @@ mod tests {
         )
         .expect("write config");
 
-        let mut store =
-            SessionStore::with_paths(state_path, config_path).expect("create configured store");
+        let mut store = SessionStore::with_paths(state_path, config_path, dir.path().join("panes"))
+            .expect("create configured store");
         assert_eq!(
             store.handle(CommandRequest::ReloadConfig),
             CommandResponse::ConfigReloaded
@@ -1079,7 +1108,8 @@ mod tests {
         .expect("write config");
 
         let mut store =
-            SessionStore::with_paths(state_path, config_path.clone()).expect("create store");
+            SessionStore::with_paths(state_path, config_path.clone(), dir.path().join("panes"))
+                .expect("create store");
         fs::write(&config_path, "[keys.leader]\ndetach = \"Ctrl-Magic\"\n").expect("overwrite");
 
         assert!(matches!(
