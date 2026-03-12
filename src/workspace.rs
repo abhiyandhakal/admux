@@ -4,9 +4,13 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-use crate::layout::SplitAxis;
+use crate::{
+    layout::{LayoutNode, SplitAxis},
+    pane::PaneId,
+    session::{PaneRuntime, Session, WindowRuntime},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceSpec {
@@ -53,6 +57,59 @@ struct RawWorkspaceManifest {
     workspace: Option<RawWorkspaceSettings>,
     #[serde(default)]
     windows: Vec<RawWindowSpec>,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkspaceManifestOut {
+    version: u16,
+    workspace: WorkspaceSettingsOut,
+    windows: Vec<WindowSpecOut>,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkspaceSettingsOut {
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cwd: Option<PathBuf>,
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    active_window: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct WindowSpecOut {
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cwd: Option<PathBuf>,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    active_pane: u64,
+    root: PaneSpecOut,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    splits: Vec<SplitSpecOut>,
+}
+
+#[derive(Debug, Serialize)]
+struct PaneSpecOut {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cwd: Option<PathBuf>,
+    command: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SplitSpecOut {
+    target: u64,
+    direction: SplitAxisOut,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cwd: Option<PathBuf>,
+    command: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum SplitAxisOut {
+    Horizontal,
+    Vertical,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -121,6 +178,27 @@ pub fn load_workspace(path: &Path) -> Result<WorkspaceLoad> {
     let manifest: RawWorkspaceManifest = toml::from_str(&raw)
         .with_context(|| format!("failed to parse workspace file {}", manifest_path.display()))?;
     resolve_workspace(manifest_path, manifest_dir, manifest)
+}
+
+pub fn save_workspace(session: &Session) -> Result<PathBuf> {
+    let session_dir = session.cwd.clone().ok_or_else(|| {
+        anyhow!(
+            "session {} does not have a workspace directory",
+            session.name
+        )
+    })?;
+    fs::create_dir_all(&session_dir).with_context(|| {
+        format!(
+            "failed to create session directory {}",
+            session_dir.display()
+        )
+    })?;
+    let path = session_dir.join("admux.toml");
+    let manifest = export_workspace(session)?;
+    let raw = toml::to_string_pretty(&manifest).context("failed to encode workspace manifest")?;
+    fs::write(&path, raw)
+        .with_context(|| format!("failed to write workspace manifest {}", path.display()))?;
+    Ok(path)
 }
 
 fn resolve_workspace(
@@ -220,6 +298,139 @@ fn resolve_workspace(
             windows,
         },
     })
+}
+
+fn export_workspace(session: &Session) -> Result<WorkspaceManifestOut> {
+    let session_cwd = session.cwd.clone().ok_or_else(|| {
+        anyhow!(
+            "session {} does not have a workspace directory",
+            session.name
+        )
+    })?;
+    let active_window = session
+        .window_order
+        .iter()
+        .position(|window_id| *window_id == session.active_window)
+        .unwrap_or(0);
+
+    let windows = session
+        .window_order
+        .iter()
+        .map(|window_id| {
+            let window = session
+                .windows
+                .get(window_id)
+                .ok_or_else(|| anyhow!("missing window {}", window_id.0))?;
+            export_window(window, &session_cwd)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(WorkspaceManifestOut {
+        version: 1,
+        workspace: WorkspaceSettingsOut {
+            name: session.name.clone(),
+            cwd: Some(PathBuf::from(".")),
+            active_window,
+        },
+        windows,
+    })
+}
+
+fn export_window(window: &WindowRuntime, session_cwd: &Path) -> Result<WindowSpecOut> {
+    let window_base = window.cwd.as_deref().unwrap_or(session_cwd);
+    let root_pane_id = origin_pane(&window.layout.root);
+    let root = export_pane(
+        window
+            .panes
+            .get(&root_pane_id)
+            .ok_or_else(|| anyhow!("missing root pane {}", root_pane_id.0))?,
+        window_base,
+    )?;
+    let mut splits = Vec::new();
+    collect_splits(&window.layout.root, window, window_base, &mut splits)?;
+    Ok(WindowSpecOut {
+        name: window.name.clone(),
+        cwd: relativize(window_base, session_cwd),
+        active_pane: window.layout.active.0,
+        root,
+        splits,
+    })
+}
+
+fn collect_splits(
+    node: &LayoutNode,
+    window: &WindowRuntime,
+    window_base: &Path,
+    splits: &mut Vec<SplitSpecOut>,
+) -> Result<PaneId> {
+    match node {
+        LayoutNode::Pane(pane_id) => Ok(*pane_id),
+        LayoutNode::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } => {
+            let target = origin_pane(first);
+            let new_pane = origin_pane(second);
+            let pane = window
+                .panes
+                .get(&new_pane)
+                .ok_or_else(|| anyhow!("missing pane {}", new_pane.0))?;
+            splits.push(SplitSpecOut {
+                target: target.0,
+                direction: match axis {
+                    SplitAxis::Horizontal => SplitAxisOut::Horizontal,
+                    SplitAxis::Vertical => SplitAxisOut::Vertical,
+                },
+                size: if *ratio == 500 {
+                    None
+                } else {
+                    Some((*ratio as f32) / 1000.0)
+                },
+                cwd: relativize(pane.cwd.as_deref().unwrap_or(window_base), window_base),
+                command: pane.command.clone(),
+            });
+            collect_splits(first, window, window_base, splits)?;
+            collect_splits(second, window, window_base, splits)?;
+            Ok(target)
+        }
+    }
+}
+
+fn export_pane(pane: &PaneRuntime, base: &Path) -> Result<PaneSpecOut> {
+    if pane.command.is_empty() {
+        bail!("pane {} does not have a stored command", pane.id.0);
+    }
+    Ok(PaneSpecOut {
+        cwd: relativize(pane.cwd.as_deref().unwrap_or(base), base),
+        command: pane.command.clone(),
+    })
+}
+
+fn origin_pane(node: &LayoutNode) -> PaneId {
+    match node {
+        LayoutNode::Pane(pane_id) => *pane_id,
+        LayoutNode::Split { first, .. } => origin_pane(first),
+    }
+}
+
+fn relativize(path: &Path, base: &Path) -> Option<PathBuf> {
+    if path == base {
+        return None;
+    }
+    path.strip_prefix(base)
+        .map(PathBuf::from)
+        .ok()
+        .or_else(|| Some(path.to_path_buf()))
+}
+
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 fn resolve_pane_spec(raw: RawPaneSpec, base: &Path) -> Result<WorkspacePaneSpec> {

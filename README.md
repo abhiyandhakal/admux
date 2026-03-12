@@ -27,6 +27,7 @@ Implemented now:
 - rename the active window from the interactive prompt
 - daemon autostart from `admux`
 - explicit workspace sharing with `admux up` and `admux.toml`
+- `admux save` to export a live session back into `admux.toml` in the session directory
 - session state stored in the daemon
 - PTY-backed command execution per pane
 - multi-pane `crossterm` rendering with internal pane dividers, joined junction glyphs, and per-pane cursors
@@ -65,6 +66,8 @@ Examples:
 cargo run --bin admux -- new --name work -- sh
 cargo run --bin admux -- up
 cargo run --bin admux -- up /path/to/admux.toml
+cargo run --bin admux -- save
+cargo run --bin admux -- save work
 cargo run --bin admux -- ls
 cargo run --bin admux -- split-pane work --vertical
 cargo run --bin admux -- list-panes work
@@ -146,6 +149,8 @@ Workspace notes:
 - `admux up --rebuild` kills and recreates the mapped workspace from the manifest
 - manifest `cwd` values are resolved relative to the manifest directory
 - pane commands are argv arrays; use `["sh", "-lc", "..."]` for shell strings
+- `admux save` writes `admux.toml` into the session directory, not the caller's current directory
+- `admux save` with no session argument uses the current `ADMUX_SESSION` when invoked inside `admux`, otherwise it falls back to the daemon's current session resolution
 
 Example:
 

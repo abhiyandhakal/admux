@@ -147,3 +147,90 @@ root = { command = ["sh", "-lc", "printf tests-ready; sleep 2"] }
     let _ = daemon.kill();
     let _ = daemon.wait();
 }
+
+#[test]
+fn save_writes_workspace_manifest_into_session_directory() {
+    let temp = tempdir().expect("tempdir");
+    let socket = temp.path().join("runtime").join("admux.sock");
+    let config = temp.path().join("config.toml");
+    let session_dir = temp.path().join("project");
+    let other_dir = temp.path().join("elsewhere");
+    fs::create_dir_all(&session_dir).expect("session dir");
+    fs::create_dir_all(&other_dir).expect("other dir");
+    fs::write(&config, "").expect("write config");
+    let mut daemon = spawn_daemon(&socket);
+
+    Command::new(env!("CARGO_BIN_EXE_admux"))
+        .env("ADMUX_SOCKET", &socket)
+        .env("ADMUX_CONFIG", &config)
+        .args([
+            "new",
+            "-d",
+            "--name",
+            "save-work",
+            "--cwd",
+            session_dir.to_str().expect("utf8 path"),
+            "--",
+            "sh",
+        ])
+        .assert()
+        .success();
+
+    Command::new(env!("CARGO_BIN_EXE_admux"))
+        .env("ADMUX_SOCKET", &socket)
+        .env("ADMUX_CONFIG", &config)
+        .args([
+            "split-pane",
+            "save-work",
+            "--vertical",
+            "--",
+            "sh",
+            "-lc",
+            "printf split; sleep 2",
+        ])
+        .assert()
+        .success();
+
+    Command::new(env!("CARGO_BIN_EXE_admux"))
+        .env("ADMUX_SOCKET", &socket)
+        .env("ADMUX_CONFIG", &config)
+        .args([
+            "new-window",
+            "save-work",
+            "--name",
+            "logs",
+            "--",
+            "sh",
+            "-lc",
+            "printf logs; sleep 2",
+        ])
+        .assert()
+        .success();
+
+    Command::new(env!("CARGO_BIN_EXE_admux"))
+        .current_dir(&other_dir)
+        .env("ADMUX_SOCKET", &socket)
+        .env("ADMUX_CONFIG", &config)
+        .args(["save", "save-work"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("saved save-work"));
+
+    let saved = session_dir.join("admux.toml");
+    assert!(
+        saved.exists(),
+        "workspace manifest was not written to session cwd"
+    );
+    assert!(
+        !other_dir.join("admux.toml").exists(),
+        "workspace manifest should not be written to current directory"
+    );
+
+    let raw = fs::read_to_string(saved).expect("read saved manifest");
+    assert!(raw.contains("name = \"save-work\""));
+    assert!(raw.contains("name = \"logs\""));
+    assert!(raw.contains("direction = \"vertical\""));
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+}

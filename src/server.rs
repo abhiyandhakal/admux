@@ -19,7 +19,7 @@ use crate::{
     pane::{PaneId, WindowId},
     persistence::{PersistedSession, PersistedState, load_state, save_state},
     session::Session,
-    workspace::{WorkspaceLoad, load_workspace},
+    workspace::{WorkspaceLoad, load_workspace, save_workspace},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,6 +169,7 @@ impl SessionStore {
                     message: error.to_string(),
                 },
             },
+            CommandRequest::SaveWorkspace { session } => self.save_workspace(session),
             CommandRequest::Attach { session } => {
                 let Some(session_name) = self.resolve_session(session) else {
                     return CommandResponse::Error {
@@ -986,6 +987,28 @@ impl SessionStore {
         Ok(())
     }
 
+    fn save_workspace(&self, session: Option<String>) -> CommandResponse {
+        let Some(session_name) = self.resolve_session(session) else {
+            return CommandResponse::Error {
+                message: "no sessions available".into(),
+            };
+        };
+        let Some(session) = self.sessions.get(&session_name) else {
+            return CommandResponse::Error {
+                message: format!("unknown session {session_name}"),
+            };
+        };
+        match save_workspace(session) {
+            Ok(path) => CommandResponse::WorkspaceSaved {
+                session: session_name,
+                path,
+            },
+            Err(error) => CommandResponse::Error {
+                message: error.to_string(),
+            },
+        }
+    }
+
     fn effective_command(&self, command: Vec<String>) -> Vec<String> {
         if command.is_empty() {
             self.config
@@ -1392,6 +1415,7 @@ mod tests {
                             crate::persistence::PersistedWindow {
                                 id: WindowId(1),
                                 name: "shell".into(),
+                                cwd: None,
                                 layout: crate::layout::LayoutTree::new(PaneId(0)),
                                 next_pane_id: 1,
                                 panes: [(
@@ -1399,6 +1423,8 @@ mod tests {
                                     crate::persistence::PersistedPane {
                                         id: PaneId(0),
                                         title: "shell".into(),
+                                        cwd: None,
+                                        command: vec!["sh".into()],
                                         socket_path: Some(dir.path().join("missing-helper.sock")),
                                     },
                                 )]

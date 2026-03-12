@@ -44,6 +44,8 @@ pub struct PersistedSession {
 pub struct PersistedWindow {
     pub id: WindowId,
     pub name: String,
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
     pub layout: crate::layout::LayoutTree,
     #[serde(default)]
     pub next_pane_id: u64,
@@ -54,6 +56,10 @@ pub struct PersistedWindow {
 pub struct PersistedPane {
     pub id: PaneId,
     pub title: String,
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
+    #[serde(default)]
+    pub command: Vec<String>,
     #[serde(default)]
     pub socket_path: Option<PathBuf>,
 }
@@ -84,6 +90,7 @@ impl PersistedWindow {
         Self {
             id: window.id,
             name: window.name.clone(),
+            cwd: window.cwd.clone(),
             layout: window.layout.clone(),
             next_pane_id: window.next_pane_id,
             panes: window
@@ -100,6 +107,8 @@ impl PersistedPane {
         Self {
             id: pane.id,
             title: pane.title.clone(),
+            cwd: pane.cwd.clone(),
+            command: pane.command.clone(),
             socket_path: Some(pane.process.socket_path().to_path_buf()),
         }
     }

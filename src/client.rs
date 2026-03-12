@@ -158,6 +158,9 @@ pub fn run(cli: AdmuxCli) -> Result<()> {
             }
             return Ok(());
         }
+        ClientCommand::Save(args) => CommandRequest::SaveWorkspace {
+            session: args.session.or_else(|| std::env::var("ADMUX_SESSION").ok()),
+        },
         ClientCommand::New(args) => {
             let requested_name = args.name.clone();
             let nested_switch = (!args.detach
@@ -474,6 +477,9 @@ fn print_response(paths: &RuntimePaths, response: CommandResponse) -> Result<()>
             } else {
                 println!("workspace {session} attached");
             }
+        }
+        CommandResponse::WorkspaceSaved { session, path } => {
+            println!("saved {session} {}", path.display());
         }
         CommandResponse::PaneSplit {
             session,

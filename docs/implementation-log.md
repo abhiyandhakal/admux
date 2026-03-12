@@ -418,3 +418,25 @@ This document records each completed implementation slice in detail, including t
   - workspace manifests support one session with ordered windows, root panes, sequential splits, per-pane commands, and cwd resolution relative to the manifest directory
 - Commit: pending current worktree
 - Status: complete
+
+## Workspace save slice
+
+- Goal: add `admux save` so a live session can be exported back into `admux.toml` in the session directory, not the caller's current directory.
+- Files changed:
+  - cli/protocol/client path: `src/cli.rs`, `src/ipc.rs`, `src/client.rs`, `src/server.rs`
+  - runtime metadata for export: `src/session.rs`, `src/persistence.rs`
+  - manifest export logic: `src/workspace.rs`
+  - docs: `README.md`, `docs/detailed-status.md`
+- Verification:
+  - `cargo test`
+  - direct built-binary smoke:
+    - create a session with `--cwd <project-dir>`
+    - split panes and create an extra window
+    - invoke `target/debug/admux save <session>` from a different directory
+    - confirm `<project-dir>/admux.toml` exists and the caller directory does not get a manifest
+- Observed result:
+  - `admux save` writes `admux.toml` into the session cwd
+  - the saved manifest contains the workspace name, windows, root panes, and split sequence from the live layout
+  - `admux save` with no session argument can use `ADMUX_SESSION` when called from inside `admux`
+- Commit: pending current worktree
+- Status: complete

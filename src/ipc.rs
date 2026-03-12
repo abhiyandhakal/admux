@@ -29,6 +29,9 @@ pub enum CommandRequest {
         rebuild: bool,
         switch_from: Option<SwitchSource>,
     },
+    SaveWorkspace {
+        session: Option<String>,
+    },
     Attach {
         session: Option<String>,
     },
@@ -148,6 +151,10 @@ pub enum CommandResponse {
     WorkspaceReady {
         session: String,
         created: bool,
+    },
+    WorkspaceSaved {
+        session: String,
+        path: PathBuf,
     },
     WindowCreated {
         session: String,

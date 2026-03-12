@@ -11,6 +11,7 @@ pub struct AdmuxCli {
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum ClientCommand {
     Up(UpArgs),
+    Save(SaveArgs),
     New(NewArgs),
     Attach(AttachArgs),
     Ls,
@@ -56,6 +57,11 @@ pub struct NewArgs {
     pub cwd: Option<PathBuf>,
     #[arg(trailing_var_arg = true)]
     pub command: Vec<String>,
+}
+
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+pub struct SaveArgs {
+    pub session: Option<String>,
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
@@ -230,6 +236,17 @@ mod tests {
                 detach: false,
                 rebuild: true,
                 path: Some(PathBuf::from("admux.toml")),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_save_command() {
+        let cli = AdmuxCli::parse_from(["admux", "save", "work"]);
+        assert_eq!(
+            cli.command,
+            ClientCommand::Save(SaveArgs {
+                session: Some("work".into()),
             })
         );
     }

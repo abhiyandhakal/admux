@@ -40,6 +40,7 @@ pub struct Session {
 pub struct WindowRuntime {
     pub id: WindowId,
     pub name: String,
+    pub cwd: Option<PathBuf>,
     pub layout: LayoutTree,
     pub next_pane_id: u64,
     pub panes: BTreeMap<PaneId, PaneRuntime>,
@@ -48,6 +49,8 @@ pub struct WindowRuntime {
 pub struct PaneRuntime {
     pub id: PaneId,
     pub title: String,
+    pub cwd: Option<PathBuf>,
+    pub command: Vec<String>,
     pub process: PaneProcess,
 }
 
@@ -143,6 +146,8 @@ impl Session {
                     PaneRuntime {
                         id: pane_id,
                         title: persisted_pane.title.clone(),
+                        cwd: persisted_pane.cwd.clone(),
+                        command: persisted_pane.command.clone(),
                         process: PaneProcess::connect(socket_path)?,
                     },
                 );
@@ -152,6 +157,7 @@ impl Session {
                 WindowRuntime {
                     id: persisted_window.id,
                     name: persisted_window.name.clone(),
+                    cwd: persisted_window.cwd.clone(),
                     layout: persisted_window.layout.clone(),
                     next_pane_id: persisted_window.next_pane_id,
                     panes,
@@ -487,6 +493,8 @@ impl Session {
         let pane = PaneRuntime {
             id: pane_id,
             title: default_window_name(&default_command, &self.window_defaults),
+            cwd: cwd.clone(),
+            command: default_command.clone(),
             process,
         };
         window.panes.insert(pane_id, pane);
@@ -770,6 +778,8 @@ impl WindowRuntime {
         let pane = PaneRuntime {
             id: pane_id,
             title: default_window_name(command, window_defaults),
+            cwd: cwd.clone(),
+            command: command.to_vec(),
             process,
         };
         let mut panes = BTreeMap::new();
@@ -778,6 +788,7 @@ impl WindowRuntime {
         Ok(Self {
             id,
             name,
+            cwd,
             layout: LayoutTree::new(pane_id),
             next_pane_id: 1,
             panes,
