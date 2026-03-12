@@ -314,11 +314,36 @@ fn apply_attached_session(
 }
 
 pub fn request_response(paths: &RuntimePaths, request: CommandRequest) -> Result<CommandResponse> {
+    ensure_protocol(paths)?;
     let response = with_connection(paths, |stream| {
         write_message(stream, &request)?;
         read_message(stream)
     })?;
     Ok(response)
+}
+
+fn ensure_protocol(paths: &RuntimePaths) -> Result<()> {
+    let response = with_connection(paths, |stream| {
+        write_message(
+            stream,
+            &CommandRequest::Hello {
+                version: crate::ipc::CURRENT_PROTOCOL_VERSION,
+            },
+        )?;
+        read_message(stream)
+    })?;
+
+    match response {
+        CommandResponse::HelloAck { version }
+            if version == crate::ipc::CURRENT_PROTOCOL_VERSION =>
+        {
+            Ok(())
+        }
+        CommandResponse::Error { message } => Err(anyhow!(message))
+            .context("daemon protocol check failed; restart admuxd so it matches this admux build"),
+        other => Err(anyhow!("unexpected hello response: {other:?}"))
+            .context("daemon protocol check failed; restart admuxd so it matches this admux build"),
+    }
 }
 
 fn split_pane_request(args: SplitPaneArgs) -> CommandRequest {
@@ -2308,6 +2333,10 @@ fn copy_text_to_buffer_and_clipboard(
 mod tests {
     use super::*;
     use crate::paths::RuntimePaths;
+    use std::{
+        io::{Read, Write},
+        os::unix::net::UnixListener,
+    };
 
     #[test]
     fn writes_and_reads_protocol_messages() {
@@ -2328,6 +2357,33 @@ mod tests {
             state_path: "/tmp/admux-test/state.json".into(),
         };
         assert!(paths.socket_path.ends_with("socket"));
+    }
+
+    #[test]
+    fn ensure_protocol_surfaces_mismatch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("socket");
+        let paths = RuntimePaths {
+            socket_path: socket_path.clone(),
+            config_path: dir.path().join("config.toml"),
+            state_path: dir.path().join("state.json"),
+        };
+        let listener = UnixListener::bind(&socket_path).expect("bind");
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut input = Vec::new();
+            stream.read_to_end(&mut input).expect("read hello");
+            let response = CommandResponse::Error {
+                message: "protocol mismatch: client=5, server=4".into(),
+            };
+            let encoded = serde_json::to_vec(&response).expect("encode response");
+            stream.write_all(&encoded).expect("write response");
+        });
+
+        let error = ensure_protocol(&paths).unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("protocol mismatch"));
+        assert!(rendered.contains("restart admuxd"));
     }
 
     #[test]
