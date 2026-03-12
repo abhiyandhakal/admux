@@ -13,6 +13,7 @@ The repository currently contains a working foundation with:
 - VT100-backed screen parsing and clipped pane rendering
 - a `crossterm` interactive attach loop with Unicode pane dividers, a status-row command prompt, a choose-tree session view, and tmux-style leader keys
 - a tmux-style one-row statusline with the session list on the left, a centered window list, and host/date/time on the right
+- `admux up` workspace manifests from a project-local `admux.toml`
 
 ## Current scope
 
@@ -25,6 +26,7 @@ Implemented now:
 - pane numbering is window-local and starts at `0` in each window
 - rename the active window from the interactive prompt
 - daemon autostart from `admux`
+- explicit workspace sharing with `admux up` and `admux.toml`
 - session state stored in the daemon
 - PTY-backed command execution per pane
 - multi-pane `crossterm` rendering with internal pane dividers, joined junction glyphs, and per-pane cursors
@@ -61,6 +63,8 @@ Examples:
 
 ```bash
 cargo run --bin admux -- new --name work -- sh
+cargo run --bin admux -- up
+cargo run --bin admux -- up /path/to/admux.toml
 cargo run --bin admux -- ls
 cargo run --bin admux -- split-pane work --vertical
 cargo run --bin admux -- list-panes work
@@ -106,6 +110,42 @@ cargo run --bin admuxd -- serve
 
 Configuration is read from `~/.config/admux/config.toml`.
 Persistent session metadata is stored in `~/.config/admux/state.json`.
+Project-local workspace manifests are read from `./admux.toml` when using `admux up`.
+
+Workspace manifest example:
+
+```toml
+version = 1
+
+[workspace]
+name = "shared-work"
+cwd = "."
+active_window = 0
+
+[[windows]]
+name = "editor"
+root = { cwd = ".", command = ["nvim"] }
+
+[[windows.splits]]
+target = 0
+direction = "vertical"
+size = 0.5
+cwd = "."
+command = ["cargo", "watch", "-x", "test"]
+
+[[windows]]
+name = "shell"
+root = { cwd = ".", command = ["zsh"] }
+```
+
+Workspace notes:
+
+- `admux up` looks only for `./admux.toml` when no path is given
+- one `admux.toml` defines one shared session
+- rerunning `admux up` attaches to the existing mapped workspace session instead of recreating it
+- `admux up --rebuild` kills and recreates the mapped workspace from the manifest
+- manifest `cwd` values are resolved relative to the manifest directory
+- pane commands are argv arrays; use `["sh", "-lc", "..."]` for shell strings
 
 Example:
 

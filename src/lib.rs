@@ -17,3 +17,4 @@ pub mod server;
 pub mod session;
 pub mod test_support;
 pub mod window;
+pub mod workspace;

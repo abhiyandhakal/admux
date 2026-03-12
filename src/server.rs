@@ -19,6 +19,7 @@ use crate::{
     pane::{PaneId, WindowId},
     persistence::{PersistedSession, PersistedState, load_state, save_state},
     session::Session,
+    workspace::{WorkspaceLoad, load_workspace},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +35,7 @@ pub struct SessionStore {
     state_path: Option<std::path::PathBuf>,
     helper_dir: PathBuf,
     pending_switches: BTreeMap<String, String>,
+    workspace_mappings: BTreeMap<String, String>,
     last_session: Option<String>,
     next_window_id: u64,
     config_path: Option<std::path::PathBuf>,
@@ -49,6 +51,7 @@ impl Default for SessionStore {
             state_path: None,
             helper_dir: PathBuf::from("/tmp/admux-helpers"),
             pending_switches: BTreeMap::new(),
+            workspace_mappings: BTreeMap::new(),
             last_session: None,
             next_window_id: 0,
             config_path: None,
@@ -75,6 +78,7 @@ impl SessionStore {
         let persisted = load_state(&state_path)?;
         let mut store = Self {
             buffers: BufferStore::from_persisted(persisted.buffers),
+            workspace_mappings: persisted.workspaces,
             persisted_sessions: persisted.sessions,
             state_path: Some(state_path),
             helper_dir,
@@ -123,6 +127,7 @@ impl SessionStore {
                 let window_id = self.next_window();
                 match Session::new(
                     name.clone(),
+                    None,
                     cwd,
                     command,
                     window_id,
@@ -154,6 +159,16 @@ impl SessionStore {
                     },
                 }
             }
+            CommandRequest::UpWorkspace {
+                manifest_path,
+                rebuild,
+                switch_from,
+            } => match load_workspace(&manifest_path) {
+                Ok(workspace) => self.up_workspace(workspace, rebuild, switch_from),
+                Err(error) => CommandResponse::Error {
+                    message: error.to_string(),
+                },
+            },
             CommandRequest::Attach { session } => {
                 let Some(session_name) = self.resolve_session(session) else {
                     return CommandResponse::Error {
@@ -659,6 +674,7 @@ impl SessionStore {
             last_session: self.last_session.clone(),
             next_window_id: self.next_window_id,
             buffers: self.buffers.snapshot(),
+            workspaces: self.workspace_mappings.clone(),
             sessions: self.persisted_sessions.clone(),
         };
         let _ = save_state(path, &state);
@@ -838,6 +854,136 @@ impl SessionStore {
                 message: format!("unknown session {}", target.session),
             },
         }
+    }
+
+    fn up_workspace(
+        &mut self,
+        workspace: WorkspaceLoad,
+        rebuild: bool,
+        switch_from: Option<crate::ipc::SwitchSource>,
+    ) -> CommandResponse {
+        let manifest_key = workspace.manifest_key.clone();
+        if rebuild && let Some(existing) = self.workspace_mappings.get(&manifest_key).cloned() {
+            if let Some(session) = self.sessions.remove(&existing) {
+                let _ = session.kill();
+            }
+            self.persisted_sessions.remove(&existing);
+        }
+
+        if let Some(existing) = self.workspace_mappings.get(&manifest_key).cloned()
+            && self.sessions.get(&existing).is_some_and(|session| {
+                session.workspace_manifest.as_deref() == Some(manifest_key.as_str())
+            })
+        {
+            self.last_session = Some(existing.clone());
+            return CommandResponse::WorkspaceReady {
+                session: existing,
+                created: false,
+            };
+        }
+
+        let session_name = workspace.spec.name.clone();
+        if self.sessions.contains_key(&session_name)
+            || self.persisted_sessions.contains_key(&session_name)
+        {
+            return CommandResponse::Error {
+                message: format!(
+                    "session {session_name} already exists; set [workspace].name to a unique value or use --rebuild"
+                ),
+            };
+        }
+
+        match self.create_workspace_session(&workspace) {
+            Ok(()) => {
+                self.workspace_mappings
+                    .insert(manifest_key.clone(), session_name.clone());
+                self.last_session = Some(session_name.clone());
+                if let Some(source) = switch_from
+                    && self.sessions.get(&source.session).is_some_and(|session| {
+                        session.contains_window_pane(
+                            WindowId(source.window_id),
+                            PaneId(source.pane_id),
+                        )
+                    })
+                {
+                    self.pending_switches
+                        .insert(source.session, session_name.clone());
+                }
+                CommandResponse::WorkspaceReady {
+                    session: session_name,
+                    created: true,
+                }
+            }
+            Err(error) => CommandResponse::Error {
+                message: error.to_string(),
+            },
+        }
+    }
+
+    fn create_workspace_session(&mut self, workspace: &WorkspaceLoad) -> Result<()> {
+        let first_window_id = self.next_window();
+        let first_window =
+            workspace.spec.windows.first().ok_or_else(|| {
+                anyhow::anyhow!("workspace manifest must define at least one window")
+            })?;
+        let mut session = Session::new(
+            workspace.spec.name.clone(),
+            Some(workspace.manifest_key.clone()),
+            Some(first_window.root.cwd.clone()),
+            first_window.root.command.clone(),
+            first_window_id,
+            self.config.behavior.default_shell.clone(),
+            self.config.behavior.scrollback_lines,
+            self.config.defaults.window.clone(),
+            self.helper_dir.clone(),
+        )?;
+        session.cwd = Some(workspace.spec.cwd.clone());
+        session.rename_active_window(first_window.name.clone())?;
+        self.apply_workspace_window(&mut session, first_window_id, first_window)?;
+
+        for window in workspace.spec.windows.iter().skip(1) {
+            let window_id = self.next_window();
+            session.new_window_with_cwd(
+                window_id,
+                Some(window.name.clone()),
+                Some(window.cwd.clone()),
+                &window.root.command,
+            )?;
+            session.select_window(window_id)?;
+            self.apply_workspace_window(&mut session, window_id, window)?;
+        }
+
+        if let Some(window_id) = session
+            .window_order
+            .get(workspace.spec.active_window)
+            .copied()
+        {
+            session.select_window(window_id)?;
+        }
+
+        self.sessions.insert(session.name.clone(), session);
+        Ok(())
+    }
+
+    fn apply_workspace_window(
+        &self,
+        session: &mut Session,
+        window_id: WindowId,
+        window: &crate::workspace::WorkspaceWindowSpec,
+    ) -> Result<()> {
+        session.select_window(window_id)?;
+        for split in &window.splits {
+            session.split_pane_in_window(
+                window_id,
+                Some(PaneId(split.target)),
+                split.direction,
+                split.ratio,
+                Some(split.pane.cwd.clone()),
+                &split.pane.command,
+            )?;
+        }
+        session.select_pane(Some(window_id), PaneId(window.active_pane))?;
+        Ok(())
     }
 
     fn effective_command(&self, command: Vec<String>) -> Vec<String> {
@@ -1228,10 +1374,12 @@ mod tests {
                 last_session: Some("ghost".into()),
                 next_window_id: 1,
                 buffers: Vec::new(),
+                workspaces: BTreeMap::new(),
                 sessions: [(
                     "ghost".into(),
                     PersistedSession {
                         name: "ghost".into(),
+                        workspace_manifest: None,
                         cwd: None,
                         command: vec!["sh".into()],
                         rows: 24,
@@ -1269,9 +1417,8 @@ mod tests {
         )
         .expect("write state");
 
-        let mut store =
-            SessionStore::with_paths(state_path, config_path, dir.path().join("panes"))
-                .expect("start store");
+        let mut store = SessionStore::with_paths(state_path, config_path, dir.path().join("panes"))
+            .expect("start store");
 
         assert_eq!(
             store.handle(CommandRequest::ListSessions),

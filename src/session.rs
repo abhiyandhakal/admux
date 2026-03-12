@@ -22,6 +22,7 @@ pub struct SessionName(pub String);
 
 pub struct Session {
     pub name: String,
+    pub workspace_manifest: Option<String>,
     pub cwd: Option<PathBuf>,
     pub command: Vec<String>,
     pub rows: u16,
@@ -68,6 +69,7 @@ pub struct KillResult {
 impl Session {
     pub fn new(
         name: String,
+        workspace_manifest: Option<String>,
         cwd: Option<PathBuf>,
         command: Vec<String>,
         window_id: WindowId,
@@ -95,6 +97,7 @@ impl Session {
 
         let mut session = Self {
             name,
+            workspace_manifest,
             cwd,
             command,
             rows: 24,
@@ -158,6 +161,7 @@ impl Session {
 
         let mut session = Self {
             name: persisted.name.clone(),
+            workspace_manifest: persisted.workspace_manifest.clone(),
             cwd: persisted.cwd.clone(),
             command: persisted.command.clone(),
             rows: persisted.rows,
@@ -449,21 +453,33 @@ impl Session {
         command: &[String],
     ) -> Result<SplitResult> {
         let cwd = self.cwd.clone();
+        self.split_pane_in_window(self.active_window, None, axis, 500, cwd, command)
+    }
+
+    pub fn split_pane_in_window(
+        &mut self,
+        window_id: WindowId,
+        target_pane: Option<PaneId>,
+        axis: SplitAxis,
+        ratio: u16,
+        cwd: Option<PathBuf>,
+        command: &[String],
+    ) -> Result<SplitResult> {
         let default_command = if command.is_empty() {
             self.command.clone()
         } else {
             command.to_vec()
         };
-        let active_window = self.active_window;
         let window = self
             .windows
-            .get_mut(&active_window)
+            .get_mut(&window_id)
             .ok_or_else(|| anyhow!("unknown window"))?;
+        let target_pane = target_pane.unwrap_or(window.layout.active);
         let pane_id = window.allocate_pane_id();
         let process = PaneProcess::spawn(
             &default_command,
             cwd.as_deref(),
-            Some((&self.name, active_window, pane_id)),
+            Some((&self.name, window_id, pane_id)),
             self.default_shell.as_deref(),
             self.scrollback_lines,
             &self.helper_dir,
@@ -474,18 +490,27 @@ impl Session {
             process,
         };
         window.panes.insert(pane_id, pane);
-        window.layout.split_active(axis, pane_id);
+        if !window.layout.split_pane(target_pane, axis, ratio, pane_id) {
+            return Err(anyhow!("unknown pane"));
+        }
         self.sync_pane_sizes()?;
-        Ok(SplitResult {
-            window_id: active_window,
-            pane_id,
-        })
+        Ok(SplitResult { window_id, pane_id })
     }
 
     pub fn new_window(
         &mut self,
         window_id: WindowId,
         name: Option<String>,
+        command: &[String],
+    ) -> Result<WindowCreation> {
+        self.new_window_with_cwd(window_id, name, self.cwd.clone(), command)
+    }
+
+    pub fn new_window_with_cwd(
+        &mut self,
+        window_id: WindowId,
+        name: Option<String>,
+        cwd: Option<PathBuf>,
         command: &[String],
     ) -> Result<WindowCreation> {
         let command = if command.is_empty() {
@@ -496,7 +521,7 @@ impl Session {
         let window = WindowRuntime::new(
             window_id,
             name.unwrap_or_else(|| default_window_name(&command, &self.window_defaults)),
-            self.cwd.clone(),
+            cwd,
             &command,
             &self.name,
             self.default_shell.as_deref(),
@@ -831,6 +856,7 @@ mod tests {
         let mut session = Session::new(
             "work".into(),
             None,
+            None,
             vec!["sh".into()],
             WindowId(1),
             None,
@@ -877,6 +903,7 @@ mod tests {
         let mut session = Session::new(
             "work".into(),
             None,
+            None,
             vec!["sh".into()],
             WindowId(1),
             None,
@@ -908,6 +935,7 @@ mod tests {
         let helper_dir = tempdir().expect("tempdir");
         let mut session = Session::new(
             "work".into(),
+            None,
             None,
             vec!["sh".into()],
             WindowId(1),

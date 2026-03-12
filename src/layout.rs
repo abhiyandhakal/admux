@@ -61,6 +61,21 @@ impl LayoutTree {
         self.active = new_pane;
     }
 
+    pub fn split_pane(
+        &mut self,
+        target: PaneId,
+        axis: SplitAxis,
+        ratio: u16,
+        new_pane: PaneId,
+    ) -> bool {
+        if !self.root.contains(target) {
+            return false;
+        }
+        self.root = self.root.clone().split(target, axis, ratio, new_pane);
+        self.active = new_pane;
+        true
+    }
+
     pub fn panes(&self) -> Vec<PaneId> {
         let mut panes = Vec::new();
         self.root.collect_panes(&mut panes);

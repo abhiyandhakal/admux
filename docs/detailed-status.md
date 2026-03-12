@@ -92,6 +92,7 @@
 - statusline layout, tmux current/last markers, and truncation-priority tests
 - binary smoke tests that execute `admux` and `admuxd`
 - direct binary smoke for split-pane and new-window command flow
+- direct binary and integration coverage for `admux up` workspace manifests
 - direct binary smoke for nested mixed-axis splits
 - direct binary smoke for window-local pane numbering
 - prompt command parser and completion tests
@@ -167,6 +168,7 @@ Observed result:
 - `src/cli.rs`: clap CLI definitions
 - `src/client.rs`: client request flow, autostart, attach behavior
 - `src/commands.rs`: tmux-style interactive command parsing and completion
+- `src/workspace.rs`: project-local `admux.toml` parsing and workspace bootstrap planning
 - `src/buffer.rs`: daemon-owned paste buffer store
 - `src/config.rs`: TOML config types and loaders
 - `src/ipc.rs`: request/response protocol

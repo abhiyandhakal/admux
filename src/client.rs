@@ -125,6 +125,39 @@ pub fn run_from_env() -> Result<()> {
 pub fn run(cli: AdmuxCli) -> Result<()> {
     let paths = RuntimePaths::resolve();
     let request = match cli.command {
+        ClientCommand::Up(args) => {
+            let manifest_path = resolve_workspace_manifest_path(args.path.as_deref())?;
+            let nested_switch = (!args.detach
+                && io::stdout().is_terminal()
+                && std::env::var_os("ADMUX_NONINTERACTIVE").is_none())
+            .then(nested_switch_source)
+            .flatten();
+            let response = request_response(
+                &paths,
+                CommandRequest::UpWorkspace {
+                    manifest_path,
+                    rebuild: args.rebuild,
+                    switch_from: nested_switch.clone(),
+                },
+            )?;
+            let session = match &response {
+                CommandResponse::WorkspaceReady { session, .. } => Some(session.clone()),
+                _ => None,
+            };
+            if nested_switch.is_none() {
+                print_response(&paths, response)?;
+            }
+            if !args.detach
+                && io::stdout().is_terminal()
+                && std::env::var_os("ADMUX_NONINTERACTIVE").is_none()
+                && nested_switch.is_none()
+            {
+                let session = session
+                    .ok_or_else(|| anyhow!("workspace response did not include a session name"))?;
+                attach_interactive(&paths, &session)?;
+            }
+            return Ok(());
+        }
         ClientCommand::New(args) => {
             let requested_name = args.name.clone();
             let nested_switch = (!args.detach
@@ -251,6 +284,17 @@ fn nested_switch_source() -> Option<SwitchSource> {
         window_id,
         pane_id,
     })
+}
+
+fn resolve_workspace_manifest_path(path: Option<&std::path::Path>) -> Result<std::path::PathBuf> {
+    let path = match path {
+        Some(path) => path.to_path_buf(),
+        None => std::env::current_dir()
+            .context("failed to resolve current directory")?
+            .join("admux.toml"),
+    };
+    path.canonicalize()
+        .with_context(|| format!("failed to resolve workspace manifest {}", path.display()))
 }
 
 fn apply_attached_session(
@@ -424,6 +468,13 @@ fn print_response(paths: &RuntimePaths, response: CommandResponse) -> Result<()>
         } => {
             println!("created {session}:{window_id} pane {pane_id}");
         }
+        CommandResponse::WorkspaceReady { session, created } => {
+            if created {
+                println!("workspace {session} ready");
+            } else {
+                println!("workspace {session} attached");
+            }
+        }
         CommandResponse::PaneSplit {
             session,
             window_id,
@@ -557,13 +608,7 @@ fn run_attach_loop(
     let mut status_message: Option<String> = None;
     let mut prompt_history = Vec::<String>::new();
     let mut overlay = OverlayState::None;
-    let mut snapshot = fetch_attach_snapshot(
-        paths,
-        &mut current_session,
-        &mut last_size,
-        80,
-        24,
-    )?;
+    let mut snapshot = fetch_attach_snapshot(paths, &mut current_session, &mut last_size, 80, 24)?;
 
     loop {
         let (width, height) = terminal::size().context("failed to read terminal size")?;
@@ -579,13 +624,8 @@ fn run_attach_loop(
                 },
             )?;
             last_size = (rows, cols);
-            snapshot = fetch_attach_snapshot(
-                paths,
-                &mut current_session,
-                &mut last_size,
-                width,
-                height,
-            )?;
+            snapshot =
+                fetch_attach_snapshot(paths, &mut current_session, &mut last_size, width, height)?;
         }
 
         let render_selection = copy_mode
@@ -686,13 +726,8 @@ fn run_attach_loop(
         status_message = None;
 
         if !event::poll(ATTACH_FRAME_INTERVAL).context("failed to poll terminal events")? {
-            snapshot = fetch_attach_snapshot(
-                paths,
-                &mut current_session,
-                &mut last_size,
-                width,
-                height,
-            )?;
+            snapshot =
+                fetch_attach_snapshot(paths, &mut current_session, &mut last_size, width, height)?;
             continue;
         }
 
@@ -1084,13 +1119,8 @@ fn run_attach_loop(
         }
 
         if needs_refresh {
-            snapshot = fetch_attach_snapshot(
-                paths,
-                &mut current_session,
-                &mut last_size,
-                width,
-                height,
-            )?;
+            snapshot =
+                fetch_attach_snapshot(paths, &mut current_session, &mut last_size, width, height)?;
         }
     }
     Ok(())

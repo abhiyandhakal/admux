@@ -19,12 +19,16 @@ pub struct PersistedState {
     pub next_window_id: u64,
     #[serde(default)]
     pub buffers: Vec<PasteBuffer>,
+    #[serde(default)]
+    pub workspaces: BTreeMap<String, String>,
     pub sessions: BTreeMap<String, PersistedSession>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedSession {
     pub name: String,
+    #[serde(default)]
+    pub workspace_manifest: Option<String>,
     pub cwd: Option<PathBuf>,
     pub command: Vec<String>,
     pub rows: u16,
@@ -58,6 +62,7 @@ impl PersistedSession {
     pub fn from_live(session: &Session) -> Self {
         Self {
             name: session.name.clone(),
+            workspace_manifest: session.workspace_manifest.clone(),
             cwd: session.cwd.clone(),
             command: session.command.clone(),
             rows: session.rows,
@@ -142,12 +147,14 @@ mod tests {
                 explicit_name: false,
                 created_seq: 1,
             }],
+            workspaces: BTreeMap::from([("/tmp/project/admux.toml".into(), "work".into())]),
             sessions: BTreeMap::new(),
         };
         state.sessions.insert(
             "work".into(),
             PersistedSession {
                 name: "work".into(),
+                workspace_manifest: None,
                 cwd: None,
                 command: vec!["sh".into()],
                 rows: 24,

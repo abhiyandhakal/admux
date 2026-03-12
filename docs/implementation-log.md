@@ -394,3 +394,27 @@ This document records each completed implementation slice in detail, including t
   - choose-buffer provides a first chooser-backed buffer workflow with preview and paste/delete actions
 - Commit: pending current worktree
 - Status: complete
+
+## Workspace manifest slice
+
+- Goal: add project-local `admux.toml` manifests and `admux up` so shared workspaces can be created and reattached from a checked-in file instead of treating the feature as session restore.
+- Files changed:
+  - workspace parsing and resolution: `src/workspace.rs`, `src/lib.rs`
+  - daemon/client command path: `src/cli.rs`, `src/ipc.rs`, `src/client.rs`, `src/server.rs`
+  - runtime/persistence integration: `src/session.rs`, `src/layout.rs`, `src/persistence.rs`
+  - docs: `README.md`, `docs/detailed-status.md`
+- Verification:
+  - `cargo test`
+  - direct built-binary smoke:
+    - create `./admux.toml` with two windows
+    - `target/debug/admuxd serve --socket <temp-socket> --state <temp-state> --config <temp-config>`
+    - `ADMUX_SOCKET=<temp-socket> ADMUX_STATE=<temp-state> ADMUX_CONFIG=<temp-config> target/debug/admux up`
+    - `ADMUX_SOCKET=<temp-socket> ADMUX_STATE=<temp-state> ADMUX_CONFIG=<temp-config> target/debug/admux list-windows <workspace-name>`
+    - rerun `ADMUX_SOCKET=<temp-socket> ADMUX_STATE=<temp-state> ADMUX_CONFIG=<temp-config> target/debug/admux up`
+- Observed result:
+  - `admux up` now creates one shared session from `./admux.toml` or an explicit manifest path
+  - rerunning `admux up` attaches to the existing mapped workspace instead of recreating it
+  - `admux up --rebuild` can discard and recreate the mapped workspace from the manifest
+  - workspace manifests support one session with ordered windows, root panes, sequential splits, per-pane commands, and cwd resolution relative to the manifest directory
+- Commit: pending current worktree
+- Status: complete

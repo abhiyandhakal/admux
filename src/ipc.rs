@@ -24,6 +24,11 @@ pub enum CommandRequest {
         command: Vec<String>,
         switch_from: Option<SwitchSource>,
     },
+    UpWorkspace {
+        manifest_path: PathBuf,
+        rebuild: bool,
+        switch_from: Option<SwitchSource>,
+    },
     Attach {
         session: Option<String>,
     },
@@ -139,6 +144,10 @@ pub enum CommandResponse {
     SessionCreated {
         session: String,
         pane_id: u64,
+    },
+    WorkspaceReady {
+        session: String,
+        created: bool,
     },
     WindowCreated {
         session: String,

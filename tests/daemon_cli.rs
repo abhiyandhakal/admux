@@ -2,6 +2,7 @@ use admux::test_support::wait_for_path;
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::{
+    fs,
     path::Path,
     process::{Child, Command as StdCommand, Stdio},
     thread,
@@ -84,6 +85,64 @@ fn daemon_backed_cli_can_manage_sessions() {
         .assert()
         .success()
         .stdout(predicate::str::contains("killed work"));
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+}
+
+#[test]
+fn daemon_backed_cli_can_bootstrap_workspace_manifest() {
+    let temp = tempdir().expect("tempdir");
+    let socket = temp.path().join("runtime").join("admux.sock");
+    let config = temp.path().join("config.toml");
+    let workspace = temp.path().join("admux.toml");
+    fs::write(&config, "").expect("write config");
+    fs::write(
+        &workspace,
+        r#"
+version = 1
+
+[workspace]
+name = "shared-work"
+
+[[windows]]
+name = "editor"
+root = { command = ["sh", "-lc", "printf editor-ready; sleep 2"] }
+
+[[windows]]
+name = "tests"
+root = { command = ["sh", "-lc", "printf tests-ready; sleep 2"] }
+"#,
+    )
+    .expect("write workspace");
+    let mut daemon = spawn_daemon(&socket);
+
+    Command::new(env!("CARGO_BIN_EXE_admux"))
+        .current_dir(temp.path())
+        .env("ADMUX_SOCKET", &socket)
+        .env("ADMUX_CONFIG", &config)
+        .arg("up")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("workspace shared-work ready"));
+
+    Command::new(env!("CARGO_BIN_EXE_admux"))
+        .env("ADMUX_SOCKET", &socket)
+        .env("ADMUX_CONFIG", &config)
+        .args(["list-windows", "shared-work"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("editor"))
+        .stdout(predicate::str::contains("tests"));
+
+    Command::new(env!("CARGO_BIN_EXE_admux"))
+        .current_dir(temp.path())
+        .env("ADMUX_SOCKET", &socket)
+        .env("ADMUX_CONFIG", &config)
+        .arg("up")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("workspace shared-work attached"));
 
     let _ = daemon.kill();
     let _ = daemon.wait();

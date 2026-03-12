@@ -10,6 +10,7 @@ pub struct AdmuxCli {
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum ClientCommand {
+    Up(UpArgs),
     New(NewArgs),
     Attach(AttachArgs),
     Ls,
@@ -34,6 +35,15 @@ pub enum ClientCommand {
     PrevWindow(SessionArgs),
     ResizePane(ResizePaneArgs),
     ReloadConfig,
+}
+
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+pub struct UpArgs {
+    #[arg(short = 'd', long)]
+    pub detach: bool,
+    #[arg(long)]
+    pub rebuild: bool,
+    pub path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
@@ -207,6 +217,19 @@ mod tests {
                 name: Some("work".into()),
                 cwd: None,
                 command: vec!["bash".into()],
+            })
+        );
+    }
+
+    #[test]
+    fn parses_up_command() {
+        let cli = AdmuxCli::parse_from(["admux", "up", "--rebuild", "admux.toml"]);
+        assert_eq!(
+            cli.command,
+            ClientCommand::Up(UpArgs {
+                detach: false,
+                rebuild: true,
+                path: Some(PathBuf::from("admux.toml")),
             })
         );
     }
