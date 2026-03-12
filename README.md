@@ -64,6 +64,7 @@ Examples:
 
 ```bash
 cargo run --bin admux -- new --name work -- sh
+cargo run --bin admux -- new -d /path/to/project
 cargo run --bin admux -- up
 cargo run --bin admux -- up /path/to/admux.toml
 cargo run --bin admux -- save
@@ -102,6 +103,12 @@ Pane target notes:
 - pane targets use `session:window.pane`
 - `pane` is local to that window, not global across the session
 - each new window starts its pane numbering at `0`
+
+`admux new` cwd notes:
+
+- without `--cwd`, new sessions now start in your current shell directory
+- `admux new -d /path/to/project` treats the lone directory argument as the session cwd
+- if you want to pass a command, keep using `--`, for example `admux new -- sh`
 
 Run the daemon explicitly:
 

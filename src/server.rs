@@ -1015,8 +1015,10 @@ impl SessionStore {
                 .behavior
                 .default_shell
                 .as_ref()
-                .map(|shell| vec![shell.clone()])
-                .unwrap_or_default()
+                .cloned()
+                .or_else(|| std::env::var("SHELL").ok())
+                .map(|shell| vec![shell])
+                .unwrap_or_else(|| vec!["/bin/sh".into()])
         } else {
             command
         }
@@ -1530,5 +1532,12 @@ mod tests {
             created,
             CommandResponse::SessionCreated { ref session, .. } if session == "work-1"
         ));
+    }
+
+    #[test]
+    fn effective_command_falls_back_to_shell_when_empty() {
+        let store = SessionStore::default();
+        let command = store.effective_command(Vec::new());
+        assert!(!command.is_empty());
     }
 }

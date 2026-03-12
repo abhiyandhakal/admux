@@ -2,6 +2,7 @@ use std::{
     collections::BTreeSet,
     io::{self, IsTerminal, Read, Write},
     os::unix::net::UnixStream,
+    path::PathBuf,
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
@@ -162,6 +163,7 @@ pub fn run(cli: AdmuxCli) -> Result<()> {
             session: args.session.or_else(|| std::env::var("ADMUX_SESSION").ok()),
         },
         ClientCommand::New(args) => {
+            let args = normalize_new_args(args)?;
             let requested_name = args.name.clone();
             let nested_switch = (!args.detach
                 && io::stdout().is_terminal()
@@ -298,6 +300,18 @@ fn resolve_workspace_manifest_path(path: Option<&std::path::Path>) -> Result<std
     };
     path.canonicalize()
         .with_context(|| format!("failed to resolve workspace manifest {}", path.display()))
+}
+
+fn normalize_new_args(mut args: crate::cli::NewArgs) -> Result<crate::cli::NewArgs> {
+    if args.cwd.is_none() && args.command.len() == 1 && PathBuf::from(&args.command[0]).is_dir() {
+        args.cwd = Some(PathBuf::from(args.command.remove(0)));
+    }
+
+    if args.cwd.is_none() {
+        args.cwd = Some(std::env::current_dir().context("failed to resolve current directory")?);
+    }
+
+    Ok(args)
 }
 
 fn apply_attached_session(
@@ -2337,6 +2351,7 @@ mod tests {
         io::{Read, Write},
         os::unix::net::UnixListener,
     };
+    use tempfile::tempdir;
 
     #[test]
     fn writes_and_reads_protocol_messages() {
@@ -2384,6 +2399,38 @@ mod tests {
         let rendered = format!("{error:#}");
         assert!(rendered.contains("protocol mismatch"));
         assert!(rendered.contains("restart admuxd"));
+    }
+
+    #[test]
+    fn normalize_new_args_defaults_to_current_directory() {
+        let args = crate::cli::NewArgs {
+            detach: true,
+            name: Some("work".into()),
+            cwd: None,
+            command: Vec::new(),
+        };
+
+        let normalized = normalize_new_args(args).expect("normalize");
+        assert_eq!(
+            normalized.cwd,
+            Some(std::env::current_dir().expect("current dir"))
+        );
+        assert!(normalized.command.is_empty());
+    }
+
+    #[test]
+    fn normalize_new_args_treats_single_directory_argument_as_cwd() {
+        let dir = tempdir().expect("tempdir");
+        let args = crate::cli::NewArgs {
+            detach: true,
+            name: Some("work".into()),
+            cwd: None,
+            command: vec![dir.path().display().to_string()],
+        };
+
+        let normalized = normalize_new_args(args).expect("normalize");
+        assert_eq!(normalized.cwd, Some(dir.path().to_path_buf()));
+        assert!(normalized.command.is_empty());
     }
 
     #[test]

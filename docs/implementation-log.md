@@ -440,3 +440,22 @@ This document records each completed implementation slice in detail, including t
   - `admux save` with no session argument can use `ADMUX_SESSION` when called from inside `admux`
 - Commit: pending current worktree
 - Status: complete
+
+## New-session cwd slice
+
+- Goal: make `admux new` use the caller's current directory by default, and treat a lone directory argument as session cwd shorthand.
+- Files changed:
+  - client normalization and tests: `src/client.rs`
+  - daemon default command fallback: `src/server.rs`
+  - docs: `README.md`
+- Verification:
+  - `cargo test`
+  - direct built-binary smoke:
+    - run `admux new -d --name current-cwd` from one directory and verify `admux save current-cwd` writes `admux.toml` there
+    - run `admux new -d --name explicit-cwd /path/to/project` and verify `admux save explicit-cwd` writes there
+- Observed result:
+  - `admux new` now defaults session cwd to the current shell directory when `--cwd` is not provided
+  - `admux new -d /path/to/project` is accepted as cwd shorthand
+  - sessions created without an explicit command still keep a real shell command for later workspace export
+- Commit: pending current worktree
+- Status: complete
