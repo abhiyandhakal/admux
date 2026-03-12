@@ -269,6 +269,63 @@ impl Session {
         })
     }
 
+    pub fn render_session_preview(&self, size: Rect) -> Option<RenderSnapshot> {
+        let mut panes = Vec::new();
+        let mut dividers = Vec::new();
+        let mut offset_y = 0u16;
+        let window_count = self.window_order.len().max(1) as u16;
+        let band_height = size.height.max(window_count) / window_count;
+
+        for window_id in &self.window_order {
+            let window = self.windows.get(window_id)?;
+            let remaining_height = size.height.saturating_sub(offset_y);
+            if remaining_height == 0 {
+                break;
+            }
+            let window_height = if *window_id == *self.window_order.last().unwrap_or(window_id) {
+                remaining_height
+            } else {
+                band_height.max(1).min(remaining_height)
+            };
+            let window_rect = Rect {
+                x: 0,
+                y: offset_y,
+                width: size.width,
+                height: window_height,
+            };
+            let rects = window.layout.pane_rects(window_rect);
+            for pane_id in window.layout.panes() {
+                let pane = window.panes.get(&pane_id)?;
+                let rect = *rects.get(&pane_id)?;
+                let render = pane.process.render(rect.width, rect.height).ok()?;
+                let cursor = clamp_cursor(rect, render.cursor_row, render.cursor_col);
+                panes.push(PaneRender {
+                    pane_id: pane.id.0,
+                    title: pane.title.clone(),
+                    rect,
+                    focused: pane_id == window.layout.active && *window_id == self.active_window,
+                    rows_plain: render.rows_plain,
+                    rows_formatted: render.rows_formatted,
+                    cursor,
+                });
+            }
+            dividers.extend(window.layout.divider_cells(window_rect));
+            offset_y = offset_y.saturating_add(window_height);
+        }
+
+        Some(RenderSnapshot {
+            sessions: Vec::new(),
+            windows: self.list_windows(),
+            panes,
+            dividers,
+            active_window_id: self.active_window.0,
+            active_pane_id: self
+                .active_window()
+                .map(|window| window.layout.active.0)
+                .unwrap_or(0),
+        })
+    }
+
     pub fn list_windows(&self) -> Vec<WindowSummary> {
         self.window_order
             .iter()

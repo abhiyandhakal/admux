@@ -491,6 +491,9 @@ fn print_response(paths: &RuntimePaths, response: CommandResponse) -> Result<()>
             println!("saved {name} {}", path.display());
         }
         CommandResponse::BufferLoaded { name } => println!("loaded {name}"),
+        CommandResponse::SessionPreview { .. } => {
+            return Err(anyhow!("session preview responses are interactive-only"));
+        }
         CommandResponse::SessionKilled { session } => println!("killed {session}"),
         CommandResponse::WindowKilled { session, window_id } => {
             println!("killed {session}:{window_id}");
@@ -1595,6 +1598,19 @@ fn chooser_preview(
         | ChooseItem::Window { session, .. }
         | ChooseItem::Pane { session, .. } => session.clone(),
     };
+    if matches!(item, ChooseItem::Session(_)) {
+        let snapshot = match request_response(
+            paths,
+            CommandRequest::PreviewSession {
+                session: session.clone(),
+            },
+        )? {
+            CommandResponse::SessionPreview { snapshot } => snapshot,
+            CommandResponse::Error { message } => return Err(anyhow!(message)),
+            other => return Err(anyhow!("unexpected session preview response: {other:?}")),
+        };
+        return Ok((session, snapshot));
+    }
     let snapshot = match request_response(
         paths,
         CommandRequest::Attach {

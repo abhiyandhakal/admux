@@ -191,6 +191,25 @@ impl SessionStore {
                     };
                 }
             }
+            CommandRequest::PreviewSession { session } => match self.sessions.get(&session) {
+                Some(runtime) => match runtime.render_session_preview(crate::pane::Rect {
+                    x: 0,
+                    y: 0,
+                    width: 80,
+                    height: 24,
+                }) {
+                    Some(mut snapshot) => {
+                        snapshot.sessions = self.list_session_summaries();
+                        CommandResponse::SessionPreview { snapshot }
+                    }
+                    None => CommandResponse::Error {
+                        message: format!("could not render session preview for {session}"),
+                    },
+                },
+                None => CommandResponse::Error {
+                    message: format!("unknown session {session}"),
+                },
+            },
             CommandRequest::ListSessions => CommandResponse::SessionList {
                 sessions: self.list_session_summaries(),
             },

@@ -27,6 +27,9 @@ pub enum CommandRequest {
     Attach {
         session: Option<String>,
     },
+    PreviewSession {
+        session: String,
+    },
     ListSessions,
     ListWindows {
         session: String,
@@ -156,6 +159,9 @@ pub enum CommandResponse {
         formatted_cursor: String,
         #[serde(default)]
         snapshot: Option<RenderSnapshot>,
+    },
+    SessionPreview {
+        snapshot: RenderSnapshot,
     },
     SessionList {
         sessions: Vec<SessionSummary>,
