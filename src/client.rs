@@ -1,9 +1,10 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashSet},
     io::{self, IsTerminal, Read, Write},
     os::unix::net::UnixStream,
     path::PathBuf,
     process::{Command, Stdio},
+    sync::{Mutex, OnceLock},
     thread,
     time::{Duration, Instant},
 };
@@ -45,6 +46,11 @@ use crate::{
 };
 
 const ATTACH_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+
+fn validated_sockets() -> &'static Mutex<HashSet<PathBuf>> {
+    static VALIDATED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    VALIDATED.get_or_init(|| Mutex::new(HashSet::new()))
+}
 
 #[derive(Debug, Clone)]
 struct PromptState {
@@ -328,11 +334,30 @@ fn apply_attached_session(
 }
 
 pub fn request_response(paths: &RuntimePaths, request: CommandRequest) -> Result<CommandResponse> {
-    ensure_protocol(paths)?;
+    {
+        let validated = validated_sockets()
+            .lock()
+            .expect("validated sockets lock poisoned");
+        if !validated.contains(&paths.socket_path) {
+            drop(validated);
+            ensure_protocol(paths)?;
+            validated_sockets()
+                .lock()
+                .expect("validated sockets lock poisoned")
+                .insert(paths.socket_path.clone());
+        }
+    }
     let response = with_connection(paths, |stream| {
         write_message(stream, &request)?;
         read_message(stream)
-    })?;
+    });
+    if response.is_err() {
+        validated_sockets()
+            .lock()
+            .expect("validated sockets lock poisoned")
+            .remove(&paths.socket_path);
+    }
+    let response = response?;
     Ok(response)
 }
 
@@ -654,6 +679,8 @@ fn run_attach_loop(
     let mut prompt_history = Vec::<String>::new();
     let mut overlay = OverlayState::None;
     let mut snapshot = fetch_attach_snapshot(paths, &mut current_session, &mut last_size, 80, 24)?;
+    let mut snapshot_dirty = false;
+    let mut last_snapshot_refresh = Instant::now();
 
     loop {
         let (width, height) = terminal::size().context("failed to read terminal size")?;
@@ -671,6 +698,13 @@ fn run_attach_loop(
             last_size = (rows, cols);
             snapshot =
                 fetch_attach_snapshot(paths, &mut current_session, &mut last_size, width, height)?;
+            snapshot_dirty = false;
+            last_snapshot_refresh = Instant::now();
+        } else if snapshot_dirty && last_snapshot_refresh.elapsed() >= ATTACH_FRAME_INTERVAL {
+            snapshot =
+                fetch_attach_snapshot(paths, &mut current_session, &mut last_size, width, height)?;
+            snapshot_dirty = false;
+            last_snapshot_refresh = Instant::now();
         }
 
         let render_selection = copy_mode
@@ -773,6 +807,8 @@ fn run_attach_loop(
         if !event::poll(ATTACH_FRAME_INTERVAL).context("failed to poll terminal events")? {
             snapshot =
                 fetch_attach_snapshot(paths, &mut current_session, &mut last_size, width, height)?;
+            snapshot_dirty = false;
+            last_snapshot_refresh = Instant::now();
             continue;
         }
 
@@ -1164,8 +1200,18 @@ fn run_attach_loop(
         }
 
         if needs_refresh {
-            snapshot =
-                fetch_attach_snapshot(paths, &mut current_session, &mut last_size, width, height)?;
+            snapshot_dirty = true;
+            if last_snapshot_refresh.elapsed() >= ATTACH_FRAME_INTERVAL {
+                snapshot = fetch_attach_snapshot(
+                    paths,
+                    &mut current_session,
+                    &mut last_size,
+                    width,
+                    height,
+                )?;
+                snapshot_dirty = false;
+                last_snapshot_refresh = Instant::now();
+            }
         }
     }
     Ok(())
