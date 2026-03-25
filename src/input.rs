@@ -189,7 +189,13 @@ fn key_to_bytes(event: KeyEvent) -> InputAction {
                 InputAction::Noop
             }
         }
+        KeyCode::Char(ch) if event.modifiers.contains(KeyModifiers::ALT) => {
+            let mut bytes = vec![0x1b];
+            bytes.extend_from_slice(ch.to_string().as_bytes());
+            InputAction::SendBytes(bytes)
+        }
         KeyCode::Char(ch) => InputAction::SendBytes(ch.to_string().into_bytes()),
+        KeyCode::Esc => InputAction::SendBytes(vec![0x1b]),
         KeyCode::Enter => InputAction::SendBytes(vec![b'\r']),
         KeyCode::Tab => InputAction::SendBytes(vec![b'\t']),
         KeyCode::Backspace => InputAction::SendBytes(vec![0x7f]),
@@ -234,6 +240,24 @@ mod tests {
         assert_eq!(
             state.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)),
             InputAction::SendBytes(vec![0x0c])
+        );
+    }
+
+    #[test]
+    fn escape_is_forwarded_to_the_pane() {
+        let mut state = configured_state("");
+        assert_eq!(
+            state.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            InputAction::SendBytes(vec![0x1b])
+        );
+    }
+
+    #[test]
+    fn alt_key_is_forwarded_as_escape_sequence() {
+        let mut state = configured_state("");
+        assert_eq!(
+            state.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::ALT)),
+            InputAction::SendBytes(vec![0x1b, b'j'])
         );
     }
 
