@@ -894,7 +894,7 @@ impl SessionStore {
             };
         }
 
-        match self.create_workspace_session(&workspace) {
+        match self.create_workspace_session(&workspace, !rebuild) {
             Ok(()) => {
                 self.workspace_mappings
                     .insert(manifest_key.clone(), session_name.clone());
@@ -921,13 +921,30 @@ impl SessionStore {
         }
     }
 
-    fn create_workspace_session(&mut self, workspace: &WorkspaceLoad) -> Result<()> {
+    fn create_workspace_session(
+        &mut self,
+        workspace: &WorkspaceLoad,
+        use_snapshot: bool,
+    ) -> Result<()> {
         let first_window_id = self.next_window();
         let first_window =
             workspace.spec.windows.first().ok_or_else(|| {
                 anyhow::anyhow!("workspace manifest must define at least one window")
             })?;
-        let mut session = Session::new(
+        let root_seed = use_snapshot
+            .then(|| {
+                workspace
+                    .snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.pane(0, 0))
+                    .map(|pane| crate::pty::PaneRestoreSeed {
+                        rows: pane.rows,
+                        cols: pane.cols,
+                        vt: pane.vt.clone(),
+                    })
+            })
+            .flatten();
+        let mut session = Session::new_with_restore(
             workspace.spec.name.clone(),
             Some(workspace.manifest_key.clone()),
             Some(first_window.root.cwd.clone()),
@@ -937,21 +954,36 @@ impl SessionStore {
             self.config.behavior.scrollback_lines,
             self.config.defaults.window.clone(),
             self.helper_dir.clone(),
+            root_seed,
         )?;
         session.cwd = Some(workspace.spec.cwd.clone());
         session.rename_active_window(first_window.name.clone())?;
-        self.apply_workspace_window(&mut session, first_window_id, first_window)?;
+        self.apply_workspace_window(&mut session, first_window_id, first_window, workspace, 0)?;
 
-        for window in workspace.spec.windows.iter().skip(1) {
+        for (window_index, window) in workspace.spec.windows.iter().enumerate().skip(1) {
             let window_id = self.next_window();
-            session.new_window_with_cwd(
+            let root_seed = use_snapshot
+                .then(|| {
+                    workspace
+                        .snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.pane(window_index, 0))
+                        .map(|pane| crate::pty::PaneRestoreSeed {
+                            rows: pane.rows,
+                            cols: pane.cols,
+                            vt: pane.vt.clone(),
+                        })
+                })
+                .flatten();
+            session.new_window_with_cwd_and_restore(
                 window_id,
                 Some(window.name.clone()),
                 Some(window.cwd.clone()),
                 &window.root.command,
+                root_seed,
             )?;
             session.select_window(window_id)?;
-            self.apply_workspace_window(&mut session, window_id, window)?;
+            self.apply_workspace_window(&mut session, window_id, window, workspace, window_index)?;
         }
 
         if let Some(window_id) = session
@@ -971,19 +1003,36 @@ impl SessionStore {
         session: &mut Session,
         window_id: WindowId,
         window: &crate::workspace::WorkspaceWindowSpec,
+        workspace: &WorkspaceLoad,
+        window_index: usize,
     ) -> Result<()> {
         session.select_window(window_id)?;
-        for split in &window.splits {
-            session.split_pane_in_window(
+        for (split_index, split) in window.splits.iter().enumerate() {
+            let restore_seed = workspace
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.pane(window_index, (split_index + 1) as u64))
+                .map(|pane| crate::pty::PaneRestoreSeed {
+                    rows: pane.rows,
+                    cols: pane.cols,
+                    vt: pane.vt.clone(),
+                });
+            session.split_pane_in_window_with_restore(
                 window_id,
                 Some(PaneId(split.target)),
                 split.direction,
                 split.ratio,
                 Some(split.pane.cwd.clone()),
                 &split.pane.command,
+                restore_seed,
             )?;
         }
-        session.select_pane(Some(window_id), PaneId(window.active_pane))?;
+        let active_pane = workspace
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.active_pane(window_index))
+            .unwrap_or(window.active_pane);
+        session.select_pane(Some(window_id), PaneId(active_pane))?;
         Ok(())
     }
 
@@ -998,7 +1047,7 @@ impl SessionStore {
                 message: format!("unknown session {session_name}"),
             };
         };
-        match save_workspace(session) {
+        match save_workspace(session, self.config.behavior.workspace_snapshot_lines) {
             Ok(path) => CommandResponse::WorkspaceSaved {
                 session: session_name,
                 path,

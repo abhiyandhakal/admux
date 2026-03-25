@@ -3,6 +3,7 @@ use crate::{
     pane::{PaneId, WindowId},
 };
 use anyhow::{Context, Result, anyhow, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -56,6 +57,20 @@ pub struct PaneProcess {
     socket_path: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanePersistentSnapshot {
+    pub rows: u16,
+    pub cols: u16,
+    pub vt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneRestoreSeed {
+    pub rows: u16,
+    pub cols: u16,
+    pub vt: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneHelperArgs {
     pub socket: PathBuf,
@@ -66,6 +81,8 @@ pub struct PaneHelperArgs {
     pub default_shell: Option<String>,
     pub scrollback_lines: usize,
     pub command: Vec<String>,
+    #[serde(default)]
+    pub restore_seed: Option<PaneRestoreSeed>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,6 +113,9 @@ enum PaneRequest {
     SendKeys {
         keys: Vec<String>,
     },
+    PersistentSnapshot {
+        lines: usize,
+    },
     Shutdown,
     IsAlive,
 }
@@ -105,9 +125,17 @@ enum PaneResponse {
     Snapshot(PaneSnapshotWire),
     ScreenSize { rows: u16, cols: u16 },
     SelectionText { text: String },
+    PersistentSnapshot(PanePersistentSnapshotWire),
     IsAlive { alive: bool },
     Ok,
     Error { message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PanePersistentSnapshotWire {
+    rows: u16,
+    cols: u16,
+    vt_b64: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,6 +169,31 @@ impl From<PaneSnapshotWire> for PaneSnapshot {
     }
 }
 
+impl From<PanePersistentSnapshotWire> for PanePersistentSnapshot {
+    fn from(value: PanePersistentSnapshotWire) -> Self {
+        Self {
+            rows: value.rows,
+            cols: value.cols,
+            vt: String::from_utf8(
+                STANDARD
+                    .decode(value.vt_b64)
+                    .expect("pane snapshot wire should contain valid base64"),
+            )
+            .expect("pane snapshot wire should contain valid utf-8"),
+        }
+    }
+}
+
+impl From<&PanePersistentSnapshot> for PaneRestoreSeed {
+    fn from(value: &PanePersistentSnapshot) -> Self {
+        Self {
+            rows: value.rows,
+            cols: value.cols,
+            vt: value.vt.clone(),
+        }
+    }
+}
+
 impl PaneProcess {
     pub fn spawn(
         command: &[String],
@@ -149,6 +202,7 @@ impl PaneProcess {
         default_shell: Option<&str>,
         scrollback_lines: usize,
         helper_dir: &Path,
+        restore_seed: Option<PaneRestoreSeed>,
     ) -> Result<Self> {
         fs::create_dir_all(helper_dir).with_context(|| {
             format!("failed to create helper directory {}", helper_dir.display())
@@ -165,6 +219,7 @@ impl PaneProcess {
             default_shell: default_shell.map(ToOwned::to_owned),
             scrollback_lines,
             command: command.to_vec(),
+            restore_seed,
         };
         let payload = serde_json::to_string(&args).context("failed to encode helper args")?;
 
@@ -314,6 +369,16 @@ impl PaneProcess {
         }
     }
 
+    pub fn persistent_snapshot(&self, lines: usize) -> Result<PanePersistentSnapshot> {
+        match self.request(PaneRequest::PersistentSnapshot { lines })? {
+            PaneResponse::PersistentSnapshot(snapshot) => Ok(snapshot.into()),
+            PaneResponse::Error { message } => Err(anyhow!(message)),
+            other => Err(anyhow!(
+                "unexpected persistent snapshot response: {other:?}"
+            )),
+        }
+    }
+
     pub fn is_alive(&self) -> bool {
         matches!(
             self.request(PaneRequest::IsAlive),
@@ -390,11 +455,21 @@ pub fn run_helper(args: PaneHelperArgs) -> Result<()> {
 }
 
 fn start_helper_state(args: &PaneHelperArgs) -> Result<HelperState> {
+    let initial_rows = args
+        .restore_seed
+        .as_ref()
+        .map(|seed| seed.rows.max(1))
+        .unwrap_or(24);
+    let initial_cols = args
+        .restore_seed
+        .as_ref()
+        .map(|seed| seed.cols.max(1))
+        .unwrap_or(80);
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
-            rows: 24,
-            cols: 80,
+            rows: initial_rows,
+            cols: initial_cols,
             pixel_width: 0,
             pixel_height: 0,
         })
@@ -412,6 +487,13 @@ fn start_helper_state(args: &PaneHelperArgs) -> Result<HelperState> {
     }
     builder.env("TERM", "screen-256color");
 
+    let mut parser = vt100::Parser::new(initial_rows, initial_cols, args.scrollback_lines);
+    let mut history = Vec::new();
+    if let Some(seed) = &args.restore_seed {
+        history.extend_from_slice(seed.vt.as_bytes());
+        parser.process(seed.vt.as_bytes());
+    }
+
     let child = pair
         .slave
         .spawn_command(builder)
@@ -425,8 +507,8 @@ fn start_helper_state(args: &PaneHelperArgs) -> Result<HelperState> {
         .take_writer()
         .context("failed to acquire PTY writer")?;
     let terminal = Arc::new(Mutex::new(TerminalState {
-        parser: vt100::Parser::new(24, 80, args.scrollback_lines),
-        history: Vec::new(),
+        parser,
+        history,
         scrollback_lines: args.scrollback_lines,
     }));
     let terminal_clone = Arc::clone(&terminal);
@@ -511,6 +593,14 @@ fn handle_helper_request(state: &Arc<HelperState>, request: PaneRequest) -> Pane
                 message: error.to_string(),
             },
         },
+        PaneRequest::PersistentSnapshot { lines } => {
+            match helper_persistent_snapshot(state, lines) {
+                Ok(snapshot) => PaneResponse::PersistentSnapshot(snapshot),
+                Err(error) => PaneResponse::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
         PaneRequest::Shutdown => {
             let _ = state
                 .child
@@ -674,6 +764,38 @@ fn helper_send_keys(state: &Arc<HelperState>, keys: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn helper_persistent_snapshot(
+    state: &Arc<HelperState>,
+    lines: usize,
+) -> Result<PanePersistentSnapshotWire> {
+    let terminal = state
+        .terminal
+        .lock()
+        .expect("pane helper terminal lock poisoned");
+    let screen = terminal.parser.screen();
+    let (rows, cols) = screen.size();
+    let mut formatted_rows: Vec<String> = screen
+        .rows_formatted(0, cols.max(1))
+        .map(|row| String::from_utf8_lossy(&row).into_owned())
+        .collect();
+    let keep = lines.max(rows as usize).min(formatted_rows.len());
+    if formatted_rows.len() > keep {
+        let drop = formatted_rows.len() - keep;
+        formatted_rows.drain(..drop);
+    }
+    let mut vt = String::from("\x1b[2J\x1b[H");
+    if !formatted_rows.is_empty() {
+        vt.push_str(&formatted_rows.join("\r\n"));
+    }
+    vt.push_str("\x1b[0m");
+    vt.push_str(&String::from_utf8_lossy(&screen.cursor_state_formatted()));
+    Ok(PanePersistentSnapshotWire {
+        rows,
+        cols,
+        vt_b64: STANDARD.encode(vt.as_bytes()),
+    })
+}
+
 fn read_helper_request(stream: &mut UnixStream) -> Result<PaneRequest> {
     let mut payload = Vec::new();
     stream
@@ -801,6 +923,17 @@ mod tests {
         tempdir().expect("tempdir")
     }
 
+    fn wait_for_preview(pane: &PaneProcess, needle: &str) -> String {
+        for _ in 0..50 {
+            let preview = pane.preview();
+            if preview.contains(needle) {
+                return preview;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        pane.preview()
+    }
+
     #[test]
     fn pane_process_captures_command_output() {
         let dir = helper_dir();
@@ -811,11 +944,11 @@ mod tests {
             None,
             10_000,
             dir.path(),
+            None,
         )
         .expect("spawn pane");
 
-        thread::sleep(Duration::from_millis(100));
-        assert!(pane.preview().contains("hello from pane"));
+        assert!(wait_for_preview(&pane, "hello from pane").contains("hello from pane"));
     }
 
     #[test]
@@ -832,11 +965,11 @@ mod tests {
             None,
             10_000,
             dir.path(),
+            None,
         )
         .expect("spawn pane");
 
-        thread::sleep(Duration::from_millis(100));
-        let preview = pane.preview();
+        let preview = wait_for_preview(&pane, "after");
         assert!(preview.contains("after"));
         assert!(!preview.contains("beforeafter"));
     }
@@ -855,10 +988,11 @@ mod tests {
             None,
             10_000,
             dir.path(),
+            None,
         )
         .expect("spawn pane");
 
-        thread::sleep(Duration::from_millis(100));
+        let _ = wait_for_preview(&pane, "one two");
         pane.resize(24, 10).expect("resize pane");
         let shrunk = pane.preview();
         assert!(shrunk.contains("one two"));
@@ -884,12 +1018,46 @@ mod tests {
             None,
             10_000,
             dir.path(),
+            None,
         )
         .expect("spawn pane");
 
-        thread::sleep(Duration::from_millis(100));
         let reconnected =
             PaneProcess::connect(pane.socket_path().to_path_buf()).expect("reconnect helper");
-        assert!(reconnected.preview().contains("reconnect-test"));
+        assert!(wait_for_preview(&reconnected, "reconnect-test").contains("reconnect-test"));
+    }
+
+    #[test]
+    fn pane_process_can_restore_persistent_snapshot() {
+        let dir = helper_dir();
+        let pane = PaneProcess::spawn(
+            &[
+                "sh".into(),
+                "-lc".into(),
+                "printf 'snapshot-one\\nsnapshot-two'; sleep 1".into(),
+            ],
+            None,
+            None,
+            None,
+            10_000,
+            dir.path(),
+            None,
+        )
+        .expect("spawn pane");
+        assert!(wait_for_preview(&pane, "snapshot-two").contains("snapshot-two"));
+        let snapshot = pane.persistent_snapshot(500).expect("persistent snapshot");
+        let restored = PaneProcess::spawn(
+            &["sh".into(), "-lc".into(), "sleep 1".into()],
+            None,
+            None,
+            None,
+            10_000,
+            dir.path(),
+            Some((&snapshot).into()),
+        )
+        .expect("spawn restored pane");
+        let preview = wait_for_preview(&restored, "snapshot-two");
+        assert!(preview.contains("snapshot-one"));
+        assert!(preview.contains("snapshot-two"));
     }
 }

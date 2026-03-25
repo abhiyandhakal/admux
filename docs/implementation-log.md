@@ -459,3 +459,32 @@ This document records each completed implementation slice in detail, including t
   - sessions created without an explicit command still keep a real shell command for later workspace export
 - Commit: pending current worktree
 - Status: complete
+
+## Workspace snapshot restore slice
+
+- Goal: extend workspace sharing so `admux save` writes a local snapshot sidecar and `admux up` can restore saved pane context before rerunning pane commands.
+- Files changed:
+  - helper snapshot export/import: `src/pty.rs`, `src/bin/admux-pane.rs`
+  - session creation with restore seeds: `src/session.rs`
+  - workspace manifest digesting and sidecar handling: `src/workspace.rs`
+  - daemon workspace bootstrap/save integration: `src/server.rs`
+  - config default for snapshot depth: `src/config.rs`
+  - binary coverage: `tests/daemon_cli.rs`
+  - docs: `README.md`, `docs/detailed-status.md`
+- Verification:
+  - `cargo test`
+  - direct built-binary smoke:
+    - create a shell session rooted in a project directory
+    - print visible content into the pane
+    - run `admux save`
+    - kill the session
+    - run `admux up` from the project directory
+    - confirm `attach` immediately shows the saved content
+- Observed result:
+  - `admux save` now writes `admux.toml`, `.admux/snapshot.json`, and `.admux/.gitignore`
+  - `admux up` restores saved VT pane context when the sidecar digest matches the current manifest
+  - restored panes immediately rerun their saved commands after seeding the snapshot
+  - `admux up --rebuild` ignores the snapshot sidecar and rebuilds from `admux.toml` only
+  - stale snapshots are ignored automatically after manifest edits
+- Commit: pending current worktree
+- Status: complete

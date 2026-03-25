@@ -1,6 +1,9 @@
 use std::{
+    collections::{BTreeMap, hash_map::DefaultHasher},
     fs,
+    hash::{Hash, Hasher},
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -48,7 +51,54 @@ pub struct WorkspaceSplitSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceLoad {
     pub manifest_key: String,
+    pub manifest_digest: String,
     pub spec: WorkspaceSpec,
+    pub snapshot: Option<WorkspaceSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceSnapshot {
+    pub version: u16,
+    pub saved_at_unix: u64,
+    pub manifest_path: String,
+    pub manifest_digest: String,
+    pub session_name: String,
+    pub active_window: usize,
+    pub windows: Vec<WorkspaceWindowSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceWindowSnapshot {
+    pub window_index: usize,
+    pub active_pane: u64,
+    pub panes: Vec<WorkspacePaneSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspacePaneSnapshot {
+    pub pane_id: u64,
+    pub title: String,
+    pub cwd: PathBuf,
+    pub command: Vec<String>,
+    pub rows: u16,
+    pub cols: u16,
+    pub vt: String,
+}
+
+impl WorkspaceSnapshot {
+    pub fn pane(&self, window_index: usize, pane_id: u64) -> Option<&WorkspacePaneSnapshot> {
+        self.windows
+            .iter()
+            .find(|window| window.window_index == window_index)
+            .and_then(|window| window.panes.iter().find(|pane| pane.pane_id == pane_id))
+    }
+
+    pub fn active_pane(&self, window_index: usize) -> Option<u64> {
+        self.windows
+            .iter()
+            .find(|window| window.window_index == window_index)
+            .map(|window| window.active_pane)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -175,12 +225,16 @@ pub fn load_workspace(path: &Path) -> Result<WorkspaceLoad> {
         .to_path_buf();
     let raw = fs::read_to_string(&manifest_path)
         .with_context(|| format!("failed to read workspace file {}", manifest_path.display()))?;
+    let manifest_digest = manifest_digest(&raw);
     let manifest: RawWorkspaceManifest = toml::from_str(&raw)
         .with_context(|| format!("failed to parse workspace file {}", manifest_path.display()))?;
-    resolve_workspace(manifest_path, manifest_dir, manifest)
+    let mut workspace = resolve_workspace(manifest_path.clone(), manifest_dir, manifest)?;
+    workspace.manifest_digest = manifest_digest.clone();
+    workspace.snapshot = load_snapshot_sidecar(&manifest_path, &manifest_digest)?;
+    Ok(workspace)
 }
 
-pub fn save_workspace(session: &Session) -> Result<PathBuf> {
+pub fn save_workspace(session: &Session, snapshot_lines: usize) -> Result<PathBuf> {
     let session_dir = session.cwd.clone().ok_or_else(|| {
         anyhow!(
             "session {} does not have a workspace directory",
@@ -198,6 +252,11 @@ pub fn save_workspace(session: &Session) -> Result<PathBuf> {
     let raw = toml::to_string_pretty(&manifest).context("failed to encode workspace manifest")?;
     fs::write(&path, raw)
         .with_context(|| format!("failed to write workspace manifest {}", path.display()))?;
+    let digest = manifest_digest(
+        &fs::read_to_string(&path)
+            .with_context(|| format!("failed to reread workspace manifest {}", path.display()))?,
+    );
+    write_snapshot_sidecar(session, &path, &digest, snapshot_lines)?;
     Ok(path)
 }
 
@@ -289,6 +348,7 @@ fn resolve_workspace(
 
     Ok(WorkspaceLoad {
         manifest_key: manifest_path.display().to_string(),
+        manifest_digest: String::new(),
         spec: WorkspaceSpec {
             manifest_path,
             manifest_dir,
@@ -297,6 +357,7 @@ fn resolve_workspace(
             active_window,
             windows,
         },
+        snapshot: None,
     })
 }
 
@@ -338,6 +399,7 @@ fn export_workspace(session: &Session) -> Result<WorkspaceManifestOut> {
 
 fn export_window(window: &WindowRuntime, session_cwd: &Path) -> Result<WindowSpecOut> {
     let window_base = window.cwd.as_deref().unwrap_or(session_cwd);
+    let pane_map = manifest_pane_map(window);
     let root_pane_id = origin_pane(&window.layout.root);
     let root = export_pane(
         window
@@ -347,11 +409,19 @@ fn export_window(window: &WindowRuntime, session_cwd: &Path) -> Result<WindowSpe
         window_base,
     )?;
     let mut splits = Vec::new();
-    collect_splits(&window.layout.root, window, window_base, &mut splits)?;
+    collect_splits(
+        &window.layout.root,
+        window,
+        window_base,
+        &pane_map,
+        &mut splits,
+    )?;
     Ok(WindowSpecOut {
         name: window.name.clone(),
         cwd: relativize(window_base, session_cwd),
-        active_pane: window.layout.active.0,
+        active_pane: *pane_map
+            .get(&window.layout.active)
+            .ok_or_else(|| anyhow!("missing active pane {}", window.layout.active.0))?,
         root,
         splits,
     })
@@ -361,6 +431,7 @@ fn collect_splits(
     node: &LayoutNode,
     window: &WindowRuntime,
     window_base: &Path,
+    pane_map: &BTreeMap<PaneId, u64>,
     splits: &mut Vec<SplitSpecOut>,
 ) -> Result<PaneId> {
     match node {
@@ -378,7 +449,9 @@ fn collect_splits(
                 .get(&new_pane)
                 .ok_or_else(|| anyhow!("missing pane {}", new_pane.0))?;
             splits.push(SplitSpecOut {
-                target: target.0,
+                target: *pane_map
+                    .get(&target)
+                    .ok_or_else(|| anyhow!("missing mapped pane {}", target.0))?,
                 direction: match axis {
                     SplitAxis::Horizontal => SplitAxisOut::Horizontal,
                     SplitAxis::Vertical => SplitAxisOut::Vertical,
@@ -391,9 +464,33 @@ fn collect_splits(
                 cwd: relativize(pane.cwd.as_deref().unwrap_or(window_base), window_base),
                 command: pane.command.clone(),
             });
-            collect_splits(first, window, window_base, splits)?;
-            collect_splits(second, window, window_base, splits)?;
+            collect_splits(first, window, window_base, pane_map, splits)?;
+            collect_splits(second, window, window_base, pane_map, splits)?;
             Ok(target)
+        }
+    }
+}
+
+fn manifest_pane_map(window: &WindowRuntime) -> BTreeMap<PaneId, u64> {
+    let mut map = BTreeMap::new();
+    map.insert(origin_pane(&window.layout.root), 0);
+    let mut next = 1u64;
+    assign_manifest_pane_ids(&window.layout.root, &mut map, &mut next);
+    map
+}
+
+fn assign_manifest_pane_ids(node: &LayoutNode, map: &mut BTreeMap<PaneId, u64>, next: &mut u64) {
+    match node {
+        LayoutNode::Pane(_) => {}
+        LayoutNode::Split { first, second, .. } => {
+            let new_pane = origin_pane(second);
+            map.entry(new_pane).or_insert_with(|| {
+                let current = *next;
+                *next += 1;
+                current
+            });
+            assign_manifest_pane_ids(first, map, next);
+            assign_manifest_pane_ids(second, map, next);
         }
     }
 }
@@ -423,6 +520,130 @@ fn relativize(path: &Path, base: &Path) -> Option<PathBuf> {
         .map(PathBuf::from)
         .ok()
         .or_else(|| Some(path.to_path_buf()))
+}
+
+fn write_snapshot_sidecar(
+    session: &Session,
+    manifest_path: &Path,
+    digest: &str,
+    snapshot_lines: usize,
+) -> Result<()> {
+    let snapshot = export_snapshot(session, manifest_path, digest, snapshot_lines)?;
+    let state_dir = workspace_state_dir(manifest_path);
+    fs::create_dir_all(&state_dir)
+        .with_context(|| format!("failed to create {}", state_dir.display()))?;
+    let gitignore = state_dir.join(".gitignore");
+    if !gitignore.exists() {
+        fs::write(&gitignore, "*\n!.gitignore\n")
+            .with_context(|| format!("failed to write {}", gitignore.display()))?;
+    }
+    let snapshot_path = workspace_snapshot_path(manifest_path);
+    let raw =
+        serde_json::to_vec_pretty(&snapshot).context("failed to encode workspace snapshot")?;
+    fs::write(&snapshot_path, raw)
+        .with_context(|| format!("failed to write {}", snapshot_path.display()))?;
+    Ok(())
+}
+
+fn export_snapshot(
+    session: &Session,
+    manifest_path: &Path,
+    digest: &str,
+    snapshot_lines: usize,
+) -> Result<WorkspaceSnapshot> {
+    let mut windows = Vec::new();
+    for (window_index, window_id) in session.window_order.iter().enumerate() {
+        let window = session
+            .windows
+            .get(window_id)
+            .ok_or_else(|| anyhow!("missing window {}", window_id.0))?;
+        let pane_map = manifest_pane_map(window);
+        let mut panes = Vec::new();
+        for pane_id in window.layout.panes() {
+            let pane = window
+                .panes
+                .get(&pane_id)
+                .ok_or_else(|| anyhow!("missing pane {}", pane_id.0))?;
+            let manifest_pane_id = *pane_map
+                .get(&pane_id)
+                .ok_or_else(|| anyhow!("missing mapped pane {}", pane_id.0))?;
+            let persistent =
+                session.pane_persistent_snapshot(*window_id, pane_id, snapshot_lines)?;
+            panes.push(WorkspacePaneSnapshot {
+                pane_id: manifest_pane_id,
+                title: pane.title.clone(),
+                cwd: pane
+                    .cwd
+                    .clone()
+                    .or_else(|| window.cwd.clone())
+                    .or_else(|| session.cwd.clone())
+                    .ok_or_else(|| anyhow!("pane {} does not have a cwd", pane.id.0))?,
+                command: pane.command.clone(),
+                rows: persistent.rows,
+                cols: persistent.cols,
+                vt: persistent.vt,
+            });
+        }
+        panes.sort_by_key(|pane| pane.pane_id);
+        windows.push(WorkspaceWindowSnapshot {
+            window_index,
+            active_pane: *pane_map
+                .get(&window.layout.active)
+                .ok_or_else(|| anyhow!("missing active pane {}", window.layout.active.0))?,
+            panes,
+        });
+    }
+    Ok(WorkspaceSnapshot {
+        version: 1,
+        saved_at_unix: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        manifest_path: manifest_path.display().to_string(),
+        manifest_digest: digest.to_string(),
+        session_name: session.name.clone(),
+        active_window: session
+            .window_order
+            .iter()
+            .position(|window_id| *window_id == session.active_window)
+            .unwrap_or(0),
+        windows,
+    })
+}
+
+fn load_snapshot_sidecar(manifest_path: &Path, digest: &str) -> Result<Option<WorkspaceSnapshot>> {
+    let snapshot_path = workspace_snapshot_path(manifest_path);
+    if !snapshot_path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(&snapshot_path)
+        .with_context(|| format!("failed to read {}", snapshot_path.display()))?;
+    let snapshot: WorkspaceSnapshot = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to decode {}", snapshot_path.display()))?;
+    if snapshot.version != 1 {
+        return Ok(None);
+    }
+    if snapshot.manifest_digest != digest {
+        return Ok(None);
+    }
+    Ok(Some(snapshot))
+}
+
+pub fn workspace_state_dir(manifest_path: &Path) -> PathBuf {
+    manifest_path
+        .parent()
+        .map(|parent| parent.join(".admux"))
+        .unwrap_or_else(|| PathBuf::from(".admux"))
+}
+
+fn workspace_snapshot_path(manifest_path: &Path) -> PathBuf {
+    workspace_state_dir(manifest_path).join("snapshot.json")
+}
+
+fn manifest_digest(raw: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    raw.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 fn is_zero_usize(value: &usize) -> bool {
@@ -463,6 +684,8 @@ fn resolve_ratio(value: Option<f32>) -> Result<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{config::WindowDefaults, pane::WindowId, session::Session};
+    use std::{thread, time::Duration};
     use tempfile::tempdir;
 
     fn load(raw: &str) -> Result<WorkspaceLoad> {
@@ -470,6 +693,15 @@ mod tests {
         let path = dir.path().join("admux.toml");
         fs::write(&path, raw).expect("write manifest");
         load_workspace(&path)
+    }
+
+    fn wait_for_preview(session: &Session, needle: &str) {
+        for _ in 0..50 {
+            if session.active_pane_preview().contains(needle) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]
@@ -592,5 +824,84 @@ command = ["cargo", "test"]
         .unwrap_err();
 
         assert!(error.to_string().contains("between 0 and 1"));
+    }
+
+    #[test]
+    fn save_writes_snapshot_sidecar_and_loads_it_back() {
+        let dir = tempdir().expect("tempdir");
+        let session_dir = dir.path().join("project");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        let session = Session::new(
+            "workspace".into(),
+            None,
+            Some(session_dir.clone()),
+            vec!["sh".into(), "-lc".into(), "printf saved-pane".into()],
+            WindowId(1),
+            None,
+            10_000,
+            WindowDefaults::default(),
+            dir.path().join("helpers"),
+        )
+        .expect("session");
+        wait_for_preview(&session, "saved-pane");
+
+        let manifest_path = save_workspace(&session, 500).expect("save workspace");
+        let snapshot_path = workspace_snapshot_path(&manifest_path);
+        let gitignore_path = workspace_state_dir(&manifest_path).join(".gitignore");
+
+        assert!(snapshot_path.exists(), "snapshot sidecar should exist");
+        assert!(gitignore_path.exists(), "workspace .gitignore should exist");
+
+        let loaded = load_workspace(&manifest_path).expect("reload workspace");
+        let snapshot = loaded.snapshot.expect("snapshot");
+        assert_eq!(snapshot.session_name, "workspace");
+        assert_eq!(snapshot.windows.len(), 1);
+        assert!(snapshot.windows[0].panes[0].vt.contains("saved-pane"));
+
+        let _ = session.kill();
+    }
+
+    #[test]
+    fn ignores_stale_snapshot_when_manifest_changes() {
+        let dir = tempdir().expect("tempdir");
+        let session_dir = dir.path().join("project");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        let session = Session::new(
+            "workspace".into(),
+            None,
+            Some(session_dir.clone()),
+            vec!["sh".into(), "-lc".into(), "printf stale-pane".into()],
+            WindowId(1),
+            None,
+            10_000,
+            WindowDefaults::default(),
+            dir.path().join("helpers"),
+        )
+        .expect("session");
+        wait_for_preview(&session, "stale-pane");
+        let manifest_path = save_workspace(&session, 500).expect("save workspace");
+
+        fs::write(
+            &manifest_path,
+            r#"
+version = 1
+
+[workspace]
+name = "workspace"
+
+[[windows]]
+name = "fresh"
+root = { command = ["sh"] }
+"#,
+        )
+        .expect("overwrite manifest");
+
+        let loaded = load_workspace(&manifest_path).expect("load changed workspace");
+        assert!(
+            loaded.snapshot.is_none(),
+            "stale snapshot should be ignored"
+        );
+
+        let _ = session.kill();
     }
 }

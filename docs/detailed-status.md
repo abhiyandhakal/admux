@@ -171,6 +171,7 @@ Observed result:
 - `src/commands.rs`: tmux-style interactive command parsing and completion
 - `src/workspace.rs`: project-local `admux.toml` parsing and workspace bootstrap planning
 - `src/workspace.rs`: project-local `admux.toml` parsing plus live-session export
+- `src/workspace.rs`: local `.admux/snapshot.json` sidecars for best-effort workspace restore
 - `src/buffer.rs`: daemon-owned paste buffer store
 - `src/config.rs`: TOML config types and loaders
 - `src/ipc.rs`: request/response protocol
@@ -179,6 +180,7 @@ Observed result:
 - `src/server.rs`: daemon loop and session request handling
 - `src/session.rs`: session runtime model
 - `src/pty.rs`: PTY-backed pane process management
+- `src/pty.rs`: helper-exported persistent VT snapshots and restore seeding
 - `src/layout.rs`: layout tree
 - `src/render.rs`: custom `crossterm` drawing
 - `src/input.rs`: leader-mode input handling

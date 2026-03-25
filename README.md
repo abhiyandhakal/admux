@@ -121,6 +121,7 @@ cargo run --bin admuxd -- serve
 Configuration is read from `~/.config/admux/config.toml`.
 Persistent session metadata is stored in `~/.config/admux/state.json`.
 Project-local workspace manifests are read from `./admux.toml` when using `admux up`.
+Local workspace snapshots are stored in `.admux/snapshot.json`.
 
 Workspace manifest example:
 
@@ -153,11 +154,14 @@ Workspace notes:
 - `admux up` looks only for `./admux.toml` when no path is given
 - one `admux.toml` defines one shared session
 - rerunning `admux up` attaches to the existing mapped workspace session instead of recreating it
-- `admux up --rebuild` kills and recreates the mapped workspace from the manifest
+- when no live workspace exists, `admux up` can seed panes from `.admux/snapshot.json` and then rerun the pane commands
+- `admux up --rebuild` kills and recreates the mapped workspace from the manifest only; it ignores `.admux/snapshot.json`
 - manifest `cwd` values are resolved relative to the manifest directory
 - pane commands are argv arrays; use `["sh", "-lc", "..."]` for shell strings
 - `admux save` writes `admux.toml` into the session directory, not the caller's current directory
+- `admux save` also writes `.admux/snapshot.json` plus `.admux/.gitignore` in the session directory
 - `admux save` with no session argument uses the current `ADMUX_SESSION` when invoked inside `admux`, otherwise it falls back to the daemon's current session resolution
+- snapshots are local sidecar state intended for best-effort restore, not exact process checkpointing
 
 Example:
 
@@ -188,6 +192,7 @@ wheel_scroll = true
 
 [behavior]
 scrollback_lines = 10000
+workspace_snapshot_lines = 500
 default_shell = "/bin/zsh"
 resize_step = 25
 copy_page_size = 20

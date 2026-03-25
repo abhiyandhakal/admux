@@ -132,6 +132,7 @@ pub struct BehaviorConfig {
     pub default_shell: Option<String>,
     pub resize_step: u16,
     pub copy_page_size: Option<u16>,
+    pub workspace_snapshot_lines: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -531,6 +532,7 @@ impl Default for BehaviorConfig {
             default_shell: None,
             resize_step: 50,
             copy_page_size: None,
+            workspace_snapshot_lines: 500,
         }
     }
 }

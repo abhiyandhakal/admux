@@ -234,3 +234,125 @@ fn save_writes_workspace_manifest_into_session_directory() {
     let _ = daemon.kill();
     let _ = daemon.wait();
 }
+
+#[test]
+fn workspace_save_and_up_restore_snapshot_sidecar() {
+    let temp = tempdir().expect("tempdir");
+    let socket = temp.path().join("runtime").join("admux.sock");
+    let config = temp.path().join("config.toml");
+    let session_dir = temp.path().join("project");
+    fs::create_dir_all(&session_dir).expect("session dir");
+    fs::write(&config, "").expect("write config");
+    let mut daemon = spawn_daemon(&socket);
+
+    Command::new(env!("CARGO_BIN_EXE_admux"))
+        .env("ADMUX_SOCKET", &socket)
+        .env("ADMUX_CONFIG", &config)
+        .args([
+            "new",
+            "-d",
+            "--name",
+            "snapshot-work",
+            "--cwd",
+            session_dir.to_str().expect("utf8 path"),
+            "--",
+            "sh",
+        ])
+        .assert()
+        .success();
+
+    Command::new(env!("CARGO_BIN_EXE_admux"))
+        .env("ADMUX_SOCKET", &socket)
+        .env("ADMUX_CONFIG", &config)
+        .args([
+            "send-keys",
+            "snapshot-work",
+            "printf snapshot-visible",
+            "\n",
+        ])
+        .assert()
+        .success();
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut saw_output = false;
+    while Instant::now() < deadline {
+        let output = StdCommand::new(env!("CARGO_BIN_EXE_admux"))
+            .env("ADMUX_SOCKET", &socket)
+            .env("ADMUX_CONFIG", &config)
+            .args(["attach", "snapshot-work"])
+            .output()
+            .expect("run attach");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if output.status.success() && stdout.contains("snapshot-visible") {
+            saw_output = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        saw_output,
+        "pane never showed saved output before snapshot save"
+    );
+
+    Command::new(env!("CARGO_BIN_EXE_admux"))
+        .env("ADMUX_SOCKET", &socket)
+        .env("ADMUX_CONFIG", &config)
+        .args(["save", "snapshot-work"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("saved snapshot-work"));
+
+    assert!(session_dir.join(".admux").join("snapshot.json").exists());
+
+    Command::new(env!("CARGO_BIN_EXE_admux"))
+        .env("ADMUX_SOCKET", &socket)
+        .env("ADMUX_CONFIG", &config)
+        .args(["kill", "snapshot-work"])
+        .assert()
+        .success();
+
+    Command::new(env!("CARGO_BIN_EXE_admux"))
+        .current_dir(&session_dir)
+        .env("ADMUX_SOCKET", &socket)
+        .env("ADMUX_CONFIG", &config)
+        .arg("up")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("workspace snapshot-work ready"));
+
+    Command::new(env!("CARGO_BIN_EXE_admux"))
+        .env("ADMUX_SOCKET", &socket)
+        .env("ADMUX_CONFIG", &config)
+        .args(["attach", "snapshot-work"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("snapshot-visible"));
+
+    Command::new(env!("CARGO_BIN_EXE_admux"))
+        .env("ADMUX_SOCKET", &socket)
+        .env("ADMUX_CONFIG", &config)
+        .args(["kill", "snapshot-work"])
+        .assert()
+        .success();
+
+    Command::new(env!("CARGO_BIN_EXE_admux"))
+        .current_dir(&session_dir)
+        .env("ADMUX_SOCKET", &socket)
+        .env("ADMUX_CONFIG", &config)
+        .args(["up", "--rebuild"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("workspace snapshot-work ready"));
+
+    Command::new(env!("CARGO_BIN_EXE_admux"))
+        .env("ADMUX_SOCKET", &socket)
+        .env("ADMUX_CONFIG", &config)
+        .args(["attach", "snapshot-work"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("attached snapshot-work"))
+        .stdout(predicate::str::contains("snapshot-visible").not());
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+}

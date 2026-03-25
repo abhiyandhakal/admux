@@ -13,7 +13,7 @@ use crate::{
     layout::{Direction, LayoutTree, SplitAxis},
     pane::{PaneId, PaneSnapshot, Rect, WindowId},
     persistence::PersistedSession,
-    pty::PaneProcess,
+    pty::{PanePersistentSnapshot, PaneProcess, PaneRestoreSeed},
     window::WindowSummary,
 };
 
@@ -81,6 +81,32 @@ impl Session {
         window_defaults: WindowDefaults,
         helper_dir: PathBuf,
     ) -> Result<Self> {
+        Self::new_with_restore(
+            name,
+            workspace_manifest,
+            cwd,
+            command,
+            window_id,
+            default_shell,
+            scrollback_lines,
+            window_defaults,
+            helper_dir,
+            None,
+        )
+    }
+
+    pub fn new_with_restore(
+        name: String,
+        workspace_manifest: Option<String>,
+        cwd: Option<PathBuf>,
+        command: Vec<String>,
+        window_id: WindowId,
+        default_shell: Option<String>,
+        scrollback_lines: usize,
+        window_defaults: WindowDefaults,
+        helper_dir: PathBuf,
+        restore_seed: Option<PaneRestoreSeed>,
+    ) -> Result<Self> {
         let mut windows = BTreeMap::new();
         let initial_name = default_window_name(&command, &window_defaults);
         windows.insert(
@@ -95,6 +121,7 @@ impl Session {
                 scrollback_lines,
                 &window_defaults,
                 &helper_dir,
+                restore_seed,
             )?,
         );
 
@@ -471,6 +498,27 @@ impl Session {
         cwd: Option<PathBuf>,
         command: &[String],
     ) -> Result<SplitResult> {
+        self.split_pane_in_window_with_restore(
+            window_id,
+            target_pane,
+            axis,
+            ratio,
+            cwd,
+            command,
+            None,
+        )
+    }
+
+    pub fn split_pane_in_window_with_restore(
+        &mut self,
+        window_id: WindowId,
+        target_pane: Option<PaneId>,
+        axis: SplitAxis,
+        ratio: u16,
+        cwd: Option<PathBuf>,
+        command: &[String],
+        restore_seed: Option<PaneRestoreSeed>,
+    ) -> Result<SplitResult> {
         let default_command = if command.is_empty() {
             self.command.clone()
         } else {
@@ -489,6 +537,7 @@ impl Session {
             self.default_shell.as_deref(),
             self.scrollback_lines,
             &self.helper_dir,
+            restore_seed,
         )?;
         let pane = PaneRuntime {
             id: pane_id,
@@ -521,6 +570,17 @@ impl Session {
         cwd: Option<PathBuf>,
         command: &[String],
     ) -> Result<WindowCreation> {
+        self.new_window_with_cwd_and_restore(window_id, name, cwd, command, None)
+    }
+
+    pub fn new_window_with_cwd_and_restore(
+        &mut self,
+        window_id: WindowId,
+        name: Option<String>,
+        cwd: Option<PathBuf>,
+        command: &[String],
+        restore_seed: Option<PaneRestoreSeed>,
+    ) -> Result<WindowCreation> {
         let command = if command.is_empty() {
             self.command.clone()
         } else {
@@ -536,6 +596,7 @@ impl Session {
             self.scrollback_lines,
             &self.window_defaults,
             &self.helper_dir,
+            restore_seed,
         )?;
         let pane_id = window.layout.active;
         self.windows.insert(window_id, window);
@@ -543,6 +604,23 @@ impl Session {
         self.remember_window_switch(window_id);
         self.sync_pane_sizes()?;
         Ok(WindowCreation { window_id, pane_id })
+    }
+
+    pub fn pane_persistent_snapshot(
+        &self,
+        window_id: WindowId,
+        pane_id: PaneId,
+        lines: usize,
+    ) -> Result<PanePersistentSnapshot> {
+        let window = self
+            .windows
+            .get(&window_id)
+            .ok_or_else(|| anyhow!("unknown window"))?;
+        let pane = window
+            .panes
+            .get(&pane_id)
+            .ok_or_else(|| anyhow!("unknown pane"))?;
+        pane.process.persistent_snapshot(lines)
     }
 
     pub fn select_pane(&mut self, window_id: Option<WindowId>, pane_id: PaneId) -> Result<()> {
@@ -765,6 +843,7 @@ impl WindowRuntime {
         scrollback_lines: usize,
         window_defaults: &WindowDefaults,
         helper_dir: &Path,
+        restore_seed: Option<PaneRestoreSeed>,
     ) -> Result<Self> {
         let pane_id = PaneId(0);
         let process = PaneProcess::spawn(
@@ -774,6 +853,7 @@ impl WindowRuntime {
             default_shell,
             scrollback_lines,
             helper_dir,
+            restore_seed,
         )?;
         let pane = PaneRuntime {
             id: pane_id,
