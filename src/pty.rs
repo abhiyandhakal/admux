@@ -62,6 +62,7 @@ pub struct PanePersistentSnapshot {
     pub rows: u16,
     pub cols: u16,
     pub vt: String,
+    pub command: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,6 +137,7 @@ struct PanePersistentSnapshotWire {
     rows: u16,
     cols: u16,
     vt_b64: String,
+    command: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,6 +182,7 @@ impl From<PanePersistentSnapshotWire> for PanePersistentSnapshot {
                     .expect("pane snapshot wire should contain valid base64"),
             )
             .expect("pane snapshot wire should contain valid utf-8"),
+            command: value.command,
         }
     }
 }
@@ -793,7 +796,51 @@ fn helper_persistent_snapshot(
         rows,
         cols,
         vt_b64: STANDARD.encode(vt.as_bytes()),
+        command: helper_foreground_command(state).unwrap_or_default(),
     })
+}
+
+fn helper_foreground_command(state: &Arc<HelperState>) -> Option<Vec<String>> {
+    let pid = state
+        .master
+        .lock()
+        .expect("pane helper master lock poisoned")
+        .process_group_leader()?;
+    foreground_command_for_pid(pid)
+}
+
+fn foreground_command_for_pid(pid: i32) -> Option<Vec<String>> {
+    #[cfg(target_os = "linux")]
+    {
+        let path = PathBuf::from(format!("/proc/{pid}/cmdline"));
+        if let Ok(raw) = fs::read(path)
+            && !raw.is_empty()
+        {
+            let args: Vec<String> = raw
+                .split(|byte| *byte == 0)
+                .filter(|part| !part.is_empty())
+                .map(|part| String::from_utf8_lossy(part).into_owned())
+                .collect();
+            if !args.is_empty() {
+                return Some(args);
+            }
+        }
+    }
+
+    let output = Command::new("ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+    shell_words::split(&raw)
+        .ok()
+        .filter(|args| !args.is_empty())
 }
 
 fn read_helper_request(stream: &mut UnixStream) -> Result<PaneRequest> {
@@ -1059,5 +1106,23 @@ mod tests {
         let preview = wait_for_preview(&restored, "snapshot-two");
         assert!(preview.contains("snapshot-one"));
         assert!(preview.contains("snapshot-two"));
+    }
+
+    #[test]
+    fn persistent_snapshot_prefers_foreground_command() {
+        let dir = helper_dir();
+        let pane = PaneProcess::spawn(
+            &["sh".into(), "-lc".into(), "exec sleep 1".into()],
+            None,
+            None,
+            None,
+            10_000,
+            dir.path(),
+            None,
+        )
+        .expect("spawn pane");
+        thread::sleep(Duration::from_millis(50));
+        let snapshot = pane.persistent_snapshot(500).expect("persistent snapshot");
+        assert_eq!(snapshot.command.first().map(String::as_str), Some("sleep"));
     }
 }

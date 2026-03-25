@@ -248,7 +248,8 @@ pub fn save_workspace(session: &Session, snapshot_lines: usize) -> Result<PathBu
         )
     })?;
     let path = session_dir.join("admux.toml");
-    let manifest = export_workspace(session)?;
+    let mut snapshot = export_snapshot(session, &path, "", snapshot_lines)?;
+    let manifest = export_workspace(session, Some(&snapshot))?;
     let raw = toml::to_string_pretty(&manifest).context("failed to encode workspace manifest")?;
     fs::write(&path, raw)
         .with_context(|| format!("failed to write workspace manifest {}", path.display()))?;
@@ -256,7 +257,8 @@ pub fn save_workspace(session: &Session, snapshot_lines: usize) -> Result<PathBu
         &fs::read_to_string(&path)
             .with_context(|| format!("failed to reread workspace manifest {}", path.display()))?,
     );
-    write_snapshot_sidecar(session, &path, &digest, snapshot_lines)?;
+    snapshot.manifest_digest = digest.clone();
+    write_snapshot_sidecar(&snapshot, &path)?;
     Ok(path)
 }
 
@@ -361,7 +363,10 @@ fn resolve_workspace(
     })
 }
 
-fn export_workspace(session: &Session) -> Result<WorkspaceManifestOut> {
+fn export_workspace(
+    session: &Session,
+    snapshot: Option<&WorkspaceSnapshot>,
+) -> Result<WorkspaceManifestOut> {
     let session_cwd = session.cwd.clone().ok_or_else(|| {
         anyhow!(
             "session {} does not have a workspace directory",
@@ -377,12 +382,17 @@ fn export_workspace(session: &Session) -> Result<WorkspaceManifestOut> {
     let windows = session
         .window_order
         .iter()
-        .map(|window_id| {
+        .enumerate()
+        .map(|(index, window_id)| {
             let window = session
                 .windows
                 .get(window_id)
                 .ok_or_else(|| anyhow!("missing window {}", window_id.0))?;
-            export_window(window, &session_cwd)
+            export_window(
+                window,
+                &session_cwd,
+                snapshot.and_then(|snap| snap.windows.get(index)),
+            )
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -397,7 +407,11 @@ fn export_workspace(session: &Session) -> Result<WorkspaceManifestOut> {
     })
 }
 
-fn export_window(window: &WindowRuntime, session_cwd: &Path) -> Result<WindowSpecOut> {
+fn export_window(
+    window: &WindowRuntime,
+    session_cwd: &Path,
+    snapshot: Option<&WorkspaceWindowSnapshot>,
+) -> Result<WindowSpecOut> {
     let window_base = window.cwd.as_deref().unwrap_or(session_cwd);
     let pane_map = manifest_pane_map(window);
     let root_pane_id = origin_pane(&window.layout.root);
@@ -407,6 +421,7 @@ fn export_window(window: &WindowRuntime, session_cwd: &Path) -> Result<WindowSpe
             .get(&root_pane_id)
             .ok_or_else(|| anyhow!("missing root pane {}", root_pane_id.0))?,
         window_base,
+        snapshot.and_then(|snapshot| snapshot.panes.iter().find(|pane| pane.pane_id == 0)),
     )?;
     let mut splits = Vec::new();
     collect_splits(
@@ -414,6 +429,7 @@ fn export_window(window: &WindowRuntime, session_cwd: &Path) -> Result<WindowSpe
         window,
         window_base,
         &pane_map,
+        snapshot,
         &mut splits,
     )?;
     Ok(WindowSpecOut {
@@ -432,6 +448,7 @@ fn collect_splits(
     window: &WindowRuntime,
     window_base: &Path,
     pane_map: &BTreeMap<PaneId, u64>,
+    snapshot: Option<&WorkspaceWindowSnapshot>,
     splits: &mut Vec<SplitSpecOut>,
 ) -> Result<PaneId> {
     match node {
@@ -462,10 +479,18 @@ fn collect_splits(
                     Some((*ratio as f32) / 1000.0)
                 },
                 cwd: relativize(pane.cwd.as_deref().unwrap_or(window_base), window_base),
-                command: pane.command.clone(),
+                command: snapshot
+                    .and_then(|snapshot| {
+                        snapshot
+                            .panes
+                            .iter()
+                            .find(|saved| saved.pane_id == *pane_map.get(&new_pane).unwrap_or(&0))
+                    })
+                    .map(|saved| saved.command.clone())
+                    .unwrap_or_else(|| pane.command.clone()),
             });
-            collect_splits(first, window, window_base, pane_map, splits)?;
-            collect_splits(second, window, window_base, pane_map, splits)?;
+            collect_splits(first, window, window_base, pane_map, snapshot, splits)?;
+            collect_splits(second, window, window_base, pane_map, snapshot, splits)?;
             Ok(target)
         }
     }
@@ -495,13 +520,20 @@ fn assign_manifest_pane_ids(node: &LayoutNode, map: &mut BTreeMap<PaneId, u64>, 
     }
 }
 
-fn export_pane(pane: &PaneRuntime, base: &Path) -> Result<PaneSpecOut> {
-    if pane.command.is_empty() {
+fn export_pane(
+    pane: &PaneRuntime,
+    base: &Path,
+    snapshot: Option<&WorkspacePaneSnapshot>,
+) -> Result<PaneSpecOut> {
+    let command = snapshot
+        .map(|snapshot| snapshot.command.clone())
+        .unwrap_or_else(|| pane.command.clone());
+    if command.is_empty() {
         bail!("pane {} does not have a stored command", pane.id.0);
     }
     Ok(PaneSpecOut {
         cwd: relativize(pane.cwd.as_deref().unwrap_or(base), base),
-        command: pane.command.clone(),
+        command,
     })
 }
 
@@ -522,13 +554,7 @@ fn relativize(path: &Path, base: &Path) -> Option<PathBuf> {
         .or_else(|| Some(path.to_path_buf()))
 }
 
-fn write_snapshot_sidecar(
-    session: &Session,
-    manifest_path: &Path,
-    digest: &str,
-    snapshot_lines: usize,
-) -> Result<()> {
-    let snapshot = export_snapshot(session, manifest_path, digest, snapshot_lines)?;
+fn write_snapshot_sidecar(snapshot: &WorkspaceSnapshot, manifest_path: &Path) -> Result<()> {
     let state_dir = workspace_state_dir(manifest_path);
     fs::create_dir_all(&state_dir)
         .with_context(|| format!("failed to create {}", state_dir.display()))?;
@@ -538,8 +564,7 @@ fn write_snapshot_sidecar(
             .with_context(|| format!("failed to write {}", gitignore.display()))?;
     }
     let snapshot_path = workspace_snapshot_path(manifest_path);
-    let raw =
-        serde_json::to_vec_pretty(&snapshot).context("failed to encode workspace snapshot")?;
+    let raw = serde_json::to_vec_pretty(snapshot).context("failed to encode workspace snapshot")?;
     fs::write(&snapshot_path, raw)
         .with_context(|| format!("failed to write {}", snapshot_path.display()))?;
     Ok(())
@@ -578,7 +603,11 @@ fn export_snapshot(
                     .or_else(|| window.cwd.clone())
                     .or_else(|| session.cwd.clone())
                     .ok_or_else(|| anyhow!("pane {} does not have a cwd", pane.id.0))?,
-                command: pane.command.clone(),
+                command: if persistent.command.is_empty() {
+                    pane.command.clone()
+                } else {
+                    persistent.command
+                },
                 rows: persistent.rows,
                 cols: persistent.cols,
                 vt: persistent.vt,
@@ -900,6 +929,34 @@ root = { command = ["sh"] }
         assert!(
             loaded.snapshot.is_none(),
             "stale snapshot should be ignored"
+        );
+
+        let _ = session.kill();
+    }
+
+    #[test]
+    fn save_prefers_current_foreground_command_in_manifest() {
+        let dir = tempdir().expect("tempdir");
+        let session_dir = dir.path().join("project");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        let session = Session::new(
+            "workspace".into(),
+            None,
+            Some(session_dir.clone()),
+            vec!["sh".into(), "-lc".into(), "exec sleep 1".into()],
+            WindowId(1),
+            None,
+            10_000,
+            WindowDefaults::default(),
+            dir.path().join("helpers"),
+        )
+        .expect("session");
+
+        let manifest_path = save_workspace(&session, 500).expect("save workspace");
+        let raw = fs::read_to_string(manifest_path).expect("read manifest");
+        assert!(
+            raw.contains("sleep"),
+            "saved manifest should use foreground command"
         );
 
         let _ = session.kill();
