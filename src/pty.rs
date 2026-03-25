@@ -49,6 +49,7 @@ pub struct PaneSnapshot {
     pub cursor_col: u16,
     pub screen_rows: u16,
     pub screen_cols: u16,
+    pub mouse_reporting: bool,
     pub alive: bool,
 }
 
@@ -108,6 +109,11 @@ enum PaneRequest {
         row: u16,
         col: u16,
     },
+    MouseEvent {
+        kind: HelperMouseEventKind,
+        row: u16,
+        col: u16,
+    },
     Scrollback {
         lines: i16,
     },
@@ -151,7 +157,15 @@ struct PaneSnapshotWire {
     cursor_col: u16,
     screen_rows: u16,
     screen_cols: u16,
+    mouse_reporting: bool,
     alive: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HelperMouseEventKind {
+    LeftDown,
+    LeftDrag,
+    LeftUp,
 }
 
 impl From<PaneSnapshotWire> for PaneSnapshot {
@@ -166,6 +180,7 @@ impl From<PaneSnapshotWire> for PaneSnapshot {
             cursor_col: value.cursor_col,
             screen_rows: value.screen_rows,
             screen_cols: value.screen_cols,
+            mouse_reporting: value.mouse_reporting,
             alive: value.alive,
         }
     }
@@ -347,6 +362,14 @@ impl PaneProcess {
             PaneResponse::Ok => Ok(()),
             PaneResponse::Error { message } => Err(anyhow!(message)),
             other => Err(anyhow!("unexpected mouse scroll response: {other:?}")),
+        }
+    }
+
+    pub fn handle_mouse_event(&self, kind: HelperMouseEventKind, row: u16, col: u16) -> Result<()> {
+        match self.request(PaneRequest::MouseEvent { kind, row, col })? {
+            PaneResponse::Ok => Ok(()),
+            PaneResponse::Error { message } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected mouse event response: {other:?}")),
         }
     }
 
@@ -586,6 +609,13 @@ fn handle_helper_request(state: &Arc<HelperState>, request: PaneRequest) -> Pane
                 message: error.to_string(),
             },
         },
+        PaneRequest::MouseEvent { kind, row, col } => match helper_mouse_event(state, kind, row, col)
+        {
+            Ok(()) => PaneResponse::Ok,
+            Err(error) => PaneResponse::Error {
+                message: error.to_string(),
+            },
+        },
         PaneRequest::Scrollback { lines } => {
             helper_scroll_scrollback(state, lines);
             PaneResponse::Ok
@@ -632,6 +662,7 @@ fn helper_snapshot(state: &Arc<HelperState>, width: u16, height: u16) -> Result<
     let screen = terminal.parser.screen();
     let (screen_rows, screen_cols) = screen.size();
     let (cursor_row, cursor_col) = screen.cursor_position();
+    let mouse_reporting = screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None;
     let alive = state
         .child
         .lock()
@@ -653,6 +684,7 @@ fn helper_snapshot(state: &Arc<HelperState>, width: u16, height: u16) -> Result<
         cursor_col,
         screen_rows,
         screen_cols,
+        mouse_reporting,
         alive,
     })
 }
@@ -735,6 +767,40 @@ fn helper_mouse_scroll(
     writer
         .write_all(sgr.as_bytes())
         .context("failed to write mouse scroll bytes")?;
+    writer.flush().context("failed to flush PTY writer")?;
+    Ok(())
+}
+
+fn helper_mouse_event(
+    state: &Arc<HelperState>,
+    kind: HelperMouseEventKind,
+    row: u16,
+    col: u16,
+) -> Result<()> {
+    let mouse_mode = state
+        .terminal
+        .lock()
+        .expect("pane helper terminal lock poisoned")
+        .parser
+        .screen()
+        .mouse_protocol_mode();
+    if mouse_mode == vt100::MouseProtocolMode::None {
+        return Ok(());
+    }
+
+    let (code, suffix) = match kind {
+        HelperMouseEventKind::LeftDown => (0, 'M'),
+        HelperMouseEventKind::LeftDrag => (32, 'M'),
+        HelperMouseEventKind::LeftUp => (0, 'm'),
+    };
+    let sgr = format!("\x1b[<{};{};{}{}", code, col + 1, row + 1, suffix);
+    let mut writer = state
+        .writer
+        .lock()
+        .expect("pane helper writer lock poisoned");
+    writer
+        .write_all(sgr.as_bytes())
+        .context("failed to write mouse event bytes")?;
     writer.flush().context("failed to flush PTY writer")?;
     Ok(())
 }

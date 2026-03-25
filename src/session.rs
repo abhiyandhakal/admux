@@ -8,7 +8,8 @@ use anyhow::{Result, anyhow};
 use crate::{
     config::WindowDefaults,
     ipc::{
-        NavigationDirection, PaneCursor, PaneRender, PaneSummary, RenderSnapshot, ScrollDirection,
+        NavigationDirection, PaneCursor, PaneMouseKind, PaneRender, PaneSummary, RenderSnapshot,
+        ScrollDirection,
     },
     layout::{Direction, LayoutTree, SplitAxis},
     pane::{PaneId, PaneSnapshot, Rect, WindowId},
@@ -289,6 +290,7 @@ impl Session {
                     title: pane.title.clone(),
                     rect,
                     focused: pane_id == window.layout.active,
+                    mouse_reporting: render.mouse_reporting,
                     rows_plain: render.rows_plain,
                     rows_formatted: render.rows_formatted,
                     cursor,
@@ -341,6 +343,7 @@ impl Session {
                     title: pane.title.clone(),
                     rect,
                     focused: pane_id == window.layout.active && *window_id == self.active_window,
+                    mouse_reporting: render.mouse_reporting,
                     rows_plain: render.rows_plain,
                     rows_formatted: render.rows_formatted,
                     cursor,
@@ -464,6 +467,33 @@ impl Session {
             .get(&pane_id)
             .ok_or_else(|| anyhow!("unknown pane"))?;
         pane.process.handle_mouse_scroll(direction, row, col)?;
+        Ok(())
+    }
+
+    pub fn handle_pane_mouse(
+        &self,
+        pane_id: Option<PaneId>,
+        kind: PaneMouseKind,
+        row: u16,
+        col: u16,
+    ) -> Result<()> {
+        let window = self
+            .active_window()
+            .ok_or_else(|| anyhow!("unknown window"))?;
+        let pane_id = pane_id.unwrap_or(window.layout.active);
+        let pane = window
+            .panes
+            .get(&pane_id)
+            .ok_or_else(|| anyhow!("unknown pane"))?;
+        pane.process.handle_mouse_event(
+            match kind {
+                PaneMouseKind::LeftDown => crate::pty::HelperMouseEventKind::LeftDown,
+                PaneMouseKind::LeftDrag => crate::pty::HelperMouseEventKind::LeftDrag,
+                PaneMouseKind::LeftUp => crate::pty::HelperMouseEventKind::LeftUp,
+            },
+            row,
+            col,
+        )?;
         Ok(())
     }
 

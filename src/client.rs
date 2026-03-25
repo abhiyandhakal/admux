@@ -32,7 +32,7 @@ use crate::{
     input::{InputAction, InputMode, InputState},
     ipc::{
         BufferSummary, CommandRequest, CommandResponse, CycleDirection, NavigationDirection,
-        PaneCursor, PaneRender, RenderSnapshot, SwitchSource,
+        PaneCursor, PaneMouseKind, PaneRender, RenderSnapshot, SwitchSource,
     },
     layout::SplitAxis,
     pane::Rect,
@@ -2107,6 +2107,21 @@ fn handle_mouse_event(
                         },
                     )?;
                 }
+                if pane.mouse_reporting {
+                    let _ = request_response(
+                        paths,
+                        CommandRequest::MousePane {
+                            session: session.to_string(),
+                            pane_id: pane.pane_id,
+                            row,
+                            col,
+                            kind: PaneMouseKind::LeftDown,
+                        },
+                    )?;
+                    *selection_anchor = None;
+                    *active_selection = None;
+                    return Ok(false);
+                }
                 if config.mouse.selection_copy {
                     *selection_anchor = Some(SelectionAnchor {
                         pane_id: pane.pane_id,
@@ -2137,6 +2152,20 @@ fn handle_mouse_event(
                     resize.last_row = mouse.row;
                     resize.last_col = mouse.column;
                 }
+            } else if let Some((pane, row, col)) =
+                pane_content_hit(snapshot, mouse.row, mouse.column)
+                && pane.mouse_reporting
+            {
+                let _ = request_response(
+                    paths,
+                    CommandRequest::MousePane {
+                        session: session.to_string(),
+                        pane_id: pane.pane_id,
+                        row,
+                        col,
+                        kind: PaneMouseKind::LeftDrag,
+                    },
+                )?;
             } else if config.mouse.selection_copy
                 && let Some(anchor) = selection_anchor.as_ref()
                 && let Some((pane, row, col)) = pane_content_hit(snapshot, mouse.row, mouse.column)
@@ -2151,6 +2180,23 @@ fn handle_mouse_event(
         }
         MouseEventKind::Up(MouseButton::Left) => {
             *resize_drag = None;
+            if let Some((pane, row, col)) = pane_content_hit(snapshot, mouse.row, mouse.column)
+                && pane.mouse_reporting
+            {
+                let _ = request_response(
+                    paths,
+                    CommandRequest::MousePane {
+                        session: session.to_string(),
+                        pane_id: pane.pane_id,
+                        row,
+                        col,
+                        kind: PaneMouseKind::LeftUp,
+                    },
+                )?;
+                *selection_anchor = None;
+                *active_selection = None;
+                return Ok(false);
+            }
             if config.mouse.selection_copy
                 && let Some(anchor) = selection_anchor.take()
                 && let Some((pane, row, col)) = pane_content_hit(snapshot, mouse.row, mouse.column)
@@ -2292,6 +2338,7 @@ fn fallback_snapshot(preview: String, width: u16, height: u16) -> RenderSnapshot
                 height: height.saturating_sub(1).max(1),
             },
             focused: true,
+            mouse_reporting: false,
             rows_formatted: rows_plain.clone(),
             rows_plain,
             cursor: Some(PaneCursor { row: 0, col: 0 }),

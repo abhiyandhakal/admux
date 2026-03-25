@@ -118,6 +118,13 @@ pub enum CommandRequest {
         col: u16,
         direction: ScrollDirection,
     },
+    MousePane {
+        session: String,
+        pane_id: u64,
+        row: u16,
+        col: u16,
+        kind: PaneMouseKind,
+    },
     CopySelection {
         session: String,
         pane_id: Option<u64>,
@@ -243,6 +250,13 @@ pub enum ScrollDirection {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PaneMouseKind {
+    LeftDown,
+    LeftDrag,
+    LeftUp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NavigationDirection {
     Left,
     Right,
@@ -275,6 +289,8 @@ pub struct PaneRender {
     pub title: String,
     pub rect: Rect,
     pub focused: bool,
+    #[serde(default)]
+    pub mouse_reporting: bool,
     pub rows_plain: Vec<String>,
     pub rows_formatted: Vec<String>,
     pub cursor: Option<PaneCursor>,
