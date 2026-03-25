@@ -49,6 +49,7 @@ pub enum InteractiveCommand {
     RenameWindow {
         name: String,
     },
+    SaveSession,
     SendKeys {
         keys: Vec<String>,
     },
@@ -135,6 +136,10 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &[],
     },
     CommandSpec {
+        canonical: "save-session",
+        aliases: &[],
+    },
+    CommandSpec {
         canonical: "rename-window",
         aliases: &[],
     },
@@ -183,6 +188,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "previous-window",
     "reload-config",
     "save-buffer",
+    "save-session",
     "rename-window",
     "set-buffer",
     "select-window",
@@ -251,6 +257,7 @@ pub fn parse(input: &str) -> Result<InteractiveCommand, String> {
         "choose-tree" => parse_no_args(command, args).map(|_| InteractiveCommand::ChooseTree),
         "detach-client" => parse_no_args(command, args).map(|_| InteractiveCommand::DetachClient),
         "reload-config" => parse_no_args(command, args).map(|_| InteractiveCommand::ReloadConfig),
+        "save-session" => parse_no_args(command, args).map(|_| InteractiveCommand::SaveSession),
         "rename-window" => parse_rename_window(args),
         "send-keys" => parse_send_keys(args),
         _ => Err(format!("unsupported command '{command}'")),
@@ -568,6 +575,14 @@ mod tests {
         assert_eq!(
             parse("reload-config").expect("parse"),
             InteractiveCommand::ReloadConfig
+        );
+    }
+
+    #[test]
+    fn parses_save_session() {
+        assert_eq!(
+            parse("save-session").expect("parse"),
+            InteractiveCommand::SaveSession
         );
     }
 

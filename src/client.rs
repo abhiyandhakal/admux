@@ -1443,6 +1443,15 @@ fn execute_prompt_command(
             let _ = request_response(paths, CommandRequest::RenameWindow { target, name })?;
             Ok(None)
         }
+        InteractiveCommand::SaveSession => {
+            let response = request_response(
+                paths,
+                CommandRequest::SaveWorkspace {
+                    session: Some(current_session.clone()),
+                },
+            )?;
+            Ok(Some(format_list_response(response)))
+        }
         InteractiveCommand::SendKeys { keys } => {
             let _ = request_response(
                 paths,

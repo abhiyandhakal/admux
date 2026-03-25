@@ -161,6 +161,7 @@ Workspace notes:
 - `admux save` writes `admux.toml` into the session directory, not the caller's current directory
 - `admux save` also writes `.admux/snapshot.json` plus `.admux/.gitignore` in the session directory
 - `admux save` with no session argument uses the current `ADMUX_SESSION` when invoked inside `admux`, otherwise it falls back to the daemon's current session resolution
+- the command prompt also supports `save-session`, so `Ctrl-b :save-session` saves the current session workspace and snapshot
 - snapshots are local sidecar state intended for best-effort restore, not exact process checkpointing
 
 Example:
