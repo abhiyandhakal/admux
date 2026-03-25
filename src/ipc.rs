@@ -290,6 +290,8 @@ pub struct PaneRender {
     pub rect: Rect,
     pub focused: bool,
     #[serde(default)]
+    pub helper_socket: Option<PathBuf>,
+    #[serde(default)]
     pub mouse_reporting: bool,
     pub rows_plain: Vec<String>,
     pub rows_formatted: Vec<String>,

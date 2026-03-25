@@ -37,6 +37,7 @@ use crate::{
     },
     layout::SplitAxis,
     pane::Rect,
+    pty::{HelperMouseEventKind, PaneProcess},
     paths::RuntimePaths,
     render::{
         BottomBar, PaneSelection, TerminalSize, TreeLine, render_buffer_chooser,
@@ -876,7 +877,7 @@ fn run_attach_loop(
                             copy_mode = None;
                         }
                         InputAction::SendBytes(bytes) => {
-                            send_input_bytes(paths, &current_session, &bytes)?;
+                            send_input_bytes(paths, &snapshot, &current_session, &bytes)?;
                             needs_refresh = true;
                         }
                         InputAction::SplitPane(axis) => {
@@ -1160,7 +1161,7 @@ fn run_attach_loop(
             }
             Event::Paste(text) => {
                 if matches!(overlay, OverlayState::None) && copy_mode.is_none() {
-                    send_input_bytes(paths, &current_session, text.as_bytes())?;
+                    send_input_bytes(paths, &snapshot, &current_session, text.as_bytes())?;
                     needs_refresh = true;
                 }
             }
@@ -2154,16 +2155,20 @@ fn handle_mouse_event(
                     )?;
                 }
                 if pane.mouse_reporting {
-                    let _ = request_response(
-                        paths,
-                        CommandRequest::MousePane {
-                            session: session.to_string(),
-                            pane_id: pane.pane_id,
-                            row,
-                            col,
-                            kind: PaneMouseKind::LeftDown,
-                        },
-                    )?;
+                send_pane_mouse(snapshot, pane.pane_id, row, col, HelperMouseEventKind::LeftDown)
+                    .or_else(|_| {
+                        request_response(
+                            paths,
+                            CommandRequest::MousePane {
+                                session: session.to_string(),
+                                pane_id: pane.pane_id,
+                                row,
+                                col,
+                                kind: PaneMouseKind::LeftDown,
+                            },
+                        )
+                        .map(|_| ())
+                    })?;
                     *selection_anchor = None;
                     *active_selection = None;
                     return Ok(false);
@@ -2202,16 +2207,20 @@ fn handle_mouse_event(
                 pane_content_hit(snapshot, mouse.row, mouse.column)
                 && pane.mouse_reporting
             {
-                let _ = request_response(
-                    paths,
-                    CommandRequest::MousePane {
-                        session: session.to_string(),
-                        pane_id: pane.pane_id,
-                        row,
-                        col,
-                        kind: PaneMouseKind::LeftDrag,
-                    },
-                )?;
+                send_pane_mouse(snapshot, pane.pane_id, row, col, HelperMouseEventKind::LeftDrag)
+                    .or_else(|_| {
+                        request_response(
+                            paths,
+                            CommandRequest::MousePane {
+                                session: session.to_string(),
+                                pane_id: pane.pane_id,
+                                row,
+                                col,
+                                kind: PaneMouseKind::LeftDrag,
+                            },
+                        )
+                        .map(|_| ())
+                    })?;
             } else if config.mouse.selection_copy
                 && let Some(anchor) = selection_anchor.as_ref()
                 && let Some((pane, row, col)) = pane_content_hit(snapshot, mouse.row, mouse.column)
@@ -2229,16 +2238,20 @@ fn handle_mouse_event(
             if let Some((pane, row, col)) = pane_content_hit(snapshot, mouse.row, mouse.column)
                 && pane.mouse_reporting
             {
-                let _ = request_response(
-                    paths,
-                    CommandRequest::MousePane {
-                        session: session.to_string(),
-                        pane_id: pane.pane_id,
-                        row,
-                        col,
-                        kind: PaneMouseKind::LeftUp,
-                    },
-                )?;
+                send_pane_mouse(snapshot, pane.pane_id, row, col, HelperMouseEventKind::LeftUp)
+                    .or_else(|_| {
+                        request_response(
+                            paths,
+                            CommandRequest::MousePane {
+                                session: session.to_string(),
+                                pane_id: pane.pane_id,
+                                row,
+                                col,
+                                kind: PaneMouseKind::LeftUp,
+                            },
+                        )
+                        .map(|_| ())
+                    })?;
                 *selection_anchor = None;
                 *active_selection = None;
                 return Ok(false);
@@ -2384,6 +2397,7 @@ fn fallback_snapshot(preview: String, width: u16, height: u16) -> RenderSnapshot
                 height: height.saturating_sub(1).max(1),
             },
             focused: true,
+            helper_socket: None,
             mouse_reporting: false,
             rows_formatted: rows_plain.clone(),
             rows_plain,
@@ -2395,9 +2409,21 @@ fn fallback_snapshot(preview: String, width: u16, height: u16) -> RenderSnapshot
     }
 }
 
-fn send_input_bytes(paths: &RuntimePaths, session: &str, bytes: &[u8]) -> Result<()> {
+fn send_input_bytes(
+    paths: &RuntimePaths,
+    snapshot: &RenderSnapshot,
+    session: &str,
+    bytes: &[u8],
+) -> Result<()> {
     if bytes.is_empty() {
         return Ok(());
+    }
+
+    if let Some(pane) = focused_pane(snapshot)
+        && let Some(socket) = pane.helper_socket.clone()
+        && let Ok(process) = PaneProcess::connect(socket)
+    {
+        return process.send_keys(&[String::from_utf8_lossy(bytes).into_owned()]);
     }
 
     let keys = vec![String::from_utf8_lossy(bytes).into_owned()];
@@ -2409,6 +2435,26 @@ fn send_input_bytes(paths: &RuntimePaths, session: &str, bytes: &[u8]) -> Result
         },
     )?;
     Ok(())
+}
+
+fn send_pane_mouse(
+    snapshot: &RenderSnapshot,
+    pane_id: u64,
+    row: u16,
+    col: u16,
+    kind: HelperMouseEventKind,
+) -> Result<()> {
+    let pane = snapshot
+        .panes
+        .iter()
+        .find(|pane| pane.pane_id == pane_id)
+        .ok_or_else(|| anyhow!("unknown pane {pane_id}"))?;
+    let socket = pane
+        .helper_socket
+        .clone()
+        .ok_or_else(|| anyhow!("pane {} has no helper socket", pane_id))?;
+    let process = PaneProcess::connect(socket)?;
+    process.handle_mouse_event(kind, row, col)
 }
 
 fn copy_via_osc52(out: &mut impl Write, text: &str) -> Result<()> {
