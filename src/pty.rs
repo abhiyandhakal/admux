@@ -609,13 +609,14 @@ fn handle_helper_request(state: &Arc<HelperState>, request: PaneRequest) -> Pane
                 message: error.to_string(),
             },
         },
-        PaneRequest::MouseEvent { kind, row, col } => match helper_mouse_event(state, kind, row, col)
-        {
-            Ok(()) => PaneResponse::Ok,
-            Err(error) => PaneResponse::Error {
-                message: error.to_string(),
-            },
-        },
+        PaneRequest::MouseEvent { kind, row, col } => {
+            match helper_mouse_event(state, kind, row, col) {
+                Ok(()) => PaneResponse::Ok,
+                Err(error) => PaneResponse::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
         PaneRequest::Scrollback { lines } => {
             helper_scroll_scrollback(state, lines);
             PaneResponse::Ok

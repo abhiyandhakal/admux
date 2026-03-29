@@ -528,13 +528,14 @@ impl SessionStore {
                 col,
                 kind,
             } => match self.sessions.get(&session) {
-                Some(session) => match session.handle_pane_mouse(Some(PaneId(pane_id)), kind, row, col)
-                {
-                    Ok(_) => CommandResponse::FocusChanged,
-                    Err(error) => CommandResponse::Error {
-                        message: error.to_string(),
-                    },
-                },
+                Some(session) => {
+                    match session.handle_pane_mouse(Some(PaneId(pane_id)), kind, row, col) {
+                        Ok(_) => CommandResponse::FocusChanged,
+                        Err(error) => CommandResponse::Error {
+                            message: error.to_string(),
+                        },
+                    }
+                }
                 None => CommandResponse::Error {
                     message: format!("unknown session {session}"),
                 },
