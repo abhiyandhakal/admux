@@ -12,12 +12,16 @@ use std::{
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const HISTORY_LIMIT: usize = 2 * 1024 * 1024;
+static HELPER_NAME_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct TerminalState {
     parser: vt100::Parser,
@@ -960,7 +964,7 @@ fn build_command(
 }
 
 fn wait_for_socket(socket_path: &Path) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         if socket_path.exists() {
             return Ok(());
@@ -1002,15 +1006,19 @@ fn unique_helper_name(admux_context: Option<(&str, WindowId, PaneId)>) -> String
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
+    let pid = std::process::id();
+    let counter = HELPER_NAME_COUNTER.fetch_add(1, Ordering::Relaxed);
     match admux_context {
         Some((session, window_id, pane_id)) => format!(
-            "{}-{}-{}-{}.sock",
+            "{}-{}-{}-{}-{}-{}.sock",
             sanitize_component(session),
             window_id.0,
             pane_id.0,
-            now
+            pid,
+            now,
+            counter
         ),
-        None => format!("pane-{}.sock", now),
+        None => format!("pane-{}-{}-{}.sock", pid, now, counter),
     }
 }
 
