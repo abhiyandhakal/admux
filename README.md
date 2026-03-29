@@ -168,18 +168,22 @@ admux reload-config
 
 The top-level README is meant to stay product-facing and quick to scan.
 
-The detailed docs are now staged in GitHub wiki format under [docs/wiki](/home/abhiyan/coding/projects/admux/docs/wiki). Once the repository wiki is enabled, these pages can be published there directly.
+For deeper documentation, use the GitHub wiki:
 
-Staged wiki pages:
+- <https://github.com/abhiyandhakal/admux/wiki>
 
-- [Home](/home/abhiyan/coding/projects/admux/docs/wiki/Home.md)
-- [CLI Reference](/home/abhiyan/coding/projects/admux/docs/wiki/CLI-Reference.md)
-- [Keybindings and Interactive Commands](/home/abhiyan/coding/projects/admux/docs/wiki/Keybindings-and-Interactive-Commands.md)
-- [Workspace Manifests](/home/abhiyan/coding/projects/admux/docs/wiki/Workspace-Manifests.md)
-- [Workspace Snapshots and Restore](/home/abhiyan/coding/projects/admux/docs/wiki/Workspace-Snapshots-and-Restore.md)
-- [Configuration Reference](/home/abhiyan/coding/projects/admux/docs/wiki/Configuration-Reference.md)
-- [Architecture](/home/abhiyan/coding/projects/admux/docs/wiki/Architecture.md)
-- [Troubleshooting](/home/abhiyan/coding/projects/admux/docs/wiki/Troubleshooting.md)
+Core wiki pages:
+
+- [Home](https://github.com/abhiyandhakal/admux/wiki)
+- [CLI Reference](https://github.com/abhiyandhakal/admux/wiki/CLI-Reference)
+- [Keybindings and Interactive Commands](https://github.com/abhiyandhakal/admux/wiki/Keybindings-and-Interactive-Commands)
+- [Workspace Manifests](https://github.com/abhiyandhakal/admux/wiki/Workspace-Manifests)
+- [Workspace Snapshots and Restore](https://github.com/abhiyandhakal/admux/wiki/Workspace-Snapshots-and-Restore)
+- [Configuration Reference](https://github.com/abhiyandhakal/admux/wiki/Configuration-Reference)
+- [Architecture](https://github.com/abhiyandhakal/admux/wiki/Architecture)
+- [Troubleshooting](https://github.com/abhiyandhakal/admux/wiki/Troubleshooting)
+
+The staged source for those pages is kept in [docs/wiki](/home/abhiyan/coding/projects/admux/docs/wiki).
 
 Engineering records remain in-repo:
 
