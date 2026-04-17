@@ -895,7 +895,7 @@ fn run_attach_loop(
                             if let Some(window) = snapshot
                                 .windows
                                 .iter()
-                                .find(|window| window.index == index as usize)
+                                .find(|window| window.index == index as u64)
                             {
                                 let _ = request_response(
                                     paths,
@@ -1570,7 +1570,10 @@ fn command_completions(prefix: &str) -> Vec<String> {
 
 fn resolve_window_target(snapshot: &RenderSnapshot, session: &str, target: &str) -> String {
     if let Ok(index) = target.parse::<usize>()
-        && let Some(window) = snapshot.windows.iter().find(|window| window.index == index)
+        && let Some(window) = snapshot
+            .windows
+            .iter()
+            .find(|window| window.index == index as u64)
     {
         return format!("{session}:{}", window.id);
     }
@@ -2499,7 +2502,11 @@ mod tests {
         io::{Read, Write},
         os::unix::net::UnixListener,
     };
-    use tempfile::tempdir;
+    use tempfile::{TempDir, tempdir as make_tempdir};
+
+    fn tempdir() -> TempDir {
+        make_tempdir().expect("tempdir")
+    }
 
     #[test]
     fn writes_and_reads_protocol_messages() {
@@ -2524,7 +2531,7 @@ mod tests {
 
     #[test]
     fn ensure_protocol_surfaces_mismatch() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempdir();
         let socket_path = dir.path().join("socket");
         let paths = RuntimePaths {
             socket_path: socket_path.clone(),
@@ -2568,7 +2575,7 @@ mod tests {
 
     #[test]
     fn normalize_new_args_treats_single_directory_argument_as_cwd() {
-        let dir = tempdir().expect("tempdir");
+        let dir = tempdir();
         let args = crate::cli::NewArgs {
             detach: true,
             name: Some("work".into()),

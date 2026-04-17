@@ -8,7 +8,11 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use tempfile::tempdir;
+use tempfile::{TempDir, tempdir as make_tempdir};
+
+fn tempdir() -> TempDir {
+    make_tempdir().expect("tempdir")
+}
 
 fn spawn_daemon(socket: &Path) -> Child {
     let child = StdCommand::new(env!("CARGO_BIN_EXE_admuxd"))
@@ -26,7 +30,7 @@ fn spawn_daemon(socket: &Path) -> Child {
 
 #[test]
 fn daemon_backed_cli_can_manage_sessions() {
-    let temp = tempdir().expect("tempdir");
+    let temp = tempdir();
     let socket = temp.path().join("runtime").join("admux.sock");
     let config = temp.path().join("config.toml");
     std::fs::write(&config, "").expect("write config");
@@ -92,7 +96,7 @@ fn daemon_backed_cli_can_manage_sessions() {
 
 #[test]
 fn daemon_backed_cli_can_bootstrap_workspace_manifest() {
-    let temp = tempdir().expect("tempdir");
+    let temp = tempdir();
     let socket = temp.path().join("runtime").join("admux.sock");
     let config = temp.path().join("config.toml");
     let workspace = temp.path().join("admux.toml");
@@ -150,7 +154,7 @@ root = { command = ["sh", "-lc", "printf tests-ready; sleep 2"] }
 
 #[test]
 fn save_writes_workspace_manifest_into_session_directory() {
-    let temp = tempdir().expect("tempdir");
+    let temp = tempdir();
     let socket = temp.path().join("runtime").join("admux.sock");
     let config = temp.path().join("config.toml");
     let session_dir = temp.path().join("project");
@@ -237,7 +241,7 @@ fn save_writes_workspace_manifest_into_session_directory() {
 
 #[test]
 fn workspace_save_and_up_restore_snapshot_sidecar() {
-    let temp = tempdir().expect("tempdir");
+    let temp = tempdir();
     let socket = temp.path().join("runtime").join("admux.sock");
     let config = temp.path().join("config.toml");
     let session_dir = temp.path().join("project");

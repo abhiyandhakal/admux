@@ -133,6 +133,8 @@ pub struct BehaviorConfig {
     pub resize_step: u16,
     pub copy_page_size: Option<u16>,
     pub workspace_snapshot_lines: usize,
+    pub window_base: u64,
+    pub pane_base: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -454,7 +456,7 @@ impl Default for KeyConfig {
             prefix: "Ctrl-b".into(),
             bindings: default_legacy_leader_bindings(),
             normal: BTreeMap::new(),
-            leader: default_leader_bindings(),
+            leader: default_leader_bindings(0),
             copy_mode: default_copy_mode_bindings(),
         }
     }
@@ -533,6 +535,8 @@ impl Default for BehaviorConfig {
             resize_step: 50,
             copy_page_size: None,
             workspace_snapshot_lines: 500,
+            window_base: 0,
+            pane_base: 0,
         }
     }
 }
@@ -577,7 +581,11 @@ impl Config {
 
     pub fn resolve(&self) -> Result<ResolvedConfig> {
         let status = resolve_status_config(&self.ui);
-        let key_config = resolve_key_config(&self.keys, self.behavior.resize_step)?;
+        let key_config = resolve_key_config(
+            &self.keys,
+            self.behavior.resize_step,
+            self.behavior.window_base,
+        )?;
         Ok(ResolvedConfig {
             ui: ResolvedUiConfig {
                 status_position: self.ui.status_position,
@@ -608,16 +616,27 @@ fn resolve_status_config(ui: &UiConfig) -> StatusConfig {
     status
 }
 
-fn resolve_key_config(config: &KeyConfig, resize_step: u16) -> Result<ResolvedKeyConfig> {
+fn resolve_key_config(
+    config: &KeyConfig,
+    resize_step: u16,
+    window_base: u64,
+) -> Result<ResolvedKeyConfig> {
     let prefix = parse_key_pattern(&config.prefix)
         .with_context(|| format!("invalid keys.prefix '{}'", config.prefix))?;
     let normal = resolve_table("keys.normal", &config.normal, resize_step)?;
 
-    let mut leader_raw = default_leader_bindings();
+    let mut leader_raw = default_leader_bindings(window_base);
+    let implicit_default_leader = default_leader_bindings(0);
     for (action, key) in &config.bindings {
         leader_raw.insert(action.clone(), key.clone());
     }
     for (action, key) in &config.leader {
+        if implicit_default_leader
+            .get(action)
+            .is_some_and(|default_key| default_key == key)
+        {
+            continue;
+        }
         leader_raw.insert(action.clone(), key.clone());
     }
     let leader = resolve_table("keys.leader", &leader_raw, resize_step)?;
@@ -736,6 +755,12 @@ fn key_event_code(event: &KeyEvent) -> KeyPatternCode {
 }
 
 fn parse_action_name(value: &str) -> Result<Action> {
+    if let Some(index) = value.strip_prefix("select_window_") {
+        let index = index
+            .parse::<u8>()
+            .with_context(|| format!("invalid window index '{index}'"))?;
+        return Ok(Action::SelectWindowIndex(index));
+    }
     Ok(match value {
         "detach" => Action::Detach,
         "split_vertical" | "split-right" => Action::SplitVertical,
@@ -746,16 +771,6 @@ fn parse_action_name(value: &str) -> Result<Action> {
         "new_window" => Action::NewWindow,
         "next_window" => Action::NextWindow,
         "prev_window" | "previous_window" => Action::PrevWindow,
-        "select_window_0" => Action::SelectWindowIndex(0),
-        "select_window_1" => Action::SelectWindowIndex(1),
-        "select_window_2" => Action::SelectWindowIndex(2),
-        "select_window_3" => Action::SelectWindowIndex(3),
-        "select_window_4" => Action::SelectWindowIndex(4),
-        "select_window_5" => Action::SelectWindowIndex(5),
-        "select_window_6" => Action::SelectWindowIndex(6),
-        "select_window_7" => Action::SelectWindowIndex(7),
-        "select_window_8" => Action::SelectWindowIndex(8),
-        "select_window_9" => Action::SelectWindowIndex(9),
         "focus_left" => Action::FocusLeft,
         "focus_down" => Action::FocusDown,
         "focus_up" => Action::FocusUp,
@@ -792,7 +807,7 @@ fn default_legacy_leader_bindings() -> BTreeMap<String, String> {
     BTreeMap::new()
 }
 
-fn default_leader_bindings() -> BTreeMap<String, String> {
+fn default_leader_bindings(window_base: u64) -> BTreeMap<String, String> {
     let mut bindings = BTreeMap::new();
     bindings.insert("detach".into(), "d".into());
     bindings.insert("split_vertical".into(), "%".into());
@@ -817,16 +832,12 @@ fn default_leader_bindings() -> BTreeMap<String, String> {
     bindings.insert("list_buffers".into(), "#".into());
     bindings.insert("delete_top_buffer".into(), "-".into());
     bindings.insert("choose_buffer".into(), "=".into());
-    bindings.insert("select_window_0".into(), "0".into());
-    bindings.insert("select_window_1".into(), "1".into());
-    bindings.insert("select_window_2".into(), "2".into());
-    bindings.insert("select_window_3".into(), "3".into());
-    bindings.insert("select_window_4".into(), "4".into());
-    bindings.insert("select_window_5".into(), "5".into());
-    bindings.insert("select_window_6".into(), "6".into());
-    bindings.insert("select_window_7".into(), "7".into());
-    bindings.insert("select_window_8".into(), "8".into());
-    bindings.insert("select_window_9".into(), "9".into());
+    for offset in 0..=9u64 {
+        let public = window_base + offset;
+        if public <= 9 {
+            bindings.insert(format!("select_window_{public}"), public.to_string());
+        }
+    }
     bindings.insert("reload_config".into(), "r".into());
     bindings
 }
@@ -936,6 +947,40 @@ mod tests {
                 .leader
                 .iter()
                 .any(|(_, action)| *action == Action::ChooseBuffer)
+        );
+    }
+
+    #[test]
+    fn numbering_bases_shift_default_window_digit_bindings() {
+        let config = Config::from_toml(
+            r#"
+                [behavior]
+                window_base = 1
+                pane_base = 2
+            "#,
+        )
+        .expect("config");
+        let resolved = config.resolve().expect("resolve");
+
+        assert_eq!(resolved.behavior.window_base, 1);
+        assert_eq!(resolved.behavior.pane_base, 2);
+        assert!(
+            resolved.keys.leader.iter().any(|(pattern, action)| {
+                *action == Action::SelectWindowIndex(1)
+                    && *pattern == parse_key_pattern("1").expect("digit binding")
+            })
+        );
+        assert!(
+            !resolved.keys.leader.iter().any(|(_, action)| {
+                *action == Action::SelectWindowIndex(0)
+            })
+        );
+        assert!(
+            !resolved
+                .keys
+                .leader
+                .iter()
+                .any(|(pattern, _)| *pattern == parse_key_pattern("0").expect("digit binding"))
         );
     }
 

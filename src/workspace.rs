@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     layout::{LayoutNode, SplitAxis},
+    numbering::Numbering,
     pane::PaneId,
     session::{PaneRuntime, Session, WindowRuntime},
 };
@@ -210,7 +211,7 @@ impl From<RawSplitDirection> for SplitAxis {
     }
 }
 
-pub fn load_workspace(path: &Path) -> Result<WorkspaceLoad> {
+pub fn load_workspace(path: &Path, numbering: Numbering) -> Result<WorkspaceLoad> {
     let manifest_path = path
         .canonicalize()
         .with_context(|| format!("failed to resolve workspace file {}", path.display()))?;
@@ -228,7 +229,7 @@ pub fn load_workspace(path: &Path) -> Result<WorkspaceLoad> {
     let manifest_digest = manifest_digest(&raw);
     let manifest: RawWorkspaceManifest = toml::from_str(&raw)
         .with_context(|| format!("failed to parse workspace file {}", manifest_path.display()))?;
-    let mut workspace = resolve_workspace(manifest_path.clone(), manifest_dir, manifest)?;
+    let mut workspace = resolve_workspace(manifest_path.clone(), manifest_dir, manifest, numbering)?;
     workspace.manifest_digest = manifest_digest.clone();
     workspace.snapshot = load_snapshot_sidecar(&manifest_path, &manifest_digest)?;
     Ok(workspace)
@@ -266,6 +267,7 @@ fn resolve_workspace(
     manifest_path: PathBuf,
     manifest_dir: PathBuf,
     manifest: RawWorkspaceManifest,
+    numbering: Numbering,
 ) -> Result<WorkspaceLoad> {
     if manifest.version != 1 {
         bail!(
@@ -290,11 +292,14 @@ fn resolve_workspace(
                 .to_string()
         });
     let cwd = resolve_cwd(workspace.cwd.as_ref(), &manifest_dir);
-    let active_window = workspace.active_window.unwrap_or(0);
+    let active_window_public = workspace.active_window.unwrap_or(numbering.window_base as usize);
+    let active_window = numbering
+        .parse_public_window_number(active_window_public as u64)?
+        ;
     if active_window >= manifest.windows.len() {
         bail!(
             "workspace active_window {} is out of range for {} windows",
-            active_window,
+            active_window_public,
             manifest.windows.len()
         );
     }
@@ -306,7 +311,8 @@ fn resolve_workspace(
         let mut known_panes = 1u64;
         let mut splits = Vec::with_capacity(window.splits.len());
         for split in window.splits {
-            if split.target >= known_panes {
+            let target = numbering.parse_public_pane_number(split.target)?.0;
+            if target >= known_panes {
                 bail!(
                     "window {} split target {} does not exist yet",
                     window_index,
@@ -315,7 +321,7 @@ fn resolve_workspace(
             }
             let ratio = resolve_ratio(split.size)?;
             splits.push(WorkspaceSplitSpec {
-                target: split.target,
+                target,
                 direction: split.direction.into(),
                 ratio,
                 pane: resolve_pane_spec(
@@ -329,12 +335,13 @@ fn resolve_workspace(
             known_panes += 1;
         }
 
-        let active_pane = window.active_pane.unwrap_or(0);
+        let active_pane_public = window.active_pane.unwrap_or(numbering.pane_base);
+        let active_pane = numbering.parse_public_pane_number(active_pane_public)?.0;
         if active_pane >= known_panes {
             bail!(
                 "window {} active_pane {} is out of range for {} panes",
                 window_index,
-                active_pane,
+                active_pane_public,
                 known_panes
             );
         }
@@ -374,10 +381,14 @@ fn export_workspace(
         )
     })?;
     let active_window = session
-        .window_order
-        .iter()
-        .position(|window_id| *window_id == session.active_window)
-        .unwrap_or(0);
+        .numbering
+        .public_window_number(
+            session
+                .window_order
+                .iter()
+                .position(|window_id| *window_id == session.active_window)
+                .unwrap_or(0),
+        )? as usize;
 
     let windows = session
         .window_order
@@ -391,6 +402,7 @@ fn export_workspace(
             export_window(
                 window,
                 &session_cwd,
+                session.numbering,
                 snapshot.and_then(|snap| snap.windows.get(index)),
             )
         })
@@ -410,10 +422,11 @@ fn export_workspace(
 fn export_window(
     window: &WindowRuntime,
     session_cwd: &Path,
+    numbering: Numbering,
     snapshot: Option<&WorkspaceWindowSnapshot>,
 ) -> Result<WindowSpecOut> {
     let window_base = window.cwd.as_deref().unwrap_or(session_cwd);
-    let pane_map = manifest_pane_map(window);
+    let pane_map = manifest_pane_map(window, numbering);
     let root_pane_id = origin_pane(&window.layout.root);
     let root = export_pane(
         window
@@ -421,13 +434,19 @@ fn export_window(
             .get(&root_pane_id)
             .ok_or_else(|| anyhow!("missing root pane {}", root_pane_id.0))?,
         window_base,
-        snapshot.and_then(|snapshot| snapshot.panes.iter().find(|pane| pane.pane_id == 0)),
+        snapshot.and_then(|snapshot| {
+            snapshot
+                .panes
+                .iter()
+                .find(|pane| pane.pane_id == numbering.pane_base)
+        }),
     )?;
     let mut splits = Vec::new();
     collect_splits(
         &window.layout.root,
         window,
         window_base,
+        numbering,
         &pane_map,
         snapshot,
         &mut splits,
@@ -447,6 +466,7 @@ fn collect_splits(
     node: &LayoutNode,
     window: &WindowRuntime,
     window_base: &Path,
+    numbering: Numbering,
     pane_map: &BTreeMap<PaneId, u64>,
     snapshot: Option<&WorkspaceWindowSnapshot>,
     splits: &mut Vec<SplitSpecOut>,
@@ -489,17 +509,17 @@ fn collect_splits(
                     .map(|saved| saved.command.clone())
                     .unwrap_or_else(|| pane.command.clone()),
             });
-            collect_splits(first, window, window_base, pane_map, snapshot, splits)?;
-            collect_splits(second, window, window_base, pane_map, snapshot, splits)?;
+            collect_splits(first, window, window_base, numbering, pane_map, snapshot, splits)?;
+            collect_splits(second, window, window_base, numbering, pane_map, snapshot, splits)?;
             Ok(target)
         }
     }
 }
 
-fn manifest_pane_map(window: &WindowRuntime) -> BTreeMap<PaneId, u64> {
+fn manifest_pane_map(window: &WindowRuntime, numbering: Numbering) -> BTreeMap<PaneId, u64> {
     let mut map = BTreeMap::new();
-    map.insert(origin_pane(&window.layout.root), 0);
-    let mut next = 1u64;
+    map.insert(origin_pane(&window.layout.root), numbering.pane_base);
+    let mut next = numbering.pane_base + 1;
     assign_manifest_pane_ids(&window.layout.root, &mut map, &mut next);
     map
 }
@@ -582,7 +602,7 @@ fn export_snapshot(
             .windows
             .get(window_id)
             .ok_or_else(|| anyhow!("missing window {}", window_id.0))?;
-        let pane_map = manifest_pane_map(window);
+        let pane_map = manifest_pane_map(window, session.numbering);
         let mut panes = Vec::new();
         for pane_id in window.layout.panes() {
             let pane = window
@@ -595,7 +615,7 @@ fn export_snapshot(
             let persistent =
                 session.pane_persistent_snapshot(*window_id, pane_id, snapshot_lines)?;
             panes.push(WorkspacePaneSnapshot {
-                pane_id: manifest_pane_id,
+                pane_id: session.numbering.public_pane_number(PaneId(manifest_pane_id))?,
                 title: pane.title.clone(),
                 cwd: pane
                     .cwd
@@ -615,10 +635,12 @@ fn export_snapshot(
         }
         panes.sort_by_key(|pane| pane.pane_id);
         windows.push(WorkspaceWindowSnapshot {
-            window_index,
-            active_pane: *pane_map
-                .get(&window.layout.active)
-                .ok_or_else(|| anyhow!("missing active pane {}", window.layout.active.0))?,
+            window_index: session.numbering.public_window_number(window_index)? as usize,
+            active_pane: session.numbering.public_pane_number(PaneId(
+                *pane_map
+                    .get(&window.layout.active)
+                    .ok_or_else(|| anyhow!("missing active pane {}", window.layout.active.0))?,
+            ))?,
             panes,
         });
     }
@@ -631,11 +653,13 @@ fn export_snapshot(
         manifest_path: manifest_path.display().to_string(),
         manifest_digest: digest.to_string(),
         session_name: session.name.clone(),
-        active_window: session
-            .window_order
-            .iter()
-            .position(|window_id| *window_id == session.active_window)
-            .unwrap_or(0),
+        active_window: session.numbering.public_window_number(
+            session
+                .window_order
+                .iter()
+                .position(|window_id| *window_id == session.active_window)
+                .unwrap_or(0),
+        )? as usize,
         windows,
     })
 }
@@ -713,15 +737,31 @@ fn resolve_ratio(value: Option<f32>) -> Result<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{config::WindowDefaults, pane::WindowId, session::Session};
+    use crate::{
+        config::WindowDefaults,
+        layout::SplitAxis,
+        numbering::Numbering,
+        pane::WindowId,
+        session::Session,
+    };
     use std::{thread, time::Duration};
-    use tempfile::tempdir;
+    use tempfile::{TempDir, tempdir as make_tempdir};
+
+    fn tempdir() -> TempDir {
+        make_tempdir().expect("tempdir")
+    }
 
     fn load(raw: &str) -> Result<WorkspaceLoad> {
-        let dir = tempdir().expect("tempdir");
+        let dir = tempdir();
         let path = dir.path().join("admux.toml");
         fs::write(&path, raw).expect("write manifest");
-        load_workspace(&path)
+        load_workspace(
+            &path,
+            Numbering {
+                window_base: 0,
+                pane_base: 0,
+            },
+        )
     }
 
     fn wait_for_preview(session: &Session, needle: &str) {
@@ -755,7 +795,7 @@ root = { command = ["nvim"] }
 
     #[test]
     fn resolves_relative_paths_against_manifest_dir() {
-        let dir = tempdir().expect("tempdir");
+        let dir = tempdir();
         let path = dir.path().join("admux.toml");
         fs::write(
             &path,
@@ -779,7 +819,14 @@ command = ["cargo", "test"]
         )
         .expect("write");
 
-        let workspace = load_workspace(&path).expect("workspace");
+        let workspace = load_workspace(
+            &path,
+            Numbering {
+                window_base: 0,
+                pane_base: 0,
+            },
+        )
+        .expect("workspace");
         assert_eq!(workspace.spec.cwd, dir.path().join("repo"));
         assert_eq!(
             workspace.spec.windows[0].cwd,
@@ -857,7 +904,7 @@ command = ["cargo", "test"]
 
     #[test]
     fn save_writes_snapshot_sidecar_and_loads_it_back() {
-        let dir = tempdir().expect("tempdir");
+        let dir = tempdir();
         let session_dir = dir.path().join("project");
         fs::create_dir_all(&session_dir).expect("session dir");
         let session = Session::new(
@@ -868,6 +915,10 @@ command = ["cargo", "test"]
             WindowId(1),
             None,
             10_000,
+            Numbering {
+                window_base: 0,
+                pane_base: 0,
+            },
             WindowDefaults::default(),
             dir.path().join("helpers"),
         )
@@ -881,7 +932,14 @@ command = ["cargo", "test"]
         assert!(snapshot_path.exists(), "snapshot sidecar should exist");
         assert!(gitignore_path.exists(), "workspace .gitignore should exist");
 
-        let loaded = load_workspace(&manifest_path).expect("reload workspace");
+        let loaded = load_workspace(
+            &manifest_path,
+            Numbering {
+                window_base: 0,
+                pane_base: 0,
+            },
+        )
+        .expect("reload workspace");
         let snapshot = loaded.snapshot.expect("snapshot");
         assert_eq!(snapshot.session_name, "workspace");
         assert_eq!(snapshot.windows.len(), 1);
@@ -892,7 +950,7 @@ command = ["cargo", "test"]
 
     #[test]
     fn ignores_stale_snapshot_when_manifest_changes() {
-        let dir = tempdir().expect("tempdir");
+        let dir = tempdir();
         let session_dir = dir.path().join("project");
         fs::create_dir_all(&session_dir).expect("session dir");
         let session = Session::new(
@@ -903,6 +961,10 @@ command = ["cargo", "test"]
             WindowId(1),
             None,
             10_000,
+            Numbering {
+                window_base: 0,
+                pane_base: 0,
+            },
             WindowDefaults::default(),
             dir.path().join("helpers"),
         )
@@ -925,7 +987,14 @@ root = { command = ["sh"] }
         )
         .expect("overwrite manifest");
 
-        let loaded = load_workspace(&manifest_path).expect("load changed workspace");
+        let loaded = load_workspace(
+            &manifest_path,
+            Numbering {
+                window_base: 0,
+                pane_base: 0,
+            },
+        )
+        .expect("load changed workspace");
         assert!(
             loaded.snapshot.is_none(),
             "stale snapshot should be ignored"
@@ -936,7 +1005,7 @@ root = { command = ["sh"] }
 
     #[test]
     fn save_prefers_current_foreground_command_in_manifest() {
-        let dir = tempdir().expect("tempdir");
+        let dir = tempdir();
         let session_dir = dir.path().join("project");
         fs::create_dir_all(&session_dir).expect("session dir");
         let session = Session::new(
@@ -947,6 +1016,10 @@ root = { command = ["sh"] }
             WindowId(1),
             None,
             10_000,
+            Numbering {
+                window_base: 0,
+                pane_base: 0,
+            },
             WindowDefaults::default(),
             dir.path().join("helpers"),
         )
@@ -958,6 +1031,47 @@ root = { command = ["sh"] }
             raw.contains("sleep"),
             "saved manifest should use foreground command"
         );
+
+        let _ = session.kill();
+    }
+
+    #[test]
+    fn save_and_load_workspace_uses_configured_public_numbering() {
+        let dir = tempdir();
+        let session_dir = dir.path().join("project");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        let numbering = Numbering {
+            window_base: 1,
+            pane_base: 2,
+        };
+        let mut session = Session::new(
+            "workspace".into(),
+            None,
+            Some(session_dir.clone()),
+            vec!["sh".into()],
+            WindowId(1),
+            None,
+            10_000,
+            numbering,
+            WindowDefaults::default(),
+            dir.path().join("helpers"),
+        )
+        .expect("session");
+        session
+            .split_active_pane(SplitAxis::Vertical, &["sh".into()])
+            .expect("split");
+
+        let manifest_path = save_workspace(&session, 50).expect("save workspace");
+        let raw = fs::read_to_string(&manifest_path).expect("read manifest");
+
+        assert!(raw.contains("active_window = 1"));
+        assert!(raw.contains("active_pane = 3"));
+        assert!(raw.contains("target = 2"));
+
+        let loaded = load_workspace(&manifest_path, numbering).expect("load workspace");
+        assert_eq!(loaded.spec.active_window, 0);
+        assert_eq!(loaded.spec.windows[0].active_pane, 1);
+        assert_eq!(loaded.spec.windows[0].splits[0].target, 0);
 
         let _ = session.kill();
     }

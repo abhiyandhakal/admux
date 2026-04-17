@@ -16,6 +16,7 @@ use crate::{
         BufferSummary, CURRENT_PROTOCOL_VERSION, CommandRequest, CommandResponse, CycleDirection,
         NavigationDirection, ProtocolVersion, SessionSummary,
     },
+    numbering::Numbering,
     pane::{PaneId, WindowId},
     persistence::{PersistedSession, PersistedState, load_state, save_state},
     session::Session,
@@ -94,6 +95,7 @@ impl SessionStore {
                 &persisted,
                 store.config.behavior.default_shell.clone(),
                 store.config.behavior.scrollback_lines,
+                store.numbering(),
                 store.config.defaults.window.clone(),
                 store.helper_dir.clone(),
             ) {
@@ -133,6 +135,7 @@ impl SessionStore {
                     window_id,
                     self.config.behavior.default_shell.clone(),
                     self.config.behavior.scrollback_lines,
+                    self.numbering(),
                     self.config.defaults.window.clone(),
                     self.helper_dir.clone(),
                 ) {
@@ -151,7 +154,7 @@ impl SessionStore {
                         }
                         CommandResponse::SessionCreated {
                             session: name,
-                            pane_id: 0,
+                            pane_id: self.config.behavior.pane_base,
                         }
                     }
                     Err(error) => CommandResponse::Error {
@@ -163,7 +166,7 @@ impl SessionStore {
                 manifest_path,
                 rebuild,
                 switch_from,
-            } => match load_workspace(&manifest_path) {
+            } => match load_workspace(&manifest_path, self.numbering()) {
                 Ok(workspace) => self.up_workspace(workspace, rebuild, switch_from),
                 Err(error) => CommandResponse::Error {
                     message: error.to_string(),
@@ -260,7 +263,7 @@ impl SessionStore {
             },
             CommandRequest::PasteBuffer { target, buffer } => {
                 match self.buffers.get(buffer.as_deref()) {
-                    Some(buffer) => match parse_target(&target) {
+                    Some(buffer) => match self.parse_target(&target) {
                         Ok(target) => match self.sessions.get(&target.session) {
                             Some(session) => match session.send_keys(
                                 target.window,
@@ -325,7 +328,9 @@ impl SessionStore {
                                 let window = session.windows.get(id)?;
                                 Some(crate::window::WindowSummary::new(
                                     *id,
-                                    index,
+                                    self.numbering()
+                                        .public_window_number(index)
+                                        .unwrap_or(index as u64),
                                     window.name.clone(),
                                     *id == session.active_window,
                                     Some(*id) == session.last_window,
@@ -339,7 +344,7 @@ impl SessionStore {
                     }
                 }
             }
-            CommandRequest::ListPanes { target } => match parse_target(&target) {
+            CommandRequest::ListPanes { target } => match self.parse_target(&target) {
                 Ok(target) => match self.sessions.get(&target.session) {
                     Some(session) => CommandResponse::PaneList {
                         panes: session.list_panes(target.window),
@@ -358,10 +363,19 @@ impl SessionStore {
                                         .filter_map(|pane_id| {
                                             let pane = window.panes.get(&pane_id)?;
                                             Some(crate::ipc::PaneSummary {
-                                                id: pane.id.0,
+                                                id: self
+                                                    .numbering()
+                                                    .public_pane_number(pane.id)
+                                                    .unwrap_or(pane.id.0),
                                                 title: pane.title.clone(),
                                                 active: pane_id == window.layout.active,
-                                                window_id: window.id.0,
+                                                window_id: self
+                                                    .numbering()
+                                                    .public_window_id(
+                                                        window.id,
+                                                        &session.window_order,
+                                                    )
+                                                    .unwrap_or(window.id.0),
                                             })
                                         })
                                         .collect()
@@ -392,15 +406,15 @@ impl SessionStore {
                     }
                 }
             }
-            CommandRequest::KillWindow { target } => match parse_target(&target) {
+            CommandRequest::KillWindow { target } => match self.parse_target(&target) {
                 Ok(target) => self.kill_window(target),
                 Err(message) => CommandResponse::Error { message },
             },
-            CommandRequest::KillPane { target } => match parse_target(&target) {
+            CommandRequest::KillPane { target } => match self.parse_target(&target) {
                 Ok(target) => self.kill_pane(target),
                 Err(message) => CommandResponse::Error { message },
             },
-            CommandRequest::SendKeys { target, keys } => match parse_target(&target) {
+            CommandRequest::SendKeys { target, keys } => match self.parse_target(&target) {
                 Ok(target) => match self.sessions.get(&target.session) {
                     Some(session) => match session.send_keys(target.window, target.pane, &keys) {
                         Ok(_) => CommandResponse::KeysSent,
@@ -418,7 +432,7 @@ impl SessionStore {
                 target,
                 axis,
                 command,
-            } => match parse_target(&target) {
+            } => match self.parse_target(&target) {
                 Ok(target) => self.split_pane(target, axis, command),
                 Err(message) => CommandResponse::Error { message },
             },
@@ -433,8 +447,14 @@ impl SessionStore {
                     Some(session) => match session.new_window(window_id, name, &command) {
                         Ok(created) => CommandResponse::WindowCreated {
                             session: session.name.clone(),
-                            window_id: created.window_id.0,
-                            pane_id: created.pane_id.0,
+                            window_id: session
+                                .numbering
+                                .public_window_id(created.window_id, &session.window_order)
+                                .unwrap_or(created.window_id.0),
+                            pane_id: session
+                                .numbering
+                                .public_pane_number(created.pane_id)
+                                .unwrap_or(created.pane_id.0),
                         },
                         Err(error) => CommandResponse::Error {
                             message: error.to_string(),
@@ -446,7 +466,7 @@ impl SessionStore {
                 }
             }
             CommandRequest::SelectPane { target, direction } => self.select_pane(target, direction),
-            CommandRequest::SelectWindow { target } => match parse_target(&target) {
+            CommandRequest::SelectWindow { target } => match self.parse_target(&target) {
                 Ok(target) => self.select_window(target),
                 Err(message) => CommandResponse::Error { message },
             },
@@ -469,7 +489,7 @@ impl SessionStore {
                 target,
                 direction,
                 amount,
-            } => match parse_target(&target) {
+            } => match self.parse_target(&target) {
                 Ok(target) => match self.sessions.get_mut(&target.session) {
                     Some(session) => {
                         match session.resize_active_pane(
@@ -490,7 +510,7 @@ impl SessionStore {
                 },
                 Err(message) => CommandResponse::Error { message },
             },
-            CommandRequest::RenameWindow { target, name } => match parse_target(&target) {
+            CommandRequest::RenameWindow { target, name } => match self.parse_target(&target) {
                 Ok(target) => self.rename_window(target, name),
                 Err(message) => CommandResponse::Error { message },
             },
@@ -718,8 +738,14 @@ impl SessionStore {
                 match session.split_active_pane(axis, &command) {
                     Ok(split) => CommandResponse::PaneSplit {
                         session: session.name.clone(),
-                        window_id: split.window_id.0,
-                        pane_id: split.pane_id.0,
+                        window_id: session
+                            .numbering
+                            .public_window_id(split.window_id, &session.window_order)
+                            .unwrap_or(split.window_id.0),
+                        pane_id: session
+                            .numbering
+                            .public_pane_number(split.pane_id)
+                            .unwrap_or(split.pane_id.0),
                     },
                     Err(error) => CommandResponse::Error {
                         message: error.to_string(),
@@ -738,7 +764,7 @@ impl SessionStore {
         direction: Option<NavigationDirection>,
     ) -> CommandResponse {
         match (target, direction) {
-            (Some(target), _) => match parse_target(&target) {
+            (Some(target), _) => match self.parse_target(&target) {
                 Ok(target) => match self.sessions.get_mut(&target.session) {
                     Some(session) => match target.pane {
                         Some(pane_id) => match session.select_pane(target.window, pane_id) {
@@ -805,8 +831,14 @@ impl SessionStore {
             Some(session) => match session.kill_pane(target.window, target.pane) {
                 Ok(Some(killed)) => CommandResponse::PaneKilled {
                     session: session.name.clone(),
-                    window_id: killed.window_id.0,
-                    pane_id: killed.pane_id.0,
+                    window_id: session
+                        .numbering
+                        .public_window_id(killed.window_id, &session.window_order)
+                        .unwrap_or(killed.window_id.0),
+                    pane_id: session
+                        .numbering
+                        .public_pane_number(killed.pane_id)
+                        .unwrap_or(killed.pane_id.0),
                 },
                 Ok(None) => {
                     if !session.is_alive() {
@@ -952,10 +984,13 @@ impl SessionStore {
             })?;
         let root_seed = use_snapshot
             .then(|| {
+                let first_window_public = self.numbering().public_window_number(0).ok()?;
                 workspace
                     .snapshot
                     .as_ref()
-                    .and_then(|snapshot| snapshot.pane(0, 0))
+                    .and_then(|snapshot| {
+                        snapshot.pane(first_window_public as usize, self.config.behavior.pane_base)
+                    })
                     .map(|pane| crate::pty::PaneRestoreSeed {
                         rows: pane.rows,
                         cols: pane.cols,
@@ -971,6 +1006,7 @@ impl SessionStore {
             first_window_id,
             self.config.behavior.default_shell.clone(),
             self.config.behavior.scrollback_lines,
+            self.numbering(),
             self.config.defaults.window.clone(),
             self.helper_dir.clone(),
             root_seed,
@@ -983,10 +1019,13 @@ impl SessionStore {
             let window_id = self.next_window();
             let root_seed = use_snapshot
                 .then(|| {
+                    let window_public = self.numbering().public_window_number(window_index).ok()?;
                     workspace
                         .snapshot
                         .as_ref()
-                        .and_then(|snapshot| snapshot.pane(window_index, 0))
+                        .and_then(|snapshot| {
+                            snapshot.pane(window_public as usize, self.config.behavior.pane_base)
+                        })
                         .map(|pane| crate::pty::PaneRestoreSeed {
                             rows: pane.rows,
                             cols: pane.cols,
@@ -1027,10 +1066,17 @@ impl SessionStore {
     ) -> Result<()> {
         session.select_window(window_id)?;
         for (split_index, split) in window.splits.iter().enumerate() {
+            let window_public = self.numbering().public_window_number(window_index).ok();
+            let pane_public = self
+                .numbering()
+                .public_pane_number(PaneId((split_index + 1) as u64))
+                .ok();
             let restore_seed = workspace
                 .snapshot
                 .as_ref()
-                .and_then(|snapshot| snapshot.pane(window_index, (split_index + 1) as u64))
+                .and_then(|snapshot| {
+                    snapshot.pane(window_public? as usize, pane_public?)
+                })
                 .map(|pane| crate::pty::PaneRestoreSeed {
                     rows: pane.rows,
                     cols: pane.cols,
@@ -1049,7 +1095,12 @@ impl SessionStore {
         let active_pane = workspace
             .snapshot
             .as_ref()
-            .and_then(|snapshot| snapshot.active_pane(window_index))
+            .and_then(|snapshot| {
+                self.numbering()
+                    .public_window_number(window_index)
+                    .ok()
+                    .and_then(|window_public| snapshot.active_pane(window_public as usize))
+            })
             .unwrap_or(window.active_pane);
         session.select_pane(Some(window_id), PaneId(active_pane))?;
         Ok(())
@@ -1075,6 +1126,73 @@ impl SessionStore {
                 message: error.to_string(),
             },
         }
+    }
+
+    fn numbering(&self) -> Numbering {
+        Numbering {
+            window_base: self.config.behavior.window_base,
+            pane_base: self.config.behavior.pane_base,
+        }
+    }
+
+    fn parse_target(&self, target: &str) -> Result<TargetRef, String> {
+        let (session, rest) = target
+            .split_once(':')
+            .map_or((target, None), |(session, rest)| (session, Some(rest)));
+        if session.is_empty() {
+            return Err("target requires a session name".into());
+        }
+
+        let numbering = self.numbering();
+        let empty_order: Vec<WindowId> = Vec::new();
+        let window_order = if let Some(runtime) = self.sessions.get(session) {
+            runtime.window_order.as_slice()
+        } else if let Some(persisted) = self.persisted_sessions.get(session) {
+            persisted.window_order.as_slice()
+        } else {
+            empty_order.as_slice()
+        };
+
+        let (window, pane) = match rest {
+            Some(rest) => {
+                let (window, pane) = rest
+                    .split_once('.')
+                    .map_or((rest, None), |(window, pane)| (window, Some(pane)));
+                let window = if window.is_empty() {
+                    None
+                } else {
+                    let public = window
+                        .parse::<u64>()
+                        .map_err(|_| format!("invalid window id in target {target}"))?;
+                    Some(
+                        numbering
+                            .parse_public_window_id(public, window_order)
+                            .map_err(|error| error.to_string())?,
+                    )
+                };
+                let pane = match pane {
+                    Some(value) if !value.is_empty() => {
+                        let public = value
+                            .parse::<u64>()
+                            .map_err(|_| format!("invalid pane id in target {target}"))?;
+                        Some(
+                            numbering
+                                .parse_public_pane_number(public)
+                                .map_err(|error| error.to_string())?,
+                        )
+                    }
+                    _ => None,
+                };
+                (window, pane)
+            }
+            None => (None, None),
+        };
+
+        Ok(TargetRef {
+            session: session.into(),
+            window,
+            pane,
+        })
     }
 
     fn effective_command(&self, command: Vec<String>) -> Vec<String> {
@@ -1142,49 +1260,6 @@ pub fn serve(socket_path: &Path, state_path: &Path, config_path: &Path) -> Resul
     bail!("listener stopped unexpectedly")
 }
 
-fn parse_target(target: &str) -> Result<TargetRef, String> {
-    let (session, rest) = target
-        .split_once(':')
-        .map_or((target, None), |(session, rest)| (session, Some(rest)));
-    if session.is_empty() {
-        return Err("target requires a session name".into());
-    }
-    let (window, pane) = match rest {
-        Some(rest) => {
-            let (window, pane) = rest
-                .split_once('.')
-                .map_or((rest, None), |(window, pane)| (window, Some(pane)));
-            let window = if window.is_empty() {
-                None
-            } else {
-                Some(
-                    window
-                        .parse::<u64>()
-                        .map(WindowId)
-                        .map_err(|_| format!("invalid window id in target {target}"))?,
-                )
-            };
-            let pane = match pane {
-                Some(value) if !value.is_empty() => Some(
-                    value
-                        .parse::<u64>()
-                        .map(PaneId)
-                        .map_err(|_| format!("invalid pane id in target {target}"))?,
-                ),
-                _ => None,
-            };
-            (window, pane)
-        }
-        None => (None, None),
-    };
-
-    Ok(TargetRef {
-        session: session.into(),
-        window,
-        pane,
-    })
-}
-
 fn read_request(stream: &mut UnixStream) -> Result<CommandRequest> {
     let mut payload = Vec::new();
     stream
@@ -1209,7 +1284,11 @@ mod tests {
         ipc::{CommandRequest, SwitchSource},
         layout::SplitAxis,
     };
-    use tempfile::tempdir;
+    use tempfile::{TempDir, tempdir as make_tempdir};
+
+    fn tempdir() -> TempDir {
+        make_tempdir().expect("tempdir")
+    }
 
     #[test]
     fn store_creates_and_lists_sessions() {
@@ -1299,7 +1378,7 @@ mod tests {
             response,
             CommandResponse::PaneSplit {
                 session,
-                window_id: 1,
+                window_id: 0,
                 pane_id: 1
             } if session == "work"
         ));
@@ -1339,7 +1418,7 @@ mod tests {
         });
 
         let response = store.handle(CommandRequest::RenameWindow {
-            target: "work:1".into(),
+            target: "work:0".into(),
             name: "editor".into(),
         });
 
@@ -1400,7 +1479,7 @@ mod tests {
 
     #[test]
     fn persisted_metadata_survives_store_restart() {
-        let dir = tempdir().expect("tempdir");
+        let dir = tempdir();
         let state_path = dir.path().join("state.json");
         let config_path = dir.path().join("config.toml");
 
@@ -1458,7 +1537,7 @@ mod tests {
 
     #[test]
     fn unrecoverable_persisted_sessions_are_pruned_on_startup() {
-        let dir = tempdir().expect("tempdir");
+        let dir = tempdir();
         let state_path = dir.path().join("state.json");
         let config_path = dir.path().join("config.toml");
         fs::write(
@@ -1524,7 +1603,7 @@ mod tests {
 
     #[test]
     fn reload_config_updates_future_creation_defaults() {
-        let dir = tempdir().expect("tempdir");
+        let dir = tempdir();
         let state_path = dir.path().join("state.json");
         let config_path = dir.path().join("config.toml");
         fs::write(
@@ -1568,7 +1647,7 @@ mod tests {
 
     #[test]
     fn invalid_reload_keeps_previous_config() {
-        let dir = tempdir().expect("tempdir");
+        let dir = tempdir();
         let state_path = dir.path().join("state.json");
         let config_path = dir.path().join("config.toml");
         fs::write(
@@ -1599,6 +1678,78 @@ mod tests {
         assert!(matches!(
             created,
             CommandResponse::SessionCreated { ref session, .. } if session == "work-1"
+        ));
+    }
+
+    #[test]
+    fn configurable_public_numbering_applies_to_sessions_and_targets() {
+        let dir = tempdir();
+        let state_path = dir.path().join("state.json");
+        let config_path = dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+                [behavior]
+                window_base = 1
+                pane_base = 2
+            "#,
+        )
+        .expect("write config");
+
+        let mut store = SessionStore::with_paths(state_path, config_path, dir.path().join("panes"))
+            .expect("create store");
+
+        let created = store.handle(CommandRequest::NewSession {
+            name: Some("work".into()),
+            cwd: None,
+            command: vec!["sh".into()],
+            switch_from: None,
+        });
+        assert!(matches!(
+            created,
+            CommandResponse::SessionCreated {
+                session,
+                pane_id: 2
+            } if session == "work"
+        ));
+
+        assert_eq!(
+            store.handle(CommandRequest::ListWindows {
+                session: "work".into(),
+            }),
+            CommandResponse::WindowList {
+                windows: vec![crate::window::WindowSummary {
+                    id: 1,
+                    index: 1,
+                    name: "sh".into(),
+                    active: true,
+                    last_selected: false,
+                }]
+            }
+        );
+
+        let split = store.handle(CommandRequest::SplitPane {
+            target: "work:1.2".into(),
+            axis: SplitAxis::Vertical,
+            command: Vec::new(),
+        });
+        assert!(matches!(
+            split,
+            CommandResponse::PaneSplit {
+                session,
+                window_id: 1,
+                pane_id: 3
+            } if session == "work"
+        ));
+
+        assert!(matches!(
+            store.handle(CommandRequest::ListPanes {
+                target: "work:1".into(),
+            }),
+            CommandResponse::PaneList { panes }
+                if panes.len() == 2
+                    && panes.iter().any(|pane| pane.id == 2 && pane.window_id == 1)
+                    && panes.iter().any(|pane| pane.id == 3 && pane.window_id == 1)
         ));
     }
 

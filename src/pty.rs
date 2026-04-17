@@ -1039,10 +1039,10 @@ fn sanitize_component(value: &str) -> String {
 mod tests {
     use super::*;
     use std::{thread, time::Duration};
-    use tempfile::tempdir;
+    use tempfile::{TempDir, tempdir as make_tempdir};
 
-    fn helper_dir() -> tempfile::TempDir {
-        tempdir().expect("tempdir")
+    fn helper_dir() -> TempDir {
+        make_tempdir().expect("tempdir")
     }
 
     fn wait_for_preview(pane: &PaneProcess, needle: &str) -> String {

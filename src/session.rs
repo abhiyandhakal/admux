@@ -12,6 +12,7 @@ use crate::{
         ScrollDirection,
     },
     layout::{Direction, LayoutTree, SplitAxis},
+    numbering::Numbering,
     pane::{PaneId, PaneSnapshot, Rect, WindowId},
     persistence::PersistedSession,
     pty::{PanePersistentSnapshot, PaneProcess, PaneRestoreSeed},
@@ -34,6 +35,7 @@ pub struct Session {
     pub last_window: Option<WindowId>,
     pub default_shell: Option<String>,
     pub scrollback_lines: usize,
+    pub numbering: Numbering,
     pub window_defaults: WindowDefaults,
     pub helper_dir: PathBuf,
 }
@@ -79,6 +81,7 @@ impl Session {
         window_id: WindowId,
         default_shell: Option<String>,
         scrollback_lines: usize,
+        numbering: Numbering,
         window_defaults: WindowDefaults,
         helper_dir: PathBuf,
     ) -> Result<Self> {
@@ -90,6 +93,7 @@ impl Session {
             window_id,
             default_shell,
             scrollback_lines,
+            numbering,
             window_defaults,
             helper_dir,
             None,
@@ -104,6 +108,7 @@ impl Session {
         window_id: WindowId,
         default_shell: Option<String>,
         scrollback_lines: usize,
+        numbering: Numbering,
         window_defaults: WindowDefaults,
         helper_dir: PathBuf,
         restore_seed: Option<PaneRestoreSeed>,
@@ -139,6 +144,7 @@ impl Session {
             last_window: None,
             default_shell,
             scrollback_lines,
+            numbering,
             window_defaults,
             helper_dir,
         };
@@ -150,6 +156,7 @@ impl Session {
         persisted: &PersistedSession,
         default_shell: Option<String>,
         scrollback_lines: usize,
+        numbering: Numbering,
         window_defaults: WindowDefaults,
         helper_dir: PathBuf,
     ) -> Result<Self> {
@@ -206,6 +213,7 @@ impl Session {
             last_window: persisted.last_window,
             default_shell,
             scrollback_lines,
+            numbering,
             window_defaults,
             helper_dir,
         };
@@ -286,7 +294,7 @@ impl Session {
                 let cursor = clamp_cursor(rect, render.cursor_row, render.cursor_col);
 
                 Some(PaneRender {
-                    pane_id: pane.id.0,
+                    pane_id: self.numbering.public_pane_number(pane.id).ok()?,
                     title: pane.title.clone(),
                     rect,
                     focused: pane_id == window.layout.active,
@@ -304,8 +312,11 @@ impl Session {
             windows: self.list_windows(),
             panes,
             dividers: window.layout.divider_cells(size),
-            active_window_id: window.id.0,
-            active_pane_id: window.layout.active.0,
+            active_window_id: self
+                .numbering
+                .public_window_id(window.id, &self.window_order)
+                .ok()?,
+            active_pane_id: self.numbering.public_pane_number(window.layout.active).ok()?,
         })
     }
 
@@ -340,7 +351,7 @@ impl Session {
                 let render = pane.process.render(rect.width, rect.height).ok()?;
                 let cursor = clamp_cursor(rect, render.cursor_row, render.cursor_col);
                 panes.push(PaneRender {
-                    pane_id: pane.id.0,
+                    pane_id: self.numbering.public_pane_number(pane.id).ok()?,
                     title: pane.title.clone(),
                     rect,
                     focused: pane_id == window.layout.active && *window_id == self.active_window,
@@ -360,10 +371,13 @@ impl Session {
             windows: self.list_windows(),
             panes,
             dividers,
-            active_window_id: self.active_window.0,
+            active_window_id: self
+                .numbering
+                .public_window_id(self.active_window, &self.window_order)
+                .ok()?,
             active_pane_id: self
                 .active_window()
-                .map(|window| window.layout.active.0)
+                .and_then(|window| self.numbering.public_pane_number(window.layout.active).ok())
                 .unwrap_or(0),
         })
     }
@@ -376,7 +390,7 @@ impl Session {
                 let window = self.windows.get(id)?;
                 Some(WindowSummary::new(
                     *id,
-                    index,
+                    self.numbering.public_window_number(index).ok()?,
                     window.name.clone(),
                     *id == self.active_window,
                     Some(*id) == self.last_window,
@@ -395,14 +409,17 @@ impl Session {
                     .panes()
                     .into_iter()
                     .map(|pane_id| PaneSummary {
-                        id: pane_id.0,
+                        id: self.numbering.public_pane_number(pane_id).unwrap_or(pane_id.0),
                         title: window
                             .panes
                             .get(&pane_id)
                             .map(|pane| pane.title.clone())
                             .unwrap_or_else(|| "pane".into()),
                         active: pane_id == window.layout.active,
-                        window_id: window.id.0,
+                        window_id: self
+                            .numbering
+                            .public_window_id(window.id, &self.window_order)
+                            .unwrap_or(window.id.0),
                     })
                     .collect()
             })
@@ -971,11 +988,16 @@ fn clamp_cursor(content: Rect, row: u16, col: u16) -> Option<PaneCursor> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
+    use crate::numbering::Numbering;
+    use tempfile::{TempDir, tempdir as make_tempdir};
+
+    fn tempdir() -> TempDir {
+        make_tempdir().expect("tempdir")
+    }
 
     #[test]
     fn new_window_uses_full_viewport_width_for_pty() {
-        let helper_dir = tempdir().expect("tempdir");
+        let helper_dir = tempdir();
         let mut session = Session::new(
             "work".into(),
             None,
@@ -984,6 +1006,10 @@ mod tests {
             WindowId(1),
             None,
             10_000,
+            Numbering {
+                window_base: 0,
+                pane_base: 0,
+            },
             WindowDefaults::default(),
             helper_dir.path().to_path_buf(),
         )
@@ -1022,7 +1048,7 @@ mod tests {
 
     #[test]
     fn selecting_window_tracks_last_window() {
-        let helper_dir = tempdir().expect("tempdir");
+        let helper_dir = tempdir();
         let mut session = Session::new(
             "work".into(),
             None,
@@ -1031,6 +1057,10 @@ mod tests {
             WindowId(1),
             None,
             10_000,
+            Numbering {
+                window_base: 0,
+                pane_base: 0,
+            },
             WindowDefaults::default(),
             helper_dir.path().to_path_buf(),
         )
@@ -1055,7 +1085,7 @@ mod tests {
 
     #[test]
     fn pane_ids_are_window_local_and_stable() {
-        let helper_dir = tempdir().expect("tempdir");
+        let helper_dir = tempdir();
         let mut session = Session::new(
             "work".into(),
             None,
@@ -1064,6 +1094,10 @@ mod tests {
             WindowId(1),
             None,
             10_000,
+            Numbering {
+                window_base: 0,
+                pane_base: 0,
+            },
             WindowDefaults::default(),
             helper_dir.path().to_path_buf(),
         )
