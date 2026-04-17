@@ -1101,8 +1101,11 @@ impl SessionStore {
                     .ok()
                     .and_then(|window_public| snapshot.active_pane(window_public as usize))
             })
-            .unwrap_or(window.active_pane);
-        session.select_pane(Some(window_id), PaneId(active_pane))?;
+            .map(|public| self.numbering().parse_public_pane_number(public))
+            .transpose()?
+            .map(|pane| pane)
+            .unwrap_or(PaneId(window.active_pane));
+        session.select_pane(Some(window_id), active_pane)?;
         Ok(())
     }
 
@@ -1303,7 +1306,7 @@ mod tests {
             created,
             CommandResponse::SessionCreated {
                 session,
-                pane_id: 0
+                pane_id: 1
             } if session == "work"
         ));
 
@@ -1378,8 +1381,8 @@ mod tests {
             response,
             CommandResponse::PaneSplit {
                 session,
-                window_id: 0,
-                pane_id: 1
+                window_id: 1,
+                pane_id: 2
             } if session == "work"
         ));
     }
@@ -1418,7 +1421,7 @@ mod tests {
         });
 
         let response = store.handle(CommandRequest::RenameWindow {
-            target: "work:0".into(),
+            target: "work:1".into(),
             name: "editor".into(),
         });
 
@@ -1430,7 +1433,7 @@ mod tests {
             CommandResponse::WindowList {
                 windows: vec![crate::window::WindowSummary {
                     id: 1,
-                    index: 0,
+                    index: 1,
                     name: "editor".into(),
                     active: true,
                     last_selected: false,
@@ -1448,10 +1451,10 @@ mod tests {
             command: vec!["sh".into()],
             switch_from: None,
         });
-        let pane_id = match created {
-            CommandResponse::SessionCreated { pane_id, .. } => pane_id,
+        match created {
+            CommandResponse::SessionCreated { .. } => {}
             other => panic!("unexpected response: {other:?}"),
-        };
+        }
 
         let response = store.handle(CommandRequest::NewSession {
             name: Some("logs".into()),
@@ -1460,7 +1463,7 @@ mod tests {
             switch_from: Some(SwitchSource {
                 session: "work".into(),
                 window_id: 1,
-                pane_id,
+                pane_id: 0,
             }),
         });
         assert!(matches!(

@@ -456,7 +456,7 @@ impl Default for KeyConfig {
             prefix: "Ctrl-b".into(),
             bindings: default_legacy_leader_bindings(),
             normal: BTreeMap::new(),
-            leader: default_leader_bindings(0),
+            leader: default_leader_bindings(1),
             copy_mode: default_copy_mode_bindings(),
         }
     }
@@ -535,8 +535,8 @@ impl Default for BehaviorConfig {
             resize_step: 50,
             copy_page_size: None,
             workspace_snapshot_lines: 500,
-            window_base: 0,
-            pane_base: 0,
+            window_base: 1,
+            pane_base: 1,
         }
     }
 }
@@ -623,20 +623,17 @@ fn resolve_key_config(
 ) -> Result<ResolvedKeyConfig> {
     let prefix = parse_key_pattern(&config.prefix)
         .with_context(|| format!("invalid keys.prefix '{}'", config.prefix))?;
-    let normal = resolve_table("keys.normal", &config.normal, resize_step)?;
+    let mut normal_raw = default_normal_bindings(window_base);
+    for (action, key) in &config.normal {
+        normal_raw.insert(action.clone(), key.clone());
+    }
+    let normal = resolve_table("keys.normal", &normal_raw, resize_step)?;
 
     let mut leader_raw = default_leader_bindings(window_base);
-    let implicit_default_leader = default_leader_bindings(0);
     for (action, key) in &config.bindings {
         leader_raw.insert(action.clone(), key.clone());
     }
     for (action, key) in &config.leader {
-        if implicit_default_leader
-            .get(action)
-            .is_some_and(|default_key| default_key == key)
-        {
-            continue;
-        }
         leader_raw.insert(action.clone(), key.clone());
     }
     let leader = resolve_table("keys.leader", &leader_raw, resize_step)?;
@@ -807,6 +804,17 @@ fn default_legacy_leader_bindings() -> BTreeMap<String, String> {
     BTreeMap::new()
 }
 
+fn default_normal_bindings(window_base: u64) -> BTreeMap<String, String> {
+    let mut bindings = BTreeMap::new();
+    for offset in 0..=9u64 {
+        let public = window_base + offset;
+        if (1..=9).contains(&public) {
+            bindings.insert(format!("select_window_{public}"), format!("Alt-{public}"));
+        }
+    }
+    bindings
+}
+
 fn default_leader_bindings(window_base: u64) -> BTreeMap<String, String> {
     let mut bindings = BTreeMap::new();
     bindings.insert("detach".into(), "d".into());
@@ -898,6 +906,8 @@ mod tests {
         assert!(resolved.ui.status.show_clock);
         assert!(resolved.ui.status.show_window_list);
         assert_eq!(resolved.behavior.scrollback_lines, 10_000);
+        assert_eq!(resolved.behavior.window_base, 1);
+        assert_eq!(resolved.behavior.pane_base, 1);
         assert!(resolved.mouse.enabled);
         assert!(
             resolved
@@ -905,6 +915,12 @@ mod tests {
                 .leader
                 .iter()
                 .any(|(_, action)| *action == Action::Detach)
+        );
+        assert!(
+            resolved.keys.normal.iter().any(|(pattern, action)| {
+                *action == Action::SelectWindowIndex(1)
+                    && *pattern == parse_key_pattern("Alt-1").expect("alt-1 pattern")
+            })
         );
     }
 
@@ -981,6 +997,17 @@ mod tests {
                 .leader
                 .iter()
                 .any(|(pattern, _)| *pattern == parse_key_pattern("0").expect("digit binding"))
+        );
+        assert!(
+            resolved.keys.normal.iter().any(|(pattern, action)| {
+                *action == Action::SelectWindowIndex(1)
+                    && *pattern == parse_key_pattern("Alt-1").expect("alt-1 pattern")
+            })
+        );
+        assert!(
+            !resolved.keys.normal.iter().any(|(_, action)| {
+                *action == Action::SelectWindowIndex(0)
+            })
         );
     }
 

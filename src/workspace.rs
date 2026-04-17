@@ -615,7 +615,7 @@ fn export_snapshot(
             let persistent =
                 session.pane_persistent_snapshot(*window_id, pane_id, snapshot_lines)?;
             panes.push(WorkspacePaneSnapshot {
-                pane_id: session.numbering.public_pane_number(PaneId(manifest_pane_id))?,
+                pane_id: manifest_pane_id,
                 title: pane.title.clone(),
                 cwd: pane
                     .cwd
@@ -636,11 +636,9 @@ fn export_snapshot(
         panes.sort_by_key(|pane| pane.pane_id);
         windows.push(WorkspaceWindowSnapshot {
             window_index: session.numbering.public_window_number(window_index)? as usize,
-            active_pane: session.numbering.public_pane_number(PaneId(
-                *pane_map
-                    .get(&window.layout.active)
-                    .ok_or_else(|| anyhow!("missing active pane {}", window.layout.active.0))?,
-            ))?,
+            active_pane: *pane_map
+                .get(&window.layout.active)
+                .ok_or_else(|| anyhow!("missing active pane {}", window.layout.active.0))?,
             panes,
         });
     }
