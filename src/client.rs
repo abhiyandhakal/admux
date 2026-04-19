@@ -16,7 +16,7 @@ use crossterm::{
     cursor::{Hide, Show},
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
@@ -682,6 +682,7 @@ fn run_attach_loop(
     let mut snapshot = fetch_attach_snapshot(paths, &mut current_session, &mut last_size, 80, 24)?;
     let mut snapshot_dirty = false;
     let mut last_snapshot_refresh = Instant::now();
+    let mut pending_event = None;
 
     loop {
         let (width, height) = terminal::size().context("failed to read terminal size")?;
@@ -814,7 +815,7 @@ fn run_attach_loop(
         }
 
         let mut needs_refresh = false;
-        match event::read().context("failed to read terminal event")? {
+        match read_attach_event(&mut pending_event)? {
             Event::Key(key) => {
                 let current_overlay = std::mem::replace(&mut overlay, OverlayState::None);
                 match current_overlay {
@@ -1216,6 +1217,48 @@ fn run_attach_loop(
         }
     }
     Ok(())
+}
+
+fn read_attach_event(pending_event: &mut Option<Event>) -> Result<Event> {
+    if let Some(event) = pending_event.take() {
+        return Ok(event);
+    }
+
+    let event = event::read().context("failed to read terminal event")?;
+    let Event::Key(key) = event else {
+        return Ok(event);
+    };
+
+    if !matches!(key.code, KeyCode::Esc) || !key.modifiers.is_empty() {
+        return Ok(Event::Key(key));
+    }
+
+    if !event::poll(Duration::from_millis(5)).context("failed to poll terminal event")? {
+        return Ok(Event::Key(key));
+    }
+
+    let next = event::read().context("failed to read terminal event")?;
+    Ok(coalesce_escape_digit_event(Event::Key(key), next, pending_event))
+}
+
+fn coalesce_escape_digit_event(event: Event, next: Event, pending_event: &mut Option<Event>) -> Event {
+    let Event::Key(key) = event else {
+        return event;
+    };
+    if !matches!(key.code, KeyCode::Esc) || !key.modifiers.is_empty() {
+        return Event::Key(key);
+    }
+    match next {
+        Event::Key(next_key)
+            if matches!(next_key.code, KeyCode::Char('1'..='9')) && next_key.modifiers.is_empty() =>
+        {
+            Event::Key(KeyEvent::new(next_key.code, KeyModifiers::ALT))
+        }
+        other => {
+            *pending_event = Some(other);
+            Event::Key(key)
+        }
+    }
 }
 
 fn fetch_attach_snapshot(
@@ -2499,6 +2542,7 @@ mod tests {
     use super::*;
     use crate::paths::RuntimePaths;
     use std::{
+        collections::VecDeque,
         io::{Read, Write},
         os::unix::net::UnixListener,
     };
@@ -2586,6 +2630,52 @@ mod tests {
         let normalized = normalize_new_args(args).expect("normalize");
         assert_eq!(normalized.cwd, Some(dir.path().to_path_buf()));
         assert!(normalized.command.is_empty());
+    }
+
+    #[test]
+    fn escape_prefixed_digit_coalesces_to_alt_digit() {
+        let mut following = VecDeque::from([Event::Key(KeyEvent::new(
+            KeyCode::Char('3'),
+            KeyModifiers::NONE,
+        ))]);
+        let mut pending = None;
+
+        let event = coalesce_escape_digit_event(
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            following.pop_front().expect("followup event"),
+            &mut pending,
+        );
+
+        assert_eq!(
+            event,
+            Event::Key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::ALT))
+        );
+        assert!(pending.is_none());
+        assert!(following.is_empty());
+    }
+
+    #[test]
+    fn escape_preserves_non_digit_followup() {
+        let mut following = VecDeque::from([Event::Key(KeyEvent::new(
+            KeyCode::Char('h'),
+            KeyModifiers::NONE,
+        ))]);
+        let mut pending = None;
+
+        let event = coalesce_escape_digit_event(
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            following.pop_front().expect("followup event"),
+            &mut pending,
+        );
+
+        assert_eq!(event, Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert_eq!(
+            pending,
+            Some(Event::Key(KeyEvent::new(
+                KeyCode::Char('h'),
+                KeyModifiers::NONE,
+            )))
+        );
     }
 
     #[test]
