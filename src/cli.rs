@@ -1,6 +1,41 @@
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use std::path::PathBuf;
 
+pub const TOP_LEVEL_COMMAND_NAMES: &[&str] = &[
+    "up",
+    "save",
+    "new",
+    "attach",
+    "ls",
+    "list-windows",
+    "list-panes",
+    "list-buffers",
+    "show-buffer",
+    "delete-buffer",
+    "paste-buffer",
+    "set-buffer",
+    "save-buffer",
+    "load-buffer",
+    "kill",
+    "kill-window",
+    "kill-pane",
+    "send-keys",
+    "split-pane",
+    "new-window",
+    "select-pane",
+    "select-window",
+    "next-window",
+    "prev-window",
+    "resize-pane",
+    "reload-config",
+    "alias",
+    "help",
+];
+
+pub fn is_reserved_top_level_name(name: &str) -> bool {
+    TOP_LEVEL_COMMAND_NAMES.contains(&name)
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "admux", about = "Opinionated terminal multiplexer client")]
 pub struct AdmuxCli {
@@ -36,6 +71,7 @@ pub enum ClientCommand {
     PrevWindow(SessionArgs),
     ResizePane(ResizePaneArgs),
     ReloadConfig,
+    Alias(AliasArgs),
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
@@ -186,6 +222,30 @@ pub struct ResizePaneArgs {
     pub amount: u16,
 }
 
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+pub struct AliasArgs {
+    #[command(subcommand)]
+    pub command: AliasCommand,
+}
+
+#[derive(Debug, Clone, Subcommand, PartialEq, Eq)]
+pub enum AliasCommand {
+    Add(AliasAddArgs),
+    List,
+    Remove(AliasRemoveArgs),
+}
+
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+pub struct AliasAddArgs {
+    pub name: String,
+    pub path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+pub struct AliasRemoveArgs {
+    pub name: String,
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "admuxd", about = "Opinionated terminal multiplexer daemon")]
 pub struct AdmuxdCli {
@@ -302,6 +362,44 @@ mod tests {
                 socket: Some(PathBuf::from("/tmp/admux.sock")),
                 state: None,
                 config: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_alias_add_command() {
+        let cli = AdmuxCli::parse_from(["admux", "alias", "add", "demo", "/tmp/admux.toml"]);
+        assert_eq!(
+            cli.command,
+            ClientCommand::Alias(AliasArgs {
+                command: AliasCommand::Add(AliasAddArgs {
+                    name: "demo".into(),
+                    path: Some(PathBuf::from("/tmp/admux.toml")),
+                }),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_alias_list_command() {
+        let cli = AdmuxCli::parse_from(["admux", "alias", "list"]);
+        assert_eq!(
+            cli.command,
+            ClientCommand::Alias(AliasArgs {
+                command: AliasCommand::List,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_alias_remove_command() {
+        let cli = AdmuxCli::parse_from(["admux", "alias", "remove", "demo"]);
+        assert_eq!(
+            cli.command,
+            ClientCommand::Alias(AliasArgs {
+                command: AliasCommand::Remove(AliasRemoveArgs {
+                    name: "demo".into(),
+                }),
             })
         );
     }

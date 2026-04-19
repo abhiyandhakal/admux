@@ -26,9 +26,10 @@ use crossterm::{
 };
 
 use crate::{
+    alias::AliasRegistry,
     cli::{
-        AdmuxCli, ClientCommand, NewWindowArgs, PasteBufferArgs, ResizePaneArgs, SelectPaneArgs,
-        SetBufferArgs, SplitPaneArgs,
+        AdmuxCli, AliasAddArgs, AliasArgs, AliasCommand, ClientCommand, NewWindowArgs,
+        PasteBufferArgs, ResizePaneArgs, SelectPaneArgs, SetBufferArgs, SplitPaneArgs,
     },
     commands::{InteractiveCommand, complete as complete_commands, parse as parse_command},
     config::{Config, ResolvedConfig, StatusPosition},
@@ -39,6 +40,7 @@ use crate::{
         PaneCursor, PaneMouseKind, PaneRender, RenderSnapshot, SwitchSource,
     },
     layout::SplitAxis,
+    numbering::Numbering,
     pane::Rect,
     pty::{HelperMouseEventKind, PaneProcess},
     paths::RuntimePaths,
@@ -289,6 +291,10 @@ pub fn run(cli: AdmuxCli) -> Result<()> {
         },
         ClientCommand::ResizePane(args) => resize_pane_request(args),
         ClientCommand::ReloadConfig => CommandRequest::ReloadConfig,
+        ClientCommand::Alias(args) => {
+            run_alias_command(&paths, args)?;
+            return Ok(());
+        }
     };
 
     let response = request_response(&paths, request)?;
@@ -1433,6 +1439,41 @@ fn load_config(paths: &RuntimePaths) -> Result<ResolvedConfig> {
         return Config::default().resolve();
     }
     Config::load_from_path(&paths.config_path)?.resolve()
+}
+
+fn numbering_from_config(config: &ResolvedConfig) -> Numbering {
+    Numbering {
+        window_base: config.behavior.window_base,
+        pane_base: config.behavior.pane_base,
+    }
+}
+
+fn run_alias_command(paths: &RuntimePaths, args: AliasArgs) -> Result<()> {
+    let mut registry = AliasRegistry::load(&paths.aliases_path)?;
+    match args.command {
+        AliasCommand::Add(AliasAddArgs { name, path }) => {
+            let config = load_config(paths)?;
+            let manifest = registry.add(
+                &name,
+                path.as_deref(),
+                numbering_from_config(&config),
+                crate::cli::TOP_LEVEL_COMMAND_NAMES,
+            )?;
+            registry.save(&paths.aliases_path)?;
+            println!("added alias {name} {}", manifest.display());
+        }
+        AliasCommand::List => {
+            for (name, path) in registry.list() {
+                println!("{name} {}", path.display());
+            }
+        }
+        AliasCommand::Remove(args) => {
+            registry.remove(&args.name)?;
+            registry.save(&paths.aliases_path)?;
+            println!("removed alias {}", args.name);
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2722,6 +2763,7 @@ mod tests {
             socket_path: "/tmp/admux-test/socket".into(),
             config_path: "/tmp/admux-test/config.toml".into(),
             state_path: "/tmp/admux-test/state.json".into(),
+            aliases_path: "/tmp/admux-test/aliases.json".into(),
         };
         assert!(paths.socket_path.ends_with("socket"));
     }
@@ -2734,6 +2776,7 @@ mod tests {
             socket_path: socket_path.clone(),
             config_path: dir.path().join("config.toml"),
             state_path: dir.path().join("state.json"),
+            aliases_path: dir.path().join("aliases.json"),
         };
         let listener = UnixListener::bind(&socket_path).expect("bind");
         std::thread::spawn(move || {

@@ -8,6 +8,7 @@ pub struct RuntimePaths {
     pub socket_path: PathBuf,
     pub config_path: PathBuf,
     pub state_path: PathBuf,
+    pub aliases_path: PathBuf,
 }
 
 impl RuntimePaths {
@@ -23,10 +24,13 @@ impl RuntimePaths {
             let config_path =
                 get_var("ADMUX_CONFIG").unwrap_or_else(|| PathBuf::from("config.toml"));
             let state_path = get_var("ADMUX_STATE").unwrap_or_else(|| PathBuf::from("state.json"));
+            let aliases_path =
+                get_var("ADMUX_ALIASES").unwrap_or_else(|| PathBuf::from("aliases.json"));
             return Self {
                 socket_path,
                 config_path,
                 state_path,
+                aliases_path,
             };
         }
 
@@ -44,6 +48,7 @@ impl RuntimePaths {
             socket_path: runtime_root.join("admux").join("socket"),
             config_path: config_root.join("admux").join("config.toml"),
             state_path: config_root.join("admux").join("state.json"),
+            aliases_path: config_root.join("admux").join("aliases.json"),
         }
     }
 
@@ -80,6 +85,10 @@ mod tests {
             paths.state_path,
             PathBuf::from("/home/test/.config/admux/state.json")
         );
+        assert_eq!(
+            paths.aliases_path,
+            PathBuf::from("/home/test/.config/admux/aliases.json")
+        );
     }
 
     #[test]
@@ -103,6 +112,10 @@ mod tests {
             paths.state_path,
             PathBuf::from("/home/tester/.config/admux/state.json")
         );
+        assert_eq!(
+            paths.aliases_path,
+            PathBuf::from("/home/tester/.config/admux/aliases.json")
+        );
     }
 
     #[test]
@@ -114,5 +127,6 @@ mod tests {
         assert_eq!(paths.socket_path, PathBuf::from("/tmp/custom-admux.sock"));
         assert_eq!(paths.config_path, PathBuf::from("config.toml"));
         assert_eq!(paths.state_path, PathBuf::from("state.json"));
+        assert_eq!(paths.aliases_path, PathBuf::from("aliases.json"));
     }
 }
