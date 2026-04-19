@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeSet, HashSet},
+    fs::OpenOptions,
     io::{self, IsTerminal, Read, Write},
     os::unix::net::UnixStream,
     path::PathBuf,
@@ -16,8 +17,9 @@ use crossterm::{
     cursor::{Hide, Show},
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
-        MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+        MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
@@ -69,11 +71,11 @@ enum ChooseItem {
     Session(String),
     Window {
         session: String,
-        window_id: u64,
+        window_index: u64,
     },
     Pane {
         session: String,
-        window_id: u64,
+        window_index: u64,
         pane_id: u64,
     },
 }
@@ -125,6 +127,10 @@ struct ResizeDrag {
     direction: NavigationDirection,
     last_row: u16,
     last_col: u16,
+}
+
+struct EventLogger {
+    out: std::fs::File,
 }
 
 pub fn run_from_env() -> Result<()> {
@@ -643,6 +649,7 @@ fn print_response(paths: &RuntimePaths, response: CommandResponse) -> Result<()>
 fn attach_interactive(paths: &RuntimePaths, session: &str) -> Result<()> {
     let mut config = load_config(paths)?;
     let mut stdout = io::stdout();
+    let mut event_logger = EventLogger::from_env(paths)?;
     terminal::enable_raw_mode().context("failed to enable raw mode")?;
     execute!(
         stdout,
@@ -654,12 +661,21 @@ fn attach_interactive(paths: &RuntimePaths, session: &str) -> Result<()> {
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                 | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
                 | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
-                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
         )
     )
     .context("failed to enter alternate screen")?;
 
-    let result = run_attach_loop(paths, session.to_string(), &mut config, &mut stdout);
+    if let Some(logger) = event_logger.as_mut() {
+        logger.log_line("attach session start")?;
+    }
+
+    let result = run_attach_loop(
+        paths,
+        session.to_string(),
+        &mut config,
+        &mut stdout,
+        event_logger.as_mut(),
+    );
 
     let _ = execute!(
         stdout,
@@ -678,6 +694,7 @@ fn run_attach_loop(
     mut current_session: String,
     config: &mut ResolvedConfig,
     stdout: &mut impl Write,
+    event_logger: Option<&mut EventLogger>,
 ) -> Result<()> {
     let mut state = InputState::new(config.keys.clone(), config.behavior.resize_step);
     let mut last_size = (0, 0);
@@ -692,6 +709,7 @@ fn run_attach_loop(
     let mut snapshot_dirty = false;
     let mut last_snapshot_refresh = Instant::now();
     let mut pending_event = None;
+    let mut event_logger = event_logger;
 
     loop {
         let (width, height) = terminal::size().context("failed to read terminal size")?;
@@ -824,7 +842,7 @@ fn run_attach_loop(
         }
 
         let mut needs_refresh = false;
-        match read_attach_event(&mut pending_event)? {
+        match read_attach_event(&mut pending_event, event_logger.as_deref_mut())? {
             Event::Key(key) => {
                 let current_overlay = std::mem::replace(&mut overlay, OverlayState::None);
                 match current_overlay {
@@ -873,7 +891,16 @@ fn run_attach_loop(
                         KeyCode::Esc | KeyCode::Char('q') => {}
                         _ => overlay = OverlayState::Help,
                     },
-                    OverlayState::None => match state.handle_key(key) {
+                    OverlayState::None => {
+                        let mode_before = state.mode;
+                        let action = state.handle_key(key);
+                        if let Some(logger) = event_logger.as_deref_mut() {
+                            logger.log_line(&format!(
+                                "handled: key={key:?} mode_before={mode_before:?} mode_after={:?} action={action:?}",
+                                state.mode
+                            ))?;
+                        }
+                        match action {
                         InputAction::Noop => {}
                         InputAction::Detach => break,
                         InputAction::EnterCopyMode => {
@@ -907,13 +934,33 @@ fn run_attach_loop(
                                 .iter()
                                 .find(|window| window.index == index as u64)
                             {
-                                let _ = request_response(
+                                if let Some(logger) = event_logger.as_deref_mut() {
+                                    logger.log_line(&format!(
+                                        "select-window-hit: requested={index} window_id={} window_index={}",
+                                        window.id, window.index
+                                    ))?;
+                                }
+                                let response = request_response(
                                     paths,
                                     CommandRequest::SelectWindow {
-                                        target: format!("{}:{}", current_session, window.id),
+                                        target: format!("{}:{}", current_session, window.index),
                                     },
                                 )?;
+                                if let Some(logger) = event_logger.as_deref_mut() {
+                                    logger.log_line(&format!(
+                                        "select-window-response: {response:?}"
+                                    ))?;
+                                }
                                 needs_refresh = true;
+                            } else if let Some(logger) = event_logger.as_deref_mut() {
+                                logger.log_line(&format!(
+                                    "select-window-miss: requested={index} snapshot_indexes={:?}",
+                                    snapshot
+                                        .windows
+                                        .iter()
+                                        .map(|window| window.index)
+                                        .collect::<Vec<_>>()
+                                ))?;
                             }
                         }
                         InputAction::OpenPrompt => {
@@ -1166,7 +1213,8 @@ fn run_attach_loop(
                                 needs_refresh = true;
                             }
                         }
-                    },
+                        }
+                    }
                 }
             }
             Event::Paste(text) => {
@@ -1228,26 +1276,58 @@ fn run_attach_loop(
     Ok(())
 }
 
-fn read_attach_event(pending_event: &mut Option<Event>) -> Result<Event> {
-    if let Some(event) = pending_event.take() {
-        return Ok(event);
-    }
+fn read_attach_event(
+    pending_event: &mut Option<Event>,
+    mut event_logger: Option<&mut EventLogger>,
+) -> Result<Event> {
+    let event = loop {
+        let event = if let Some(event) = pending_event.take() {
+            if let Some(logger) = event_logger.as_deref_mut() {
+                logger.log_event("pending", &event)?;
+            }
+            event
+        } else {
+            let event = event::read().context("failed to read terminal event")?;
+            if let Some(logger) = event_logger.as_deref_mut() {
+                logger.log_event("raw", &event)?;
+            }
+            event
+        };
+        match event {
+            Event::Key(key) if key.kind == KeyEventKind::Release => continue,
+            other => break other,
+        }
+    };
 
-    let event = event::read().context("failed to read terminal event")?;
     let Event::Key(key) = event else {
         return Ok(event);
     };
 
     if !matches!(key.code, KeyCode::Esc) || !key.modifiers.is_empty() {
-        return Ok(Event::Key(key));
+        let event = Event::Key(key);
+        if let Some(logger) = event_logger.as_deref_mut() {
+            logger.log_event("normalized", &event)?;
+        }
+        return Ok(event);
     }
 
     if !event::poll(ALT_SEQUENCE_TIMEOUT).context("failed to poll terminal event")? {
-        return Ok(Event::Key(key));
+        let event = Event::Key(key);
+        if let Some(logger) = event_logger.as_deref_mut() {
+            logger.log_event("normalized", &event)?;
+        }
+        return Ok(event);
     }
 
     let next = event::read().context("failed to read terminal event")?;
-    Ok(coalesce_escape_digit_event(Event::Key(key), next, pending_event))
+    if let Some(logger) = event_logger.as_deref_mut() {
+        logger.log_event("raw-followup", &next)?;
+    }
+    let event = coalesce_escape_digit_event(Event::Key(key), next, pending_event);
+    if let Some(logger) = event_logger.as_deref_mut() {
+        logger.log_event("normalized", &event)?;
+    }
+    Ok(event)
 }
 
 fn coalesce_escape_digit_event(event: Event, next: Event, pending_event: &mut Option<Event>) -> Event {
@@ -1270,6 +1350,57 @@ fn coalesce_escape_digit_event(event: Event, next: Event, pending_event: &mut Op
     }
 }
 
+impl EventLogger {
+    fn from_env(paths: &RuntimePaths) -> Result<Option<Self>> {
+        let Some(target) = std::env::var_os("ADMUX_KEY_LOG") else {
+            return Ok(None);
+        };
+        let path = if target == "1" {
+            paths.socket_dir().join("attach-events.log")
+        } else {
+            PathBuf::from(target)
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create event log directory {}", parent.display()))?;
+        }
+        let out = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("failed to open event log {}", path.display()))?;
+        let mut logger = Self { out };
+        logger.log_line(&format!("log path {}", path.display()))?;
+        Ok(Some(logger))
+    }
+
+    fn log_event(&mut self, stage: &str, event: &Event) -> Result<()> {
+        self.log_line(&format!("{stage}: {event:?}"))
+    }
+
+    fn log_line(&mut self, line: &str) -> Result<()> {
+        writeln!(self.out, "{line}").context("failed to write event log")
+    }
+
+    fn log_snapshot_summary(&mut self, session: &str, snapshot: &RenderSnapshot) -> Result<()> {
+        let active_windows = snapshot
+            .windows
+            .iter()
+            .filter(|window| window.active)
+            .map(|window| format!("id={} index={} name={}", window.id, window.index, window.name))
+            .collect::<Vec<_>>();
+        self.log_line(&format!(
+            "snapshot: session={session} windows={:?} active_windows={:?}",
+            snapshot
+                .windows
+                .iter()
+                .map(|window| (window.id, window.index, window.active))
+                .collect::<Vec<_>>(),
+            active_windows
+        ))
+    }
+}
+
 fn fetch_attach_snapshot(
     paths: &RuntimePaths,
     current_session: &mut String,
@@ -1284,13 +1415,17 @@ fn fetch_attach_snapshot(
         },
     )?;
     apply_attached_session(&response, current_session, last_size);
-    match response {
+    let snapshot = match response {
         CommandResponse::Attached {
             preview, snapshot, ..
-        } => Ok(snapshot.unwrap_or_else(|| fallback_snapshot(preview, width, height))),
-        CommandResponse::Error { message } => Err(anyhow!(message)),
-        other => Err(anyhow!("unexpected attach response: {other:?}")),
+        } => snapshot.unwrap_or_else(|| fallback_snapshot(preview, width, height)),
+        CommandResponse::Error { message } => return Err(anyhow!(message)),
+        other => return Err(anyhow!("unexpected attach response: {other:?}")),
+    };
+    if let Some(mut logger) = EventLogger::from_env(paths)? {
+        logger.log_snapshot_summary(current_session, &snapshot)?;
     }
+    Ok(snapshot)
 }
 
 fn load_config(paths: &RuntimePaths) -> Result<ResolvedConfig> {
@@ -1627,7 +1762,7 @@ fn resolve_window_target(snapshot: &RenderSnapshot, session: &str, target: &str)
             .iter()
             .find(|window| window.index == index as u64)
     {
-        return format!("{session}:{}", window.id);
+        return format!("{session}:{}", window.index);
     }
     if target.contains(':') {
         target.to_string()
@@ -1715,10 +1850,10 @@ fn rebuild_choose_tree(paths: &RuntimePaths, state: &mut ChooseTreeState) -> Res
         for window in windows {
             let expanded_window = state
                 .expanded_windows
-                .contains(&(session_name.clone(), window.id));
+                .contains(&(session_name.clone(), window.index));
             items.push(ChooseItem::Window {
                 session: session_name.clone(),
-                window_id: window.id,
+                window_index: window.index,
             });
             lines.push(TreeLine {
                 depth: 1,
@@ -1733,7 +1868,7 @@ fn rebuild_choose_tree(paths: &RuntimePaths, state: &mut ChooseTreeState) -> Res
             let panes = match request_response(
                 paths,
                 CommandRequest::ListPanes {
-                    target: format!("{session_name}:{}", window.id),
+                    target: format!("{session_name}:{}", window.index),
                 },
             )? {
                 CommandResponse::PaneList { panes } => panes,
@@ -1742,7 +1877,7 @@ fn rebuild_choose_tree(paths: &RuntimePaths, state: &mut ChooseTreeState) -> Res
             for pane in panes {
                 items.push(ChooseItem::Pane {
                     session: session_name.clone(),
-                    window_id: window.id,
+                    window_index: window.index,
                     pane_id: pane.id,
                 });
                 lines.push(TreeLine {
@@ -1898,11 +2033,14 @@ fn handle_choose_tree_key(
                         *current_session = session;
                         tree.attached_session = current_session.clone();
                     }
-                    ChooseItem::Window { session, window_id } => {
+                    ChooseItem::Window {
+                        session,
+                        window_index,
+                    } => {
                         let _ = request_response(
                             paths,
                             CommandRequest::SelectWindow {
-                                target: format!("{session}:{window_id}"),
+                                target: format!("{session}:{window_index}"),
                             },
                         )?;
                         *current_session = session;
@@ -1910,19 +2048,19 @@ fn handle_choose_tree_key(
                     }
                     ChooseItem::Pane {
                         session,
-                        window_id,
+                        window_index,
                         pane_id,
                     } => {
                         let _ = request_response(
                             paths,
                             CommandRequest::SelectWindow {
-                                target: format!("{session}:{window_id}"),
+                                target: format!("{session}:{window_index}"),
                             },
                         )?;
                         let _ = request_response(
                             paths,
                             CommandRequest::SelectPane {
-                                target: Some(format!("{session}:{window_id}.{pane_id}")),
+                                target: Some(format!("{session}:{window_index}.{pane_id}")),
                                 direction: None,
                             },
                         )?;
@@ -2001,8 +2139,11 @@ fn toggle_choose_item(tree: &mut ChooseTreeState, expand: bool) {
                     tree.expanded_sessions.remove(session);
                 }
             }
-            ChooseItem::Window { session, window_id } => {
-                let key = (session.clone(), *window_id);
+            ChooseItem::Window {
+                session,
+                window_index,
+            } => {
+                let key = (session.clone(), *window_index);
                 if expand {
                     tree.expanded_windows.insert(key);
                 } else {
@@ -2024,8 +2165,11 @@ fn toggle_choose_selected(tree: &mut ChooseTreeState) {
                     tree.expanded_sessions.insert(session.clone());
                 }
             }
-            ChooseItem::Window { session, window_id } => {
-                let key = (session.clone(), *window_id);
+            ChooseItem::Window {
+                session,
+                window_index,
+            } => {
+                let key = (session.clone(), *window_index);
                 if tree.expanded_windows.contains(&key) {
                     tree.expanded_windows.remove(&key);
                 } else {
@@ -2057,7 +2201,7 @@ fn expand_all_choose_items(paths: &RuntimePaths, tree: &mut ChooseTreeState) -> 
             _ => Vec::new(),
         };
         for window in windows {
-            tree.expanded_windows.insert((session.clone(), window.id));
+            tree.expanded_windows.insert((session.clone(), window.index));
         }
     }
     Ok(())
@@ -2688,17 +2832,47 @@ mod tests {
     }
 
     #[test]
+    fn resolve_window_target_uses_public_window_index() {
+        let snapshot = RenderSnapshot {
+            sessions: Vec::new(),
+            windows: vec![
+                WindowSummary {
+                    id: 210,
+                    index: 1,
+                    name: "editor".into(),
+                    active: false,
+                    last_selected: false,
+                },
+                WindowSummary {
+                    id: 211,
+                    index: 2,
+                    name: "shell".into(),
+                    active: true,
+                    last_selected: false,
+                },
+            ],
+            panes: Vec::new(),
+            dividers: Vec::new(),
+            active_window_id: 2,
+            active_pane_id: 1,
+        };
+
+        assert_eq!(resolve_window_target(&snapshot, "work", "1"), "work:1");
+        assert_eq!(resolve_window_target(&snapshot, "work", "2"), "work:2");
+    }
+
+    #[test]
     fn choose_tree_search_moves_selection_forward() {
         let mut tree = ChooseTreeState {
             items: vec![
                 ChooseItem::Session("work".into()),
                 ChooseItem::Window {
                     session: "work".into(),
-                    window_id: 1,
+                    window_index: 1,
                 },
                 ChooseItem::Pane {
                     session: "work".into(),
-                    window_id: 1,
+                    window_index: 1,
                     pane_id: 2,
                 },
             ],
@@ -2746,11 +2920,11 @@ mod tests {
                 ChooseItem::Session("work".into()),
                 ChooseItem::Window {
                     session: "work".into(),
-                    window_id: 1,
+                    window_index: 1,
                 },
                 ChooseItem::Pane {
                     session: "work".into(),
-                    window_id: 1,
+                    window_index: 1,
                     pane_id: 2,
                 },
             ],
