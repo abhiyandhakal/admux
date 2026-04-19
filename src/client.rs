@@ -47,6 +47,7 @@ use crate::{
 };
 
 const ATTACH_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+const ALT_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(35);
 
 fn validated_sockets() -> &'static Mutex<HashSet<PathBuf>> {
     static VALIDATED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
@@ -1233,7 +1234,7 @@ fn read_attach_event(pending_event: &mut Option<Event>) -> Result<Event> {
         return Ok(Event::Key(key));
     }
 
-    if !event::poll(Duration::from_millis(5)).context("failed to poll terminal event")? {
+    if !event::poll(ALT_SEQUENCE_TIMEOUT).context("failed to poll terminal event")? {
         return Ok(Event::Key(key));
     }
 
