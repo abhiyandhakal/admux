@@ -153,6 +153,91 @@ root = { command = ["sh", "-lc", "printf tests-ready; sleep 2"] }
 }
 
 #[test]
+fn daemon_backed_cli_can_launch_workspace_alias() {
+    let temp = tempdir();
+    let socket = temp.path().join("runtime").join("admux.sock");
+    let config = temp.path().join("config.toml");
+    let aliases = temp.path().join("aliases.json");
+    let workspace = temp.path().join("admux.toml");
+    fs::write(&config, "").expect("write config");
+    fs::write(
+        &workspace,
+        r#"
+version = 1
+
+[workspace]
+name = "shared-work"
+
+[[windows]]
+name = "editor"
+root = { command = ["sh", "-lc", "printf editor-ready; sleep 2"] }
+"#,
+    )
+    .expect("write workspace");
+    let mut daemon = spawn_daemon(&socket);
+
+    Command::new(env!("CARGO_BIN_EXE_admux"))
+        .env("ADMUX_SOCKET", &socket)
+        .env("ADMUX_CONFIG", &config)
+        .env("ADMUX_ALIASES", &aliases)
+        .args(["alias", "add", "demo", workspace.to_str().expect("utf8 path")])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("added alias demo"));
+
+    Command::new(env!("CARGO_BIN_EXE_admux"))
+        .env("ADMUX_SOCKET", &socket)
+        .env("ADMUX_CONFIG", &config)
+        .env("ADMUX_ALIASES", &aliases)
+        .args(["alias", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("demo"))
+        .stdout(predicate::str::contains("admux.toml"));
+
+    Command::new(env!("CARGO_BIN_EXE_admux"))
+        .current_dir(temp.path())
+        .env("ADMUX_SOCKET", &socket)
+        .env("ADMUX_CONFIG", &config)
+        .env("ADMUX_ALIASES", &aliases)
+        .arg("demo")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("workspace shared-work ready"));
+
+    Command::new(env!("CARGO_BIN_EXE_admux"))
+        .current_dir(temp.path())
+        .env("ADMUX_SOCKET", &socket)
+        .env("ADMUX_CONFIG", &config)
+        .env("ADMUX_ALIASES", &aliases)
+        .arg("demo")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("workspace shared-work attached"));
+
+    Command::new(env!("CARGO_BIN_EXE_admux"))
+        .env("ADMUX_SOCKET", &socket)
+        .env("ADMUX_CONFIG", &config)
+        .env("ADMUX_ALIASES", &aliases)
+        .args(["alias", "remove", "demo"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("removed alias demo"));
+
+    Command::new(env!("CARGO_BIN_EXE_admux"))
+        .env("ADMUX_SOCKET", &socket)
+        .env("ADMUX_CONFIG", &config)
+        .env("ADMUX_ALIASES", &aliases)
+        .arg("demo")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unrecognized subcommand"));
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+}
+
+#[test]
 fn save_writes_workspace_manifest_into_session_directory() {
     let temp = tempdir();
     let socket = temp.path().join("runtime").join("admux.sock");

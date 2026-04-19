@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeSet, HashSet},
+    ffi::OsString,
     fs::OpenOptions,
     io::{self, IsTerminal, Read, Write},
     os::unix::net::UnixStream,
@@ -12,7 +13,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use clap::Parser;
+use clap::{Parser, error::ErrorKind};
 use crossterm::{
     cursor::{Hide, Show},
     event::{
@@ -30,6 +31,7 @@ use crate::{
     cli::{
         AdmuxCli, AliasAddArgs, AliasArgs, AliasCommand, ClientCommand, NewWindowArgs,
         PasteBufferArgs, ResizePaneArgs, SelectPaneArgs, SetBufferArgs, SplitPaneArgs,
+        is_reserved_top_level_name,
     },
     commands::{InteractiveCommand, complete as complete_commands, parse as parse_command},
     config::{Config, ResolvedConfig, StatusPosition},
@@ -136,8 +138,43 @@ struct EventLogger {
 }
 
 pub fn run_from_env() -> Result<()> {
-    let cli = AdmuxCli::parse();
-    run(cli)
+    let argv = std::env::args_os().collect::<Vec<_>>();
+    let paths = RuntimePaths::resolve();
+    match AdmuxCli::try_parse_from(&argv) {
+        Ok(cli) => run(cli),
+        Err(err) => {
+            if should_try_alias(&argv, &err)
+                && let Some(cli) = try_resolve_alias_invocation(&argv, &paths)?
+            {
+                return run(cli);
+            }
+            err.exit()
+        }
+    }
+}
+
+fn should_try_alias(argv: &[OsString], err: &clap::Error) -> bool {
+    argv.len() == 2 && matches!(err.kind(), ErrorKind::InvalidSubcommand)
+}
+
+fn try_resolve_alias_invocation(argv: &[OsString], paths: &RuntimePaths) -> Result<Option<AdmuxCli>> {
+    let Some(name) = argv.get(1).and_then(|value| value.to_str()) else {
+        return Ok(None);
+    };
+    if name.starts_with('-') || is_reserved_top_level_name(name) {
+        return Ok(None);
+    }
+    let registry = AliasRegistry::load(&paths.aliases_path)?;
+    let Some(path) = registry.resolve(name) else {
+        return Ok(None);
+    };
+    Ok(Some(AdmuxCli {
+        command: ClientCommand::Up(crate::cli::UpArgs {
+            detach: false,
+            rebuild: false,
+            path: Some(path.to_path_buf()),
+        }),
+    }))
 }
 
 pub fn run(cli: AdmuxCli) -> Result<()> {
@@ -2737,6 +2774,8 @@ mod tests {
     use crate::paths::RuntimePaths;
     use std::{
         collections::VecDeque,
+        ffi::OsString,
+        fs,
         io::{Read, Write},
         os::unix::net::UnixListener,
     };
@@ -2766,6 +2805,69 @@ mod tests {
             aliases_path: "/tmp/admux-test/aliases.json".into(),
         };
         assert!(paths.socket_path.ends_with("socket"));
+    }
+
+    #[test]
+    fn bare_unknown_subcommand_can_resolve_to_alias() {
+        let dir = tempdir();
+        let manifest = dir.path().join("admux.toml");
+        fs::write(
+            &manifest,
+            r#"
+version = 1
+
+[workspace]
+name = "demo"
+
+[[windows]]
+name = "shell"
+root = { command = ["sh"] }
+"#,
+        )
+        .expect("write manifest");
+        let aliases = dir.path().join("aliases.json");
+        fs::write(
+            &aliases,
+            format!(r#"{{"aliases":{{"demo":"{}"}}}}"#, manifest.display()),
+        )
+        .expect("write aliases");
+        let paths = RuntimePaths {
+            socket_path: dir.path().join("socket"),
+            config_path: dir.path().join("config.toml"),
+            state_path: dir.path().join("state.json"),
+            aliases_path: aliases,
+        };
+
+        let cli = try_resolve_alias_invocation(
+            &[OsString::from("admux"), OsString::from("demo")],
+            &paths,
+        )
+        .expect("resolve alias")
+        .expect("alias cli");
+
+        assert_eq!(
+            cli.command,
+            ClientCommand::Up(crate::cli::UpArgs {
+                detach: false,
+                rebuild: false,
+                path: Some(manifest.canonicalize().expect("canonical manifest")),
+            })
+        );
+    }
+
+    #[test]
+    fn should_only_try_alias_for_single_unknown_subcommand() {
+        let argv = vec![OsString::from("admux"), OsString::from("demo")];
+        let error = AdmuxCli::try_parse_from(&argv).expect_err("unknown subcommand");
+        assert!(should_try_alias(&argv, &error));
+
+        let argv = vec![
+            OsString::from("admux"),
+            OsString::from("demo"),
+            OsString::from("--detach"),
+        ];
+        let error = AdmuxCli::try_parse_from(&argv).expect_err("unknown subcommand");
+        assert!(!should_try_alias(&argv, &error));
     }
 
     #[test]
