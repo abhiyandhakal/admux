@@ -10,6 +10,10 @@ admux kill <session>
 admux save [session]
 admux up [path]
 admux up --rebuild [path]
+admux alias add <name> [path]
+admux alias list
+admux alias remove <name>
+admux <alias>
 ```
 
 Notes:
@@ -17,7 +21,10 @@ Notes:
 - `admux new` uses the current shell directory by default
 - `admux new /path/to/project` uses that directory as the session cwd
 - `admux up` reads `./admux.toml` when no path is given
+- `admux alias add <name>` with no path uses `./admux.toml`
+- `admux <alias>` behaves like `admux up <manifest>` for the saved alias
 - `admux save` writes workspace files into the session directory, not the caller's current directory
+- built-in command names cannot be reused as aliases
 
 ## Window and Pane Commands
 

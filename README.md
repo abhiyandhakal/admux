@@ -29,6 +29,8 @@ Use the binary directly:
 admux new
 admux new --name work
 admux up
+admux alias add admux ~/coding/projects/admux/admux.toml
+admux admux
 admux save
 admux ls
 admux attach work
@@ -113,8 +115,16 @@ Key behavior:
 - `admux up` reads `./admux.toml`
 - rerunning `admux up` attaches to the existing mapped workspace instead of recreating it
 - `admux up --rebuild` rebuilds from `admux.toml` only
+- `admux alias add <name> [path]` stores a global workspace shortcut
+- `admux <alias>` launches the aliased workspace with the same behavior as `admux up <manifest>`
 - `admux save` writes `admux.toml` into the session directory, not the directory where you ran the command
 - `admux save` also writes local restore state into `.admux/snapshot.json`
+
+Alias rules:
+
+- aliases are stored per user in the `admux` config area
+- built-in command names such as `up`, `new`, or `attach` cannot be reused as aliases
+- `admux <alias>` only activates after normal command parsing fails, so built-in commands keep their current behavior
 
 Snapshots are best-effort local restore data. They bring back recent terminal state and then rerun the saved pane commands; they are not process checkpointing.
 

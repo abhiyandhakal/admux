@@ -40,4 +40,6 @@ command = ["cargo", "test", "--", "--watch"]
 - `admux up` creates the workspace if it does not exist
 - rerunning `admux up` attaches to the existing mapped workspace
 - `admux up --rebuild` rebuilds the workspace from the manifest
+- `admux alias add <name> [path]` creates a global shortcut to the manifest
+- `admux <name>` launches that shortcut with normal workspace attach-or-create behavior
 - `admux save` writes a live session back into `admux.toml`
