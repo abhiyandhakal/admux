@@ -16,7 +16,8 @@ use crossterm::{
     cursor::{Hide, Show},
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
+        MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
@@ -47,7 +48,7 @@ use crate::{
 };
 
 const ATTACH_FRAME_INTERVAL: Duration = Duration::from_millis(16);
-const ALT_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(35);
+const ALT_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(150);
 
 fn validated_sockets() -> &'static Mutex<HashSet<PathBuf>> {
     static VALIDATED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
@@ -648,7 +649,13 @@ fn attach_interactive(paths: &RuntimePaths, session: &str) -> Result<()> {
         EnterAlternateScreen,
         Hide,
         EnableMouseCapture,
-        EnableBracketedPaste
+        EnableBracketedPaste,
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        )
     )
     .context("failed to enter alternate screen")?;
 
@@ -658,6 +665,7 @@ fn attach_interactive(paths: &RuntimePaths, session: &str) -> Result<()> {
         stdout,
         DisableBracketedPaste,
         DisableMouseCapture,
+        PopKeyboardEnhancementFlags,
         Show,
         LeaveAlternateScreen
     );
