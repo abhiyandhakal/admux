@@ -867,29 +867,42 @@ impl SessionStore {
 
     fn kill_pane(&mut self, target: TargetRef) -> CommandResponse {
         match self.sessions.get_mut(&target.session) {
-            Some(session) => match session.kill_pane(target.window, target.pane) {
-                Ok(Some(killed)) => CommandResponse::PaneKilled {
-                    session: session.name.clone(),
-                    window_id: session
-                        .numbering
-                        .public_window_id(killed.window_id, &session.window_order)
-                        .unwrap_or(killed.window_id.0),
-                    pane_id: session
-                        .numbering
-                        .public_pane_number(killed.pane_id)
-                        .unwrap_or(killed.pane_id.0),
-                },
-                Ok(None) => {
-                    if !session.is_alive() {
-                        self.sessions.remove(&target.session);
-                        self.persisted_sessions.remove(&target.session);
+            Some(session) => {
+                let window_id = target.window.unwrap_or(session.active_window);
+                match session.kill_pane(target.window, target.pane) {
+                    Ok(Some(killed)) => CommandResponse::PaneKilled {
+                        session: session.name.clone(),
+                        window_id: session
+                            .numbering
+                            .public_window_id(killed.window_id, &session.window_order)
+                            .unwrap_or(killed.window_id.0),
+                        pane_id: session
+                            .numbering
+                            .public_pane_number(killed.pane_id)
+                            .unwrap_or(killed.pane_id.0),
+                    },
+                    Ok(None) => {
+                        if !session.is_alive() {
+                            self.sessions.remove(&target.session);
+                            self.persisted_sessions.remove(&target.session);
+                            CommandResponse::SessionKilled {
+                                session: target.session,
+                            }
+                        } else {
+                            CommandResponse::WindowKilled {
+                                session: session.name.clone(),
+                                window_id: session
+                                    .numbering
+                                    .public_window_id(window_id, &session.window_order)
+                                    .unwrap_or(window_id.0),
+                            }
+                        }
                     }
-                    CommandResponse::FocusChanged
+                    Err(error) => CommandResponse::Error {
+                        message: error.to_string(),
+                    },
                 }
-                Err(error) => CommandResponse::Error {
-                    message: error.to_string(),
-                },
-            },
+            }
             None => CommandResponse::Error {
                 message: format!("unknown session {}", target.session),
             },
@@ -1595,6 +1608,27 @@ mod tests {
             .expect("session")
             .kill()
             .expect("clean up session");
+    }
+
+    #[test]
+    fn killing_the_last_pane_reports_that_the_session_was_killed() {
+        let mut store = SessionStore::default();
+        let _ = store.handle(CommandRequest::NewSession {
+            name: Some("work".into()),
+            cwd: None,
+            command: vec!["sh".into()],
+            switch_from: None,
+        });
+
+        assert_eq!(
+            store.handle(CommandRequest::KillPane {
+                target: "work".into(),
+            }),
+            CommandResponse::SessionKilled {
+                session: "work".into(),
+            }
+        );
+        assert!(!store.sessions.contains_key("work"));
     }
 
     #[test]
