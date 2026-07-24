@@ -127,8 +127,24 @@ pub fn load_state(path: &Path) -> Result<PersistedState> {
     }
     let raw = fs::read_to_string(path)
         .with_context(|| format!("failed to read state file {}", path.display()))?;
-    let mut state: PersistedState = serde_json::from_str(&raw)
-        .with_context(|| format!("failed to decode state file {}", path.display()))?;
+    let mut state: PersistedState = match serde_json::from_str(&raw) {
+        Ok(state) => state,
+        Err(error) => {
+            let quarantined = quarantine_corrupt_state(path);
+            match quarantined {
+                Ok(quarantined_path) => eprintln!(
+                    "admuxd: ignored corrupt state file {} (moved to {}): {error}",
+                    path.display(),
+                    quarantined_path.display()
+                ),
+                Err(quarantine_error) => eprintln!(
+                    "admuxd: ignored corrupt state file {} (could not quarantine it: {quarantine_error}): {error}",
+                    path.display()
+                ),
+            }
+            return Ok(PersistedState::default());
+        }
+    };
     if state.schema_version > STATE_SCHEMA_VERSION {
         anyhow::bail!(
             "state file {} uses unsupported schema version {} (this admux supports {})",
@@ -140,6 +156,19 @@ pub fn load_state(path: &Path) -> Result<PersistedState> {
     // Version 0 is the pre-versioned format and is structurally compatible.
     state.schema_version = STATE_SCHEMA_VERSION;
     Ok(state)
+}
+
+fn quarantine_corrupt_state(path: &Path) -> Result<PathBuf> {
+    let counter = STATE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let quarantined = path.with_extension(format!("json.corrupt.{}.{}", process::id(), counter));
+    fs::rename(path, &quarantined).with_context(|| {
+        format!(
+            "failed to quarantine corrupt state file {} as {}",
+            path.display(),
+            quarantined.display()
+        )
+    })?;
+    Ok(quarantined)
 }
 
 pub fn save_state(path: &Path, state: &PersistedState) -> Result<()> {
@@ -200,5 +229,39 @@ mod tests {
         let loaded = load_state(&path).expect("load");
 
         assert_eq!(loaded, state);
+    }
+
+    #[test]
+    fn corrupt_state_is_quarantined_and_does_not_block_startup() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+        fs::write(&path, "not json").expect("write corrupt state");
+
+        let state = load_state(&path).expect("recover corrupt state");
+
+        assert_eq!(state, PersistedState::default());
+        assert!(!path.exists());
+        assert!(fs::read_dir(dir.path())
+            .expect("read state directory")
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().starts_with("state.json.corrupt.")));
+    }
+
+    #[test]
+    fn future_state_schema_is_not_treated_as_corruption() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+        let future_state = PersistedState {
+            schema_version: STATE_SCHEMA_VERSION + 1,
+            ..PersistedState::default()
+        };
+        fs::write(
+            &path,
+            serde_json::to_vec(&future_state).expect("encode future state"),
+        )
+        .expect("write future state");
+
+        assert!(load_state(&path).is_err());
+        assert!(path.exists());
     }
 }
