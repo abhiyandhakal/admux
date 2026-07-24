@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs,
     io::{Read, Write},
+    os::unix::fs::FileTypeExt,
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -21,6 +22,8 @@ use std::{
 };
 
 const HISTORY_LIMIT: usize = 2 * 1024 * 1024;
+const IPC_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_IPC_MESSAGE_BYTES: u64 = 1024 * 1024;
 static HELPER_NAME_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct TerminalState {
@@ -245,7 +248,7 @@ impl PaneProcess {
         };
         let payload = serde_json::to_string(&args).context("failed to encode helper args")?;
 
-        Command::new(helper_bin)
+        let mut child = Command::new(helper_bin)
             .arg(payload)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -255,7 +258,12 @@ impl PaneProcess {
             .spawn()
             .context("failed to spawn admux-pane helper")?;
 
-        wait_for_socket(&socket_path)?;
+        if let Err(error) = wait_for_socket(&socket_path) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(&socket_path);
+            return Err(error);
+        }
         Ok(Self { socket_path })
     }
 
@@ -430,6 +438,7 @@ impl PaneProcess {
                 self.socket_path.display()
             )
         })?;
+        configure_ipc_stream(&stream)?;
         let payload = serde_json::to_vec(&request).context("failed to encode pane request")?;
         stream
             .write_all(&payload)
@@ -437,10 +446,7 @@ impl PaneProcess {
         stream
             .shutdown(std::net::Shutdown::Write)
             .context("failed to finish pane request")?;
-        let mut response = Vec::new();
-        stream
-            .read_to_end(&mut response)
-            .context("failed to read pane response")?;
+        let response = read_limited(&mut stream, "pane response")?;
         serde_json::from_slice(&response).context("failed to decode pane response")
     }
 }
@@ -472,11 +478,26 @@ pub fn run_helper(args: PaneHelperArgs) -> Result<()> {
     })?;
 
     for stream in listener.incoming() {
-        let mut stream = stream.context("failed to accept pane helper client")?;
-        let request = read_helper_request(&mut stream)?;
+        let Ok(mut stream) = stream else {
+            continue;
+        };
+        if let Err(error) = configure_ipc_stream(&stream) {
+            eprintln!("admux-pane: failed to configure client stream: {error:#}");
+            continue;
+        }
+        let request = match read_helper_request(&mut stream) {
+            Ok(request) => request,
+            Err(error) => {
+                eprintln!("admux-pane: rejected client request: {error:#}");
+                continue;
+            }
+        };
         let shutdown = matches!(request, PaneRequest::Shutdown);
         let response = handle_helper_request(&state, request);
-        write_helper_response(&mut stream, &response)?;
+        if let Err(error) = write_helper_response(&mut stream, &response) {
+            eprintln!("admux-pane: failed to write client response: {error:#}");
+            continue;
+        }
         if shutdown {
             break;
         }
@@ -917,11 +938,26 @@ fn foreground_command_for_pid(pid: i32) -> Option<Vec<String>> {
 }
 
 fn read_helper_request(stream: &mut UnixStream) -> Result<PaneRequest> {
-    let mut payload = Vec::new();
-    stream
-        .read_to_end(&mut payload)
-        .context("failed to read pane helper request")?;
+    let payload = read_limited(stream, "pane helper request")?;
     serde_json::from_slice(&payload).context("failed to decode pane helper request")
+}
+
+fn configure_ipc_stream(stream: &UnixStream) -> Result<()> {
+    stream.set_read_timeout(Some(IPC_TIMEOUT))?;
+    stream.set_write_timeout(Some(IPC_TIMEOUT))?;
+    Ok(())
+}
+
+fn read_limited(stream: &mut UnixStream, kind: &str) -> Result<Vec<u8>> {
+    let mut payload = Vec::new();
+    (&mut *stream)
+        .take(MAX_IPC_MESSAGE_BYTES + 1)
+        .read_to_end(&mut payload)
+        .with_context(|| format!("failed to read {kind}"))?;
+    if payload.len() as u64 > MAX_IPC_MESSAGE_BYTES {
+        bail!("{kind} exceeds {MAX_IPC_MESSAGE_BYTES} byte limit");
+    }
+    Ok(payload)
 }
 
 fn write_helper_response(stream: &mut UnixStream, response: &PaneResponse) -> Result<()> {
@@ -968,7 +1004,12 @@ fn build_command(
 fn wait_for_socket(socket_path: &Path) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        if socket_path.exists() {
+        if socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)
+            && PaneProcess::connect(socket_path.to_path_buf()).is_ok()
+        {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(25));

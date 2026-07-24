@@ -553,6 +553,8 @@ fn resolve_daemon_binary() -> Result<std::path::PathBuf> {
 }
 
 fn write_message(stream: &mut UnixStream, request: &CommandRequest) -> Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let payload = serde_json::to_vec(request).context("failed to encode request")?;
     stream
         .write_all(&payload)
@@ -565,9 +567,13 @@ fn write_message(stream: &mut UnixStream, request: &CommandRequest) -> Result<()
 
 fn read_message(stream: &mut UnixStream) -> Result<CommandResponse> {
     let mut payload = Vec::new();
-    stream
+    (&mut *stream)
+        .take(1024 * 1024 + 1)
         .read_to_end(&mut payload)
         .context("failed to read response payload")?;
+    if payload.len() > 1024 * 1024 {
+        bail!("response payload exceeds 1048576 byte limit");
+    }
     let response = serde_json::from_slice(&payload).context("failed to decode response")?;
     Ok(response)
 }

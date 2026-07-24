@@ -5,7 +5,12 @@ use std::{
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    thread,
+    time::Duration,
 };
+
+const IPC_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_IPC_MESSAGE_BYTES: u64 = 1024 * 1024;
 
 use anyhow::{Context, Result, bail};
 
@@ -1280,25 +1285,64 @@ pub fn serve(socket_path: &Path, state_path: &Path, config_path: &Path) -> Resul
         helper_dir,
     )?));
     for stream in listener.incoming() {
-        let mut stream = stream.context("failed to accept client")?;
-        let response = {
-            let request = read_request(&mut stream)?;
-            let mut state = state.lock().expect("session store lock poisoned");
-            state.handle(request)
+        let stream = match stream {
+            Ok(stream) => stream,
+            Err(error) => {
+                eprintln!("admuxd: failed to accept client: {error:#}");
+                thread::sleep(Duration::from_millis(25));
+                continue;
+            }
         };
-        write_response(&mut stream, &response)?;
+        let state = Arc::clone(&state);
+        thread::spawn(move || handle_client(stream, state));
     }
 
     bail!("listener stopped unexpectedly")
 }
 
+fn handle_client(mut stream: UnixStream, state: Arc<Mutex<SessionStore>>) {
+        if let Err(error) = configure_ipc_stream(&stream) {
+            eprintln!("admuxd: failed to configure client stream: {error:#}");
+            return;
+        }
+        let response = {
+            let request = match read_request(&mut stream) {
+                Ok(request) => request,
+                Err(error) => {
+                    eprintln!("admuxd: rejected client request: {error:#}");
+                    return;
+                }
+            };
+            let mut state = state.lock().expect("session store lock poisoned");
+            state.handle(request)
+        };
+        if let Err(error) = write_response(&mut stream, &response) {
+            eprintln!("admuxd: failed to write client response: {error:#}");
+        }
+}
+
 fn read_request(stream: &mut UnixStream) -> Result<CommandRequest> {
-    let mut payload = Vec::new();
-    stream
-        .read_to_end(&mut payload)
-        .context("failed to read request payload")?;
+    let payload = read_limited(stream, MAX_IPC_MESSAGE_BYTES, "request")?;
     let request = serde_json::from_slice(&payload).context("failed to decode request")?;
     Ok(request)
+}
+
+fn configure_ipc_stream(stream: &UnixStream) -> Result<()> {
+    stream.set_read_timeout(Some(IPC_TIMEOUT))?;
+    stream.set_write_timeout(Some(IPC_TIMEOUT))?;
+    Ok(())
+}
+
+fn read_limited(stream: &mut UnixStream, limit: u64, kind: &str) -> Result<Vec<u8>> {
+    let mut payload = Vec::new();
+    (&mut *stream)
+        .take(limit + 1)
+        .read_to_end(&mut payload)
+        .with_context(|| format!("failed to read {kind} payload"))?;
+    if payload.len() as u64 > limit {
+        bail!("{kind} payload exceeds {limit} byte limit");
+    }
+    Ok(payload)
 }
 
 fn write_response(stream: &mut UnixStream, response: &CommandResponse) -> Result<()> {
