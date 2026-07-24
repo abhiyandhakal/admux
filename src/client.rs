@@ -1725,13 +1725,13 @@ fn execute_prompt_command(
         }
         InteractiveCommand::AttachSession { target }
         | InteractiveCommand::SwitchClient { target } => {
-            let _ = request_response(
+            let response = request_response(
                 paths,
                 CommandRequest::Attach {
                     session: Some(target.clone()),
                 },
             )?;
-            *current_session = target;
+            apply_prompt_session_switch(current_session, response)?;
             Ok(None)
         }
         InteractiveCommand::ListSessions => {
@@ -1840,6 +1840,20 @@ fn execute_prompt_command(
             let _ = request_response(paths, CommandRequest::ReloadConfig)?;
             Ok(Some("config reloaded".into()))
         }
+    }
+}
+
+fn apply_prompt_session_switch(
+    current_session: &mut String,
+    response: CommandResponse,
+) -> Result<()> {
+    match response {
+        CommandResponse::Attached { session, .. } => {
+            *current_session = session;
+            Ok(())
+        }
+        CommandResponse::Error { message } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected attach response: {other:?}")),
     }
 }
 
@@ -3218,6 +3232,19 @@ root = { command = ["sh"] }
             &mut status,
         ));
         assert_eq!(status.as_deref(), Some("unknown pane"));
+    }
+
+    #[test]
+    fn rejected_prompt_session_switch_keeps_the_current_session() {
+        let mut current_session = String::from("work");
+        assert!(apply_prompt_session_switch(
+            &mut current_session,
+            CommandResponse::Error {
+                message: "unknown session missing".into(),
+            },
+        )
+        .is_err());
+        assert_eq!(current_session, "work");
     }
 
     #[test]
