@@ -122,7 +122,7 @@ impl BufferStore {
     fn next_sequence(&mut self) -> u64 {
         loop {
             let seq = self.next_seq;
-            self.next_seq = self.next_seq.saturating_add(1);
+            self.next_seq = self.next_seq.wrapping_add(1);
             let name = format!("buffer{seq:04}");
             if !self.buffers.iter().any(|buffer| buffer.name == name) {
                 return seq;
@@ -189,6 +189,17 @@ mod tests {
             .map(|buffer| buffer.name)
             .collect();
         assert_eq!(names, vec!["buffer0004", "buffer0003", "buffer0002"]);
+    }
+
+    #[test]
+    fn automatic_names_wrap_without_reusing_an_existing_name() {
+        let mut store = BufferStore::default();
+        store.next_seq = u64::MAX;
+        assert_eq!(
+            store.set(None, "last".into(), false).name,
+            "buffer18446744073709551615"
+        );
+        assert_eq!(store.set(None, "wrapped".into(), false).name, "buffer0000");
     }
 
     #[test]
