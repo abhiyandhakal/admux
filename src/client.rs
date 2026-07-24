@@ -928,7 +928,13 @@ fn run_attach_loop(
                         }
                     }
                     OverlayState::ChooseTree(mut tree) => {
-                        if handle_choose_tree_key(paths, &mut tree, key, &mut current_session)? {
+                        if handle_choose_tree_key(
+                            paths,
+                            &mut tree,
+                            key,
+                            &mut current_session,
+                            &mut status_message,
+                        )? {
                             overlay = OverlayState::ChooseTree(tree);
                         } else {
                             needs_refresh = true;
@@ -2120,6 +2126,7 @@ fn handle_choose_tree_key(
     tree: &mut ChooseTreeState,
     key: crossterm::event::KeyEvent,
     current_session: &mut String,
+    status_message: &mut Option<String>,
 ) -> Result<bool> {
     if let Some(query) = tree.search_input.as_mut() {
         match key.code {
@@ -2184,8 +2191,27 @@ fn handle_choose_tree_key(
             if let Some(item) = tree.items.get(tree.selected).cloned() {
                 match item {
                     ChooseItem::Session(session) => {
-                        *current_session = session;
-                        tree.attached_session = current_session.clone();
+                        match request_response(
+                            paths,
+                            CommandRequest::Attach {
+                                session: Some(session),
+                            },
+                        )? {
+                            CommandResponse::Attached { session, .. } => {
+                                *current_session = session;
+                                tree.attached_session = current_session.clone();
+                            }
+                            CommandResponse::Error { message } => {
+                                *status_message = Some(message);
+                                return Ok(true);
+                            }
+                            other => {
+                                *status_message = Some(format!(
+                                    "unexpected session attach response: {other:?}"
+                                ));
+                                return Ok(true);
+                            }
+                        }
                     }
                     ChooseItem::Window {
                         session,
