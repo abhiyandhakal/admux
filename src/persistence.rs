@@ -2,6 +2,8 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
+    process,
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use anyhow::{Context, Result};
@@ -13,8 +15,13 @@ use crate::{
     session::{PaneRuntime, Session, WindowRuntime},
 };
 
+pub const STATE_SCHEMA_VERSION: u32 = 1;
+static STATE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PersistedState {
+    #[serde(default)]
+    pub schema_version: u32,
     pub last_session: Option<String>,
     pub next_window_id: u64,
     #[serde(default)]
@@ -120,8 +127,18 @@ pub fn load_state(path: &Path) -> Result<PersistedState> {
     }
     let raw = fs::read_to_string(path)
         .with_context(|| format!("failed to read state file {}", path.display()))?;
-    let state = serde_json::from_str(&raw)
+    let mut state: PersistedState = serde_json::from_str(&raw)
         .with_context(|| format!("failed to decode state file {}", path.display()))?;
+    if state.schema_version > STATE_SCHEMA_VERSION {
+        anyhow::bail!(
+            "state file {} uses unsupported schema version {} (this admux supports {})",
+            path.display(),
+            state.schema_version,
+            STATE_SCHEMA_VERSION
+        );
+    }
+    // Version 0 is the pre-versioned format and is structurally compatible.
+    state.schema_version = STATE_SCHEMA_VERSION;
     Ok(state)
 }
 
@@ -130,8 +147,11 @@ pub fn save_state(path: &Path, state: &PersistedState) -> Result<()> {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create state directory {}", parent.display()))?;
     }
-    let tmp = path.with_extension("json.tmp");
-    let raw = serde_json::to_vec_pretty(state).context("failed to encode state file")?;
+    let counter = STATE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("json.{}.{}.tmp", process::id(), counter));
+    let mut state = state.clone();
+    state.schema_version = STATE_SCHEMA_VERSION;
+    let raw = serde_json::to_vec_pretty(&state).context("failed to encode state file")?;
     fs::write(&tmp, raw).with_context(|| format!("failed to write {}", tmp.display()))?;
     fs::rename(&tmp, path)
         .with_context(|| format!("failed to rename {} to {}", tmp.display(), path.display()))?;
@@ -148,6 +168,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("state.json");
         let mut state = PersistedState {
+            schema_version: STATE_SCHEMA_VERSION,
             last_session: Some("work".into()),
             next_window_id: 2,
             buffers: vec![PasteBuffer {

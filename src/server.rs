@@ -736,6 +736,7 @@ impl SessionStore {
             return;
         };
         let state = PersistedState {
+            schema_version: crate::persistence::STATE_SCHEMA_VERSION,
             last_session: self.last_session.clone(),
             next_window_id: self.next_window_id,
             buffers: self.buffers.snapshot(),
@@ -1728,6 +1729,7 @@ mod tests {
         fs::write(
             &state_path,
             serde_json::to_vec_pretty(&PersistedState {
+                schema_version: crate::persistence::STATE_SCHEMA_VERSION,
                 last_session: Some("ghost".into()),
                 next_window_id: 1,
                 buffers: Vec::new(),
