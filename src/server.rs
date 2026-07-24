@@ -11,6 +11,7 @@ use std::{
 
 const IPC_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_IPC_MESSAGE_BYTES: u64 = 1024 * 1024;
+const MAX_SESSION_NAME_BYTES: usize = 64;
 
 use anyhow::{Context, Result, bail};
 
@@ -97,6 +98,19 @@ fn request_changes_persisted_state(request: &CommandRequest) -> bool {
     )
 }
 
+fn validate_session_name(name: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        bail!("session name cannot be empty");
+    }
+    if name.len() > MAX_SESSION_NAME_BYTES {
+        bail!("session name exceeds {MAX_SESSION_NAME_BYTES} bytes");
+    }
+    if name.chars().any(char::is_control) {
+        bail!("session name cannot contain control characters");
+    }
+    Ok(())
+}
+
 impl SessionStore {
     pub fn with_paths(
         state_path: std::path::PathBuf,
@@ -157,7 +171,11 @@ impl SessionStore {
                 switch_from,
             } => {
                 let name = name.unwrap_or_else(|| self.next_session_name());
-                if self.sessions.contains_key(&name) || self.persisted_sessions.contains_key(&name)
+                if let Err(error) = validate_session_name(&name) {
+                    CommandResponse::Error {
+                        message: error.to_string(),
+                    }
+                } else if self.sessions.contains_key(&name) || self.persisted_sessions.contains_key(&name)
                 {
                     CommandResponse::Error {
                         message: format!("session {name} already exists"),
@@ -1018,6 +1036,12 @@ impl SessionStore {
         switch_from: Option<crate::ipc::SwitchSource>,
     ) -> CommandResponse {
         let manifest_key = workspace.manifest_key.clone();
+        let session_name = workspace.spec.name.clone();
+        if let Err(error) = validate_session_name(&session_name) {
+            return CommandResponse::Error {
+                message: error.to_string(),
+            };
+        }
         if rebuild && let Some(existing) = self.workspace_mappings.get(&manifest_key).cloned() {
             if let Some(session) = self.sessions.remove(&existing) {
                 let _ = session.kill();
@@ -1037,7 +1061,6 @@ impl SessionStore {
             };
         }
 
-        let session_name = workspace.spec.name.clone();
         if self.sessions.contains_key(&session_name)
             || self.persisted_sessions.contains_key(&session_name)
         {
@@ -1483,6 +1506,23 @@ mod tests {
             CommandResponse::Error { ref message } if message == "session work already exists"
         ));
         assert!(store.sessions.contains_key("work"));
+    }
+
+    #[test]
+    fn session_creation_rejects_empty_control_and_overlong_names() {
+        let mut store = SessionStore::default();
+        for name in [" ".into(), "bad\nname".into(), "x".repeat(65)] {
+            assert!(matches!(
+                store.handle(CommandRequest::NewSession {
+                    name: Some(name),
+                    cwd: None,
+                    command: vec!["sh".into()],
+                    switch_from: None,
+                }),
+                CommandResponse::Error { .. }
+            ));
+        }
+        assert!(store.sessions.is_empty());
     }
 
     #[test]
