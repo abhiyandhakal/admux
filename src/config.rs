@@ -679,6 +679,16 @@ pub fn parse_key_pattern(value: &str) -> Result<KeyPattern> {
             modifiers: KeyPatternModifiers::default(),
         });
     }
+    if matches!(value.to_ascii_lowercase().as_str(), "page-up" | "page-down") {
+        return Ok(KeyPattern {
+            code: if value.eq_ignore_ascii_case("page-up") {
+                KeyPatternCode::PageUp
+            } else {
+                KeyPatternCode::PageDown
+            },
+            modifiers: KeyPatternModifiers::default(),
+        });
+    }
     let mut modifiers = KeyPatternModifiers::default();
     let mut parts = value.split('-').peekable();
     let mut last = None;
@@ -970,6 +980,24 @@ mod tests {
                 .copy_mode
                 .iter()
                 .any(|(_, action)| *action == Action::CopyMoveLeft)
+        );
+    }
+
+    #[test]
+    fn page_key_aliases_parse_without_being_treated_as_modifiers() {
+        assert_eq!(
+            parse_key_pattern("page-up").expect("page-up"),
+            KeyPattern {
+                code: KeyPatternCode::PageUp,
+                modifiers: KeyPatternModifiers::default(),
+            }
+        );
+        assert_eq!(
+            parse_key_pattern("page-down").expect("page-down"),
+            KeyPattern {
+                code: KeyPatternCode::PageDown,
+                modifiers: KeyPatternModifiers::default(),
+            }
         );
     }
 
