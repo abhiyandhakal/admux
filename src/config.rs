@@ -582,6 +582,12 @@ impl Config {
     }
 
     pub fn resolve(&self) -> Result<ResolvedConfig> {
+        if self.behavior.resize_step == 0 {
+            bail!("behavior.resize_step must be greater than zero");
+        }
+        if self.behavior.copy_page_size == Some(0) {
+            bail!("behavior.copy_page_size must be greater than zero when set");
+        }
         let status = resolve_status_config(&self.ui);
         let key_config = resolve_key_config(
             &self.keys,
@@ -999,6 +1005,19 @@ mod tests {
                 modifiers: KeyPatternModifiers::default(),
             }
         );
+    }
+
+    #[test]
+    fn rejects_zero_behavior_sizes() {
+        for input in [
+            "[behavior]\nresize_step = 0",
+            "[behavior]\ncopy_page_size = 0",
+        ] {
+            assert!(Config::from_toml(input)
+                .expect("parse config")
+                .resolve()
+                .is_err());
+        }
     }
 
     #[test]
