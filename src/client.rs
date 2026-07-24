@@ -1265,7 +1265,9 @@ fn run_attach_loop(
                 }
             }
             Event::Paste(text) => {
-                if matches!(overlay, OverlayState::None) && copy_mode.is_none() {
+                if let OverlayState::Prompt(prompt) = &mut overlay {
+                    insert_prompt_text(prompt, &text);
+                } else if matches!(overlay, OverlayState::None) && copy_mode.is_none() {
                     let mut bytes = Vec::with_capacity(text.len() + 12);
                     bytes.extend_from_slice(b"\x1b[200~");
                     bytes.extend_from_slice(text.as_bytes());
@@ -1601,10 +1603,21 @@ fn handle_prompt_key(
         _ => {}
     }
 
+    refresh_prompt_completions(prompt);
+    Ok(PromptResult::KeepOpen)
+}
+
+fn insert_prompt_text(prompt: &mut PromptState, text: &str) {
+    prompt.buffer.insert_str(prompt.cursor, text);
+    prompt.cursor += text.len();
+    prompt.history_index = None;
+    refresh_prompt_completions(prompt);
+}
+
+fn refresh_prompt_completions(prompt: &mut PromptState) {
     let prefix = prompt.buffer.split_whitespace().next().unwrap_or("");
     prompt.completions = command_completions(prefix);
     prompt.selected = 0;
-    Ok(PromptResult::KeepOpen)
 }
 
 fn previous_char_boundary(text: &str, cursor: usize) -> Option<usize> {
@@ -3183,6 +3196,23 @@ root = { command = ["sh"] }
         assert_eq!(next_char_boundary(text, 0), Some(1));
         assert_eq!(next_char_boundary(text, 1), Some(3));
         assert_eq!(next_char_boundary(text, 3), Some(text.len()));
+    }
+
+    #[test]
+    fn pasting_into_the_prompt_inserts_at_the_utf8_cursor() {
+        let mut prompt = PromptState {
+            buffer: "say 🙂".into(),
+            cursor: 4,
+            completions: Vec::new(),
+            selected: 0,
+            history_index: Some(0),
+        };
+
+        insert_prompt_text(&mut prompt, "é");
+
+        assert_eq!(prompt.buffer, "say é🙂");
+        assert_eq!(prompt.cursor, 6);
+        assert!(prompt.history_index.is_none());
     }
 
     #[test]
