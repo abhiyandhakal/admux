@@ -1059,7 +1059,7 @@ fn run_attach_loop(
                             let _ = request_response(
                                 paths,
                                 CommandRequest::SelectPane {
-                                    target: None,
+                                    target: Some(current_session.clone()),
                                     direction: Some(direction),
                                 },
                             )?;

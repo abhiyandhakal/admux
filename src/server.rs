@@ -118,13 +118,13 @@ impl SessionStore {
                 command,
                 switch_from,
             } => {
-                let name = name.unwrap_or_else(|| {
-                    format!(
-                        "{}-{}",
-                        self.config.defaults.session.name_prefix,
-                        self.sessions.len() + 1
-                    )
-                });
+                let name = name.unwrap_or_else(|| self.next_session_name());
+                if self.sessions.contains_key(&name) || self.persisted_sessions.contains_key(&name)
+                {
+                    CommandResponse::Error {
+                        message: format!("session {name} already exists"),
+                    }
+                } else {
                 let command = self.effective_command(command);
                 let window_id = self.next_window();
                 match Session::new(
@@ -161,6 +161,7 @@ impl SessionStore {
                         message: error.to_string(),
                     },
                 }
+                }
             }
             CommandRequest::UpWorkspace {
                 manifest_path,
@@ -185,6 +186,7 @@ impl SessionStore {
                     .filter(|target| self.sessions.contains_key(target))
                     .unwrap_or(session_name);
                 if self.sessions.contains_key(&session_name) {
+                    self.last_session = Some(session_name.clone());
                     let session = self.sessions.get(&session_name).expect("checked contains");
                     let snapshot =
                         session
@@ -441,9 +443,14 @@ impl SessionStore {
                 name,
                 command,
             } => {
-                let window_id = self.next_window();
-                let command = self.effective_command(command);
-                match self.sessions.get_mut(&session) {
+                if !self.sessions.contains_key(&session) {
+                    CommandResponse::Error {
+                        message: format!("unknown session {session}"),
+                    }
+                } else {
+                    let window_id = self.next_window();
+                    let command = self.effective_command(command);
+                    match self.sessions.get_mut(&session) {
                     Some(session) => match session.new_window(window_id, name, &command) {
                         Ok(created) => CommandResponse::WindowCreated {
                             session: session.name.clone(),
@@ -460,9 +467,8 @@ impl SessionStore {
                             message: error.to_string(),
                         },
                     },
-                    None => CommandResponse::Error {
-                        message: format!("unknown session {session}"),
-                    },
+                    None => unreachable!("session existence checked before allocation"),
+                    }
                 }
             }
             CommandRequest::SelectPane { target, direction } => self.select_pane(target, direction),
@@ -627,6 +633,20 @@ impl SessionStore {
         WindowId(self.next_window_id)
     }
 
+    fn next_session_name(&self) -> String {
+        let prefix = &self.config.defaults.session.name_prefix;
+        let mut suffix = 1_u64;
+        loop {
+            let candidate = format!("{prefix}-{suffix}");
+            if !self.sessions.contains_key(&candidate)
+                && !self.persisted_sessions.contains_key(&candidate)
+            {
+                return candidate;
+            }
+            suffix = suffix.saturating_add(1);
+        }
+    }
+
     fn prune_dead_sessions(&mut self) {
         let dead_sessions: Vec<_> = self
             .sessions
@@ -729,24 +749,31 @@ impl SessionStore {
         let command = self.effective_command(command);
         match self.sessions.get_mut(&target.session) {
             Some(session) => {
-                if let Some(window) = target.window {
-                    session.active_window = window;
-                }
-                if let Some(pane) = target.pane {
-                    let _ = session.select_pane(target.window, pane);
-                }
-                match session.split_active_pane(axis, &command) {
-                    Ok(split) => CommandResponse::PaneSplit {
-                        session: session.name.clone(),
-                        window_id: session
-                            .numbering
-                            .public_window_id(split.window_id, &session.window_order)
-                            .unwrap_or(split.window_id.0),
-                        pane_id: session
-                            .numbering
-                            .public_pane_number(split.pane_id)
-                            .unwrap_or(split.pane_id.0),
-                    },
+                let window_id = target.window.unwrap_or(session.active_window);
+                match session.split_pane_in_window(
+                    window_id,
+                    target.pane,
+                    axis,
+                    500,
+                    None,
+                    &command,
+                ) {
+                    Ok(split) => {
+                        // A successful split becomes the active pane in its
+                        // target window; only now make that window visible.
+                        session.active_window = split.window_id;
+                        CommandResponse::PaneSplit {
+                            session: session.name.clone(),
+                            window_id: session
+                                .numbering
+                                .public_window_id(split.window_id, &session.window_order)
+                                .unwrap_or(split.window_id.0),
+                            pane_id: session
+                                .numbering
+                                .public_pane_number(split.pane_id)
+                                .unwrap_or(split.pane_id.0),
+                        }
+                    }
                     Err(error) => CommandResponse::Error {
                         message: error.to_string(),
                     },
@@ -764,7 +791,21 @@ impl SessionStore {
         direction: Option<NavigationDirection>,
     ) -> CommandResponse {
         match (target, direction) {
-            (Some(target), _) => match self.parse_target(&target) {
+            (Some(target), Some(direction)) => match self.parse_target(&target) {
+                Ok(target) => match self.sessions.get_mut(&target.session) {
+                    Some(session) => match session.move_focus(direction, session.pane_area()) {
+                        Ok(()) => CommandResponse::FocusChanged,
+                        Err(error) => CommandResponse::Error {
+                            message: error.to_string(),
+                        },
+                    },
+                    None => CommandResponse::Error {
+                        message: format!("unknown session {}", target.session),
+                    },
+                },
+                Err(message) => CommandResponse::Error { message },
+            },
+            (Some(target), None) => match self.parse_target(&target) {
                 Ok(target) => match self.sessions.get_mut(&target.session) {
                     Some(session) => match target.pane {
                         Some(pane_id) => match session.select_pane(target.window, pane_id) {
@@ -784,21 +825,9 @@ impl SessionStore {
                 Err(message) => CommandResponse::Error { message },
             },
             (None, Some(direction)) => {
-                let Some(session_name) = self.last_session.clone() else {
-                    return CommandResponse::Error {
-                        message: "no sessions available".into(),
-                    };
-                };
-                match self.sessions.get_mut(&session_name) {
-                    Some(session) => match session.move_focus(direction, session.pane_area()) {
-                        Ok(_) => CommandResponse::FocusChanged,
-                        Err(error) => CommandResponse::Error {
-                            message: error.to_string(),
-                        },
-                    },
-                    None => CommandResponse::Error {
-                        message: format!("unknown session {session_name}"),
-                    },
+                let _ = direction;
+                CommandResponse::Error {
+                    message: "directional select-pane requires a session target".into(),
                 }
             }
             _ => CommandResponse::Error {
@@ -1320,6 +1349,99 @@ mod tests {
                 }]
             }
         );
+    }
+
+    #[test]
+    fn duplicate_session_creation_preserves_the_existing_session() {
+        let mut store = SessionStore::default();
+        let request = |command| CommandRequest::NewSession {
+            name: Some("work".into()),
+            cwd: None,
+            command,
+            switch_from: None,
+        };
+
+        assert!(matches!(
+            store.handle(request(vec!["sh".into()])),
+            CommandResponse::SessionCreated { .. }
+        ));
+        assert!(matches!(
+            store.handle(request(vec!["definitely-not-a-command".into()])),
+            CommandResponse::Error { ref message } if message == "session work already exists"
+        ));
+        assert!(store.sessions.contains_key("work"));
+    }
+
+    #[test]
+    fn automatic_session_names_skip_existing_names() {
+        let mut store = SessionStore::default();
+        for name in ["session-2", "session-1"] {
+            assert!(matches!(
+                store.handle(CommandRequest::NewSession {
+                    name: Some(name.into()),
+                    cwd: None,
+                    command: vec!["sh".into()],
+                    switch_from: None,
+                }),
+                CommandResponse::SessionCreated { .. }
+            ));
+        }
+        assert!(matches!(
+            store.handle(CommandRequest::NewSession {
+                name: None,
+                cwd: None,
+                command: vec!["sh".into()],
+                switch_from: None,
+            }),
+            CommandResponse::SessionCreated { ref session, .. } if session == "session-3"
+        ));
+    }
+
+    #[test]
+    fn failed_window_creation_does_not_consume_a_window_id() {
+        let mut store = SessionStore::default();
+        assert_eq!(store.next_window_id, 0);
+
+        assert!(matches!(
+            store.handle(CommandRequest::NewWindow {
+                session: "missing".into(),
+                name: None,
+                command: vec!["sh".into()],
+            }),
+            CommandResponse::Error { .. }
+        ));
+
+        assert_eq!(store.next_window_id, 0);
+    }
+
+    #[test]
+    fn invalid_split_target_does_not_change_focus_or_create_a_pane() {
+        let mut store = SessionStore::default();
+        assert!(matches!(
+            store.handle(CommandRequest::NewSession {
+                name: Some("work".into()),
+                cwd: None,
+                command: vec!["sh".into()],
+                switch_from: None,
+            }),
+            CommandResponse::SessionCreated { .. }
+        ));
+        let before = store.sessions.get("work").expect("session");
+        let active_window = before.active_window;
+        let pane_count = before.windows[&active_window].panes.len();
+
+        assert!(matches!(
+            store.handle(CommandRequest::SplitPane {
+                target: "work:1.99".into(),
+                axis: SplitAxis::Vertical,
+                command: vec!["sh".into()],
+            }),
+            CommandResponse::Error { .. }
+        ));
+
+        let after = store.sessions.get("work").expect("session");
+        assert_eq!(after.active_window, active_window);
+        assert_eq!(after.windows[&active_window].panes.len(), pane_count);
     }
 
     #[test]

@@ -578,7 +578,11 @@ impl Session {
             .get_mut(&window_id)
             .ok_or_else(|| anyhow!("unknown window"))?;
         let target_pane = target_pane.unwrap_or(window.layout.active);
-        let pane_id = window.allocate_pane_id();
+        if !window.panes.contains_key(&target_pane) || !window.layout.panes().contains(&target_pane)
+        {
+            return Err(anyhow!("unknown pane"));
+        }
+        let pane_id = PaneId(window.next_pane_id);
         let process = PaneProcess::spawn(
             &default_command,
             cwd.as_deref(),
@@ -595,10 +599,12 @@ impl Session {
             command: default_command.clone(),
             process,
         };
+        window.next_pane_id = window
+            .next_pane_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("pane id space exhausted"))?;
         window.panes.insert(pane_id, pane);
-        if !window.layout.split_pane(target_pane, axis, ratio, pane_id) {
-            return Err(anyhow!("unknown pane"));
-        }
+        debug_assert!(window.layout.split_pane(target_pane, axis, ratio, pane_id));
         self.sync_pane_sizes()?;
         Ok(SplitResult { window_id, pane_id })
     }
@@ -673,11 +679,14 @@ impl Session {
     }
 
     pub fn select_pane(&mut self, window_id: Option<WindowId>, pane_id: PaneId) -> Result<()> {
+        let window_id = window_id.unwrap_or(self.active_window);
         let window = self
-            .window_mut(window_id)
+            .windows
+            .get_mut(&window_id)
             .ok_or_else(|| anyhow!("unknown window"))?;
         if window.panes.contains_key(&pane_id) {
             window.layout.active = pane_id;
+            self.remember_window_switch(window_id);
             Ok(())
         } else {
             Err(anyhow!("unknown pane"))
@@ -688,9 +697,10 @@ impl Session {
         let window = self
             .active_window_mut()
             .ok_or_else(|| anyhow!("unknown window"))?;
-        let _ = window
+        window
             .layout
-            .select_direction(convert_direction(direction), area);
+            .select_direction(convert_direction(direction), area)
+            .ok_or_else(|| anyhow!("no pane in that direction"))?;
         Ok(())
     }
 
@@ -701,15 +711,30 @@ impl Session {
         direction: NavigationDirection,
         amount: u16,
     ) -> Result<()> {
+        let window_id = window_id.unwrap_or(self.active_window);
         let window = self
-            .window_mut(window_id)
+            .windows
+            .get_mut(&window_id)
             .ok_or_else(|| anyhow!("unknown window"))?;
         if let Some(pane_id) = pane_id {
+            if !window.panes.contains_key(&pane_id) {
+                return Err(anyhow!("unknown pane"));
+            }
+            let previous_active = window.layout.active;
             window.layout.active = pane_id;
-        }
-        let _ = window
+            if !window
+                .layout
+                .resize_active(convert_direction(direction), amount)
+            {
+                window.layout.active = previous_active;
+                return Err(anyhow!("no resizable split in that direction"));
+            }
+        } else if !window
             .layout
-            .resize_active(convert_direction(direction), amount);
+            .resize_active(convert_direction(direction), amount)
+        {
+            return Err(anyhow!("no resizable split in that direction"));
+        }
         self.sync_pane_sizes()
     }
 
@@ -757,7 +782,9 @@ impl Session {
         if window.panes.is_empty() {
             self.windows.remove(&window_id);
             self.window_order.retain(|id| *id != window_id);
-            if let Some(next_window) = self.window_order.last().copied() {
+            if self.active_window == window_id
+                && let Some(next_window) = self.window_order.last().copied()
+            {
                 self.remember_window_after_removal(window_id, next_window);
             }
             return Ok(None);
@@ -776,7 +803,9 @@ impl Session {
             pane.process.kill()?;
         }
         self.window_order.retain(|id| *id != window_id);
-        if let Some(next_window) = self.window_order.last().copied() {
+        if self.active_window == window_id
+            && let Some(next_window) = self.window_order.last().copied()
+        {
             self.remember_window_after_removal(window_id, next_window);
         }
         if !self.window_order.is_empty() {
@@ -922,12 +951,6 @@ impl WindowRuntime {
             next_pane_id: 1,
             panes,
         })
-    }
-
-    fn allocate_pane_id(&mut self) -> PaneId {
-        let pane_id = PaneId(self.next_pane_id);
-        self.next_pane_id += 1;
-        pane_id
     }
 
     fn active_pane(&self) -> Option<&PaneRuntime> {
@@ -1133,6 +1156,79 @@ mod tests {
         let remaining = session.list_panes(Some(WindowId(1)));
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].id, 1);
+    }
+
+    #[test]
+    fn selecting_a_pane_in_another_window_activates_that_window() {
+        let helper_dir = tempdir();
+        let mut session = Session::new(
+            "work".into(),
+            None,
+            None,
+            vec!["sh".into()],
+            WindowId(1),
+            None,
+            10_000,
+            Numbering {
+                window_base: 0,
+                pane_base: 0,
+            },
+            WindowDefaults::default(),
+            helper_dir.path().to_path_buf(),
+        )
+        .expect("create session");
+        session
+            .new_window(WindowId(2), Some("logs".into()), &["sh".into()])
+            .expect("create second window");
+        session.select_window(WindowId(1)).expect("select first window");
+
+        session
+            .select_pane(Some(WindowId(2)), PaneId(0))
+            .expect("select pane in second window");
+
+        assert_eq!(session.active_window, WindowId(2));
+    }
+
+    #[test]
+    fn focus_and_resize_reject_noop_or_invalid_targets() {
+        let helper_dir = tempdir();
+        let mut session = Session::new(
+            "work".into(),
+            None,
+            None,
+            vec!["sh".into()],
+            WindowId(1),
+            None,
+            10_000,
+            Numbering {
+                window_base: 0,
+                pane_base: 0,
+            },
+            WindowDefaults::default(),
+            helper_dir.path().to_path_buf(),
+        )
+        .expect("create session");
+
+        assert!(session
+            .move_focus(NavigationDirection::Left, session.pane_area())
+            .is_err());
+        assert!(session
+            .resize_active_pane(
+                None,
+                Some(PaneId(99)),
+                NavigationDirection::Left,
+                10,
+            )
+            .is_err());
+        assert_eq!(
+            session
+                .windows
+                .get(&WindowId(1))
+                .expect("window")
+                .layout
+                .active,
+            PaneId(0)
+        );
     }
 
     #[test]
