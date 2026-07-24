@@ -642,8 +642,17 @@ impl SessionStore {
                 },
             },
         };
-        self.persist_metadata();
-        response
+        match self.persist_metadata() {
+            Ok(()) => response,
+            Err(error) => match response {
+                CommandResponse::Error { message } => CommandResponse::Error {
+                    message: format!("{message}; additionally failed to persist state: {error}"),
+                },
+                _ => CommandResponse::Error {
+                    message: format!("command completed in memory but failed to persist state: {error}"),
+                },
+            },
+        }
     }
 
     fn next_window(&mut self) -> WindowId {
@@ -740,13 +749,13 @@ impl SessionStore {
             .collect()
     }
 
-    fn persist_metadata(&mut self) {
+    fn persist_metadata(&mut self) -> Result<()> {
         for (name, session) in &self.sessions {
             self.persisted_sessions
                 .insert(name.clone(), PersistedSession::from_live(session));
         }
         let Some(path) = self.state_path.as_ref() else {
-            return;
+            return Ok(());
         };
         let state = PersistedState {
             schema_version: crate::persistence::STATE_SCHEMA_VERSION,
@@ -756,7 +765,7 @@ impl SessionStore {
             workspaces: self.workspace_mappings.clone(),
             sessions: self.persisted_sessions.clone(),
         };
-        let _ = save_state(path, &state);
+        save_state(path, &state)
     }
 
     fn split_pane(
@@ -1638,6 +1647,31 @@ mod tests {
             }
         );
         assert!(!store.sessions.contains_key("work"));
+    }
+
+    #[test]
+    fn persistence_failures_are_reported_to_the_caller() {
+        let dir = tempdir();
+        let blocked_parent = dir.path().join("not-a-directory");
+        fs::write(&blocked_parent, "file").expect("create blocked parent");
+        let mut store = SessionStore::default();
+        store.state_path = Some(blocked_parent.join("state.json"));
+
+        let response = store.handle(CommandRequest::SetBuffer {
+            buffer: None,
+            data: "hello".into(),
+            append: false,
+        });
+
+        assert!(matches!(
+            response,
+            CommandResponse::Error { message }
+                if message.contains("completed in memory but failed to persist state")
+        ));
+        assert_eq!(
+            store.buffers.get(None).map(|buffer| buffer.data.clone()),
+            Some("hello".into())
+        );
     }
 
     #[test]
