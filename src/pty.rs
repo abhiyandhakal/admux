@@ -663,12 +663,22 @@ fn handle_helper_request(state: &Arc<HelperState>, request: PaneRequest) -> Pane
             }
         }
         PaneRequest::Shutdown => {
-            match state
+            let mut child = state
                 .child
                 .lock()
-                .expect("pane helper child lock poisoned")
-                .kill()
-            {
+                .expect("pane helper child lock poisoned");
+            let shutdown = match child.try_wait() {
+                Ok(Some(_)) => Ok(()),
+                Ok(None) => match child.kill() {
+                    Ok(()) => Ok(()),
+                    Err(kill_error) => match child.try_wait() {
+                        Ok(Some(_)) => Ok(()),
+                        _ => Err(kill_error),
+                    },
+                },
+                Err(error) => Err(error),
+            };
+            match shutdown {
                 Ok(()) => PaneResponse::Ok,
                 Err(error) => PaneResponse::Error {
                     message: format!("failed to kill pane child: {error}"),
