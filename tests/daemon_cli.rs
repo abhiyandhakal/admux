@@ -371,7 +371,7 @@ fn workspace_save_and_up_restore_snapshot_sidecar() {
             "send-keys",
             "snapshot-work",
             "printf snapshot-visible",
-            "\n",
+            "Enter",
         ])
         .assert()
         .success();

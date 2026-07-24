@@ -854,11 +854,67 @@ fn helper_send_keys(state: &Arc<HelperState>, keys: &[String]) -> Result<()> {
         .expect("pane helper writer lock poisoned");
     for key in keys {
         writer
-            .write_all(key.as_bytes())
+            .write_all(&encode_send_key(key))
             .context("failed to write key bytes")?;
     }
     writer.flush().context("failed to flush PTY writer")?;
     Ok(())
+}
+
+/// Decode the small, tmux-compatible key vocabulary accepted by `send-keys`.
+/// Unrecognised values are deliberately written verbatim so quoted command text
+/// such as `send-keys "echo hello" Enter` keeps working.
+fn encode_send_key(key: &str) -> Vec<u8> {
+    if let Some(key) = key.strip_prefix("C-").or_else(|| key.strip_prefix("Ctrl-")) {
+        if key.len() == 1 {
+            let byte = key.as_bytes()[0];
+            return match byte {
+                b'a'..=b'z' | b'A'..=b'Z' => vec![byte.to_ascii_lowercase() - b'a' + 1],
+                b'@' | b' ' => vec![0],
+                b'['..=b'_' => vec![byte - b'@'],
+                b'?' => vec![0x7f],
+                _ => key.as_bytes().to_vec(),
+            };
+        }
+    }
+
+    if let Some(key) = key.strip_prefix("M-").or_else(|| key.strip_prefix("Alt-")) {
+        let mut sequence = vec![0x1b];
+        sequence.extend_from_slice(&encode_send_key(key));
+        return sequence;
+    }
+
+    match key {
+        "Enter" | "Return" => b"\r".to_vec(),
+        "Tab" => b"\t".to_vec(),
+        "BTab" => b"\x1b[Z".to_vec(),
+        "Escape" | "Esc" => b"\x1b".to_vec(),
+        "Space" => b" ".to_vec(),
+        "Backspace" | "BSpace" => vec![0x7f],
+        "Left" => b"\x1b[D".to_vec(),
+        "Right" => b"\x1b[C".to_vec(),
+        "Up" => b"\x1b[A".to_vec(),
+        "Down" => b"\x1b[B".to_vec(),
+        "Home" => b"\x1b[H".to_vec(),
+        "End" => b"\x1b[F".to_vec(),
+        "Insert" => b"\x1b[2~".to_vec(),
+        "Delete" | "DC" => b"\x1b[3~".to_vec(),
+        "PageUp" | "PPage" => b"\x1b[5~".to_vec(),
+        "PageDown" | "NPage" => b"\x1b[6~".to_vec(),
+        "F1" => b"\x1bOP".to_vec(),
+        "F2" => b"\x1bOQ".to_vec(),
+        "F3" => b"\x1bOR".to_vec(),
+        "F4" => b"\x1bOS".to_vec(),
+        "F5" => b"\x1b[15~".to_vec(),
+        "F6" => b"\x1b[17~".to_vec(),
+        "F7" => b"\x1b[18~".to_vec(),
+        "F8" => b"\x1b[19~".to_vec(),
+        "F9" => b"\x1b[20~".to_vec(),
+        "F10" => b"\x1b[21~".to_vec(),
+        "F11" => b"\x1b[23~".to_vec(),
+        "F12" => b"\x1b[24~".to_vec(),
+        _ => key.as_bytes().to_vec(),
+    }
 }
 
 fn helper_persistent_snapshot(
@@ -1067,6 +1123,21 @@ mod tests {
 
     fn helper_dir() -> TempDir {
         make_tempdir().expect("tempdir")
+    }
+
+    #[test]
+    fn send_keys_decodes_control_and_named_key_tokens() {
+        assert_eq!(encode_send_key("C-l"), vec![0x0c]);
+        assert_eq!(encode_send_key("Ctrl-c"), vec![0x03]);
+        assert_eq!(encode_send_key("M-x"), b"\x1bx".to_vec());
+        assert_eq!(encode_send_key("Enter"), b"\r".to_vec());
+        assert_eq!(encode_send_key("PageDown"), b"\x1b[6~".to_vec());
+        assert_eq!(encode_send_key("F5"), b"\x1b[15~".to_vec());
+    }
+
+    #[test]
+    fn send_keys_preserves_literal_text() {
+        assert_eq!(encode_send_key("echo hello"), b"echo hello".to_vec());
     }
 
     fn wait_for_preview(pane: &PaneProcess, needle: &str) -> String {
