@@ -212,6 +212,14 @@ impl From<RawSplitDirection> for SplitAxis {
 }
 
 pub fn load_workspace(path: &Path, numbering: Numbering) -> Result<WorkspaceLoad> {
+    load_workspace_with_snapshot(path, numbering, true)
+}
+
+pub fn load_workspace_with_snapshot(
+    path: &Path,
+    numbering: Numbering,
+    load_snapshot: bool,
+) -> Result<WorkspaceLoad> {
     let manifest_path = path
         .canonicalize()
         .with_context(|| format!("failed to resolve workspace file {}", path.display()))?;
@@ -231,7 +239,9 @@ pub fn load_workspace(path: &Path, numbering: Numbering) -> Result<WorkspaceLoad
         .with_context(|| format!("failed to parse workspace file {}", manifest_path.display()))?;
     let mut workspace = resolve_workspace(manifest_path.clone(), manifest_dir, manifest, numbering)?;
     workspace.manifest_digest = manifest_digest.clone();
-    workspace.snapshot = load_snapshot_sidecar(&manifest_path, &manifest_digest)?;
+    if load_snapshot {
+        workspace.snapshot = load_snapshot_sidecar(&manifest_path, &manifest_digest)?;
+    }
     Ok(workspace)
 }
 

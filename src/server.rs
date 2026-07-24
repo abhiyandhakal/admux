@@ -25,7 +25,7 @@ use crate::{
     pane::{PaneId, WindowId},
     persistence::{PersistedSession, PersistedState, load_state, save_state},
     session::Session,
-    workspace::{WorkspaceLoad, load_workspace, save_workspace},
+    workspace::{WorkspaceLoad, save_workspace},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,7 +172,11 @@ impl SessionStore {
                 manifest_path,
                 rebuild,
                 switch_from,
-            } => match load_workspace(&manifest_path, self.numbering()) {
+            } => match crate::workspace::load_workspace_with_snapshot(
+                &manifest_path,
+                self.numbering(),
+                !rebuild,
+            ) {
                 Ok(workspace) => self.up_workspace(workspace, rebuild, switch_from),
                 Err(error) => CommandResponse::Error {
                     message: error.to_string(),
