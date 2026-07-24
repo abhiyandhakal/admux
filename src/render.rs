@@ -576,7 +576,8 @@ fn render_bottom_bar<W: Write>(
                 SetAttribute(Attribute::Reset)
             )?;
             return Ok(Some(
-                (1 + cursor).min(size.width.saturating_sub(1) as usize) as u16,
+                (1 + buffer[..cursor.min(buffer.len())].chars().count())
+                    .min(size.width.saturating_sub(1) as usize) as u16,
             ));
         }
     };

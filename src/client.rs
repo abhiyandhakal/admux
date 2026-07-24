@@ -1550,18 +1550,28 @@ fn handle_prompt_key(
             }
         }
         KeyCode::Backspace => {
-            if prompt.cursor > 0 {
-                prompt.buffer.remove(prompt.cursor - 1);
-                prompt.cursor -= 1;
+            if let Some(previous) = previous_char_boundary(&prompt.buffer, prompt.cursor) {
+                prompt.buffer.drain(previous..prompt.cursor);
+                prompt.cursor = previous;
             }
         }
         KeyCode::Delete => {
             if prompt.cursor < prompt.buffer.len() {
-                prompt.buffer.remove(prompt.cursor);
+                let next = next_char_boundary(&prompt.buffer, prompt.cursor)
+                    .expect("cursor before string end must have a following character");
+                prompt.buffer.drain(prompt.cursor..next);
             }
         }
-        KeyCode::Left => prompt.cursor = prompt.cursor.saturating_sub(1),
-        KeyCode::Right => prompt.cursor = (prompt.cursor + 1).min(prompt.buffer.len()),
+        KeyCode::Left => {
+            if let Some(previous) = previous_char_boundary(&prompt.buffer, prompt.cursor) {
+                prompt.cursor = previous;
+            }
+        }
+        KeyCode::Right => {
+            if let Some(next) = next_char_boundary(&prompt.buffer, prompt.cursor) {
+                prompt.cursor = next;
+            }
+        }
         KeyCode::Home => prompt.cursor = 0,
         KeyCode::End => prompt.cursor = prompt.buffer.len(),
         KeyCode::Up => {
@@ -1586,7 +1596,7 @@ fn handle_prompt_key(
         }
         KeyCode::Char(ch) if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
             prompt.buffer.insert(prompt.cursor, ch);
-            prompt.cursor += 1;
+            prompt.cursor += ch.len_utf8();
         }
         _ => {}
     }
@@ -1595,6 +1605,15 @@ fn handle_prompt_key(
     prompt.completions = command_completions(prefix);
     prompt.selected = 0;
     Ok(PromptResult::KeepOpen)
+}
+
+fn previous_char_boundary(text: &str, cursor: usize) -> Option<usize> {
+    text.get(..cursor)?.char_indices().next_back().map(|(index, _)| index)
+}
+
+fn next_char_boundary(text: &str, cursor: usize) -> Option<usize> {
+    let suffix = text.get(cursor..)?;
+    suffix.chars().next().map(|ch| cursor + ch.len_utf8())
 }
 
 fn execute_prompt_command(
@@ -3153,6 +3172,17 @@ root = { command = ["sh"] }
 
         assert_eq!(current_session, "logs");
         assert_eq!(last_size, (0, 0));
+    }
+
+    #[test]
+    fn prompt_cursor_moves_on_utf8_character_boundaries() {
+        let text = "aé🙂";
+        assert_eq!(previous_char_boundary(text, text.len()), Some(3));
+        assert_eq!(previous_char_boundary(text, 3), Some(1));
+        assert_eq!(previous_char_boundary(text, 1), Some(0));
+        assert_eq!(next_char_boundary(text, 0), Some(1));
+        assert_eq!(next_char_boundary(text, 1), Some(3));
+        assert_eq!(next_char_boundary(text, 3), Some(text.len()));
     }
 
     #[test]
