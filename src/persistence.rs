@@ -6,11 +6,12 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     buffer::PasteBuffer,
+    layout::LayoutNode,
     pane::{PaneId, WindowId},
     session::{PaneRuntime, Session, WindowRuntime},
 };
@@ -72,6 +73,68 @@ pub struct PersistedPane {
 }
 
 impl PersistedSession {
+    pub fn normalized(&self) -> Result<Self> {
+        if self.rows == 0 || self.cols == 0 {
+            bail!("persisted session {} has a zero-sized viewport", self.name);
+        }
+        if self.window_order.is_empty() {
+            bail!("persisted session {} has no windows", self.name);
+        }
+
+        let ordered: std::collections::BTreeSet<_> = self.window_order.iter().copied().collect();
+        if ordered.len() != self.window_order.len() || ordered.len() != self.windows.len() {
+            bail!("persisted session {} has an invalid window order", self.name);
+        }
+        if ordered.iter().any(|id| !self.windows.contains_key(id)) {
+            bail!("persisted session {} references an unknown window", self.name);
+        }
+        if !ordered.contains(&self.active_window) {
+            bail!("persisted session {} has an unknown active window", self.name);
+        }
+        if self
+            .last_window
+            .is_some_and(|window_id| !ordered.contains(&window_id))
+        {
+            bail!("persisted session {} has an unknown last window", self.name);
+        }
+
+        let mut normalized = self.clone();
+        for (window_id, window) in &mut normalized.windows {
+            if *window_id != window.id {
+                bail!("persisted session {} has a mismatched window id", self.name);
+            }
+            let mut layout_panes = Vec::new();
+            collect_valid_layout_panes(&window.layout.root, &mut layout_panes)?;
+            let layout_set: std::collections::BTreeSet<_> = layout_panes.iter().copied().collect();
+            if layout_set.len() != layout_panes.len() || layout_set.len() != window.panes.len() {
+                bail!("persisted window {} has inconsistent pane references", window_id.0);
+            }
+            if layout_set.iter().any(|pane_id| !window.panes.contains_key(pane_id)) {
+                bail!("persisted window {} references an unknown pane", window_id.0);
+            }
+            if !layout_set.contains(&window.layout.active) {
+                bail!("persisted window {} has an unknown active pane", window_id.0);
+            }
+            if window
+                .panes
+                .iter()
+                .any(|(pane_id, pane)| *pane_id != pane.id)
+            {
+                bail!("persisted window {} has a mismatched pane id", window_id.0);
+            }
+            let max_pane = layout_set
+                .iter()
+                .map(|pane_id| pane_id.0)
+                .max()
+                .ok_or_else(|| anyhow!("persisted window {} has no panes", window_id.0))?;
+            let minimum_next = max_pane
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("persisted window {} exhausted pane ids", window_id.0))?;
+            window.next_pane_id = window.next_pane_id.max(minimum_next);
+        }
+        Ok(normalized)
+    }
+
     pub fn from_live(session: &Session) -> Self {
         Self {
             name: session.name.clone(),
@@ -90,6 +153,25 @@ impl PersistedSession {
                 .collect(),
         }
     }
+}
+
+fn collect_valid_layout_panes(node: &LayoutNode, panes: &mut Vec<PaneId>) -> Result<()> {
+    match node {
+        LayoutNode::Pane(pane_id) => panes.push(*pane_id),
+        LayoutNode::Split {
+            ratio,
+            first,
+            second,
+            ..
+        } => {
+            if !(100..=900).contains(ratio) {
+                bail!("persisted layout contains invalid split ratio {ratio}");
+            }
+            collect_valid_layout_panes(first, panes)?;
+            collect_valid_layout_panes(second, panes)?;
+        }
+    }
+    Ok(())
 }
 
 impl PersistedWindow {
@@ -190,7 +272,42 @@ pub fn save_state(path: &Path, state: &PersistedState) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::LayoutTree;
     use tempfile::tempdir;
+
+    fn persisted_session() -> PersistedSession {
+        PersistedSession {
+            name: "work".into(),
+            workspace_manifest: None,
+            cwd: None,
+            command: vec!["sh".into()],
+            rows: 24,
+            cols: 80,
+            window_order: vec![WindowId(1)],
+            active_window: WindowId(1),
+            last_window: None,
+            windows: BTreeMap::from([(
+                WindowId(1),
+                PersistedWindow {
+                    id: WindowId(1),
+                    name: "shell".into(),
+                    cwd: None,
+                    layout: LayoutTree::new(PaneId(0)),
+                    next_pane_id: 0,
+                    panes: BTreeMap::from([(
+                        PaneId(0),
+                        PersistedPane {
+                            id: PaneId(0),
+                            title: "shell".into(),
+                            cwd: None,
+                            command: vec!["sh".into()],
+                            socket_path: None,
+                        },
+                    )]),
+                },
+            )]),
+        }
+    }
 
     #[test]
     fn roundtrips_state_file() {
@@ -263,5 +380,22 @@ mod tests {
 
         assert!(load_state(&path).is_err());
         assert!(path.exists());
+    }
+
+    #[test]
+    fn normalizing_legacy_state_advances_pane_ids() {
+        let normalized = persisted_session().normalized().expect("normalize state");
+        assert_eq!(
+            normalized.windows[&WindowId(1)].next_pane_id,
+            1,
+            "the next split must not overwrite pane zero"
+        );
+    }
+
+    #[test]
+    fn normalization_rejects_inconsistent_window_order() {
+        let mut session = persisted_session();
+        session.window_order.push(WindowId(1));
+        assert!(session.normalized().is_err());
     }
 }

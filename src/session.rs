@@ -160,6 +160,7 @@ impl Session {
         window_defaults: WindowDefaults,
         helper_dir: PathBuf,
     ) -> Result<Self> {
+        let persisted = persisted.normalized()?;
         let mut windows = BTreeMap::new();
         for window_id in &persisted.window_order {
             let persisted_window = persisted
