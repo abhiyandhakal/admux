@@ -82,6 +82,15 @@ impl SessionStore {
         helper_dir: PathBuf,
     ) -> Result<Self> {
         let persisted = load_state(&state_path)?;
+        let next_window_id = persisted.next_window_id.max(
+            persisted
+                .sessions
+                .values()
+                .flat_map(|session| session.windows.keys())
+                .map(|window_id| window_id.0)
+                .max()
+                .unwrap_or(0),
+        );
         let mut store = Self {
             buffers: BufferStore::from_persisted(persisted.buffers),
             workspace_mappings: persisted.workspaces,
@@ -89,7 +98,7 @@ impl SessionStore {
             state_path: Some(state_path),
             helper_dir,
             last_session: persisted.last_session,
-            next_window_id: persisted.next_window_id,
+            next_window_id,
             config_path: Some(config_path),
             ..Self::default()
         };
