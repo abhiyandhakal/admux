@@ -695,6 +695,19 @@ fn print_response(paths: &RuntimePaths, response: CommandResponse) -> Result<()>
     Ok(())
 }
 
+fn handle_interactive_response(
+    response: CommandResponse,
+    status_message: &mut Option<String>,
+) -> bool {
+    match response {
+        CommandResponse::Error { message } => {
+            *status_message = Some(message);
+            false
+        }
+        _ => true,
+    }
+}
+
 fn attach_interactive(paths: &RuntimePaths, session: &str) -> Result<()> {
     let mut config = load_config(paths)?;
     let mut stdout = io::stdout();
@@ -965,7 +978,7 @@ fn run_attach_loop(
                             needs_refresh = true;
                         }
                         InputAction::SplitPane(axis) => {
-                            let _ = request_response(
+                            let response = request_response(
                                 paths,
                                 CommandRequest::SplitPane {
                                     target: current_session.clone(),
@@ -973,7 +986,7 @@ fn run_attach_loop(
                                     command: Vec::new(),
                                 },
                             )?;
-                            needs_refresh = true;
+                            needs_refresh = handle_interactive_response(response, &mut status_message);
                         }
                         InputAction::SelectWindowIndex(index) => {
                             if let Some(window) = snapshot
@@ -998,7 +1011,7 @@ fn run_attach_loop(
                                         "select-window-response: {response:?}"
                                     ))?;
                                 }
-                                needs_refresh = true;
+                                needs_refresh = handle_interactive_response(response, &mut status_message);
                             } else if let Some(logger) = event_logger.as_deref_mut() {
                                 logger.log_line(&format!(
                                     "select-window-miss: requested={index} snapshot_indexes={:?}",
@@ -1029,7 +1042,7 @@ fn run_attach_loop(
                             overlay = OverlayState::Help;
                         }
                         InputAction::NewWindow => {
-                            let _ = request_response(
+                            let response = request_response(
                                 paths,
                                 CommandRequest::NewWindow {
                                     session: current_session.clone(),
@@ -1037,40 +1050,40 @@ fn run_attach_loop(
                                     command: Vec::new(),
                                 },
                             )?;
-                            needs_refresh = true;
+                            needs_refresh = handle_interactive_response(response, &mut status_message);
                         }
                         InputAction::NextWindow => {
-                            let _ = request_response(
+                            let response = request_response(
                                 paths,
                                 CommandRequest::CycleWindow {
                                     session: current_session.clone(),
                                     direction: CycleDirection::Next,
                                 },
                             )?;
-                            needs_refresh = true;
+                            needs_refresh = handle_interactive_response(response, &mut status_message);
                         }
                         InputAction::PrevWindow => {
-                            let _ = request_response(
+                            let response = request_response(
                                 paths,
                                 CommandRequest::CycleWindow {
                                     session: current_session.clone(),
                                     direction: CycleDirection::Prev,
                                 },
                             )?;
-                            needs_refresh = true;
+                            needs_refresh = handle_interactive_response(response, &mut status_message);
                         }
                         InputAction::FocusPane(direction) => {
-                            let _ = request_response(
+                            let response = request_response(
                                 paths,
                                 CommandRequest::SelectPane {
                                     target: Some(current_session.clone()),
                                     direction: Some(direction),
                                 },
                             )?;
-                            needs_refresh = true;
+                            needs_refresh = handle_interactive_response(response, &mut status_message);
                         }
                         InputAction::ResizePane(direction, amount) => {
-                            let _ = request_response(
+                            let response = request_response(
                                 paths,
                                 CommandRequest::ResizePane {
                                     target: current_session.clone(),
@@ -1078,26 +1091,26 @@ fn run_attach_loop(
                                     amount,
                                 },
                             )?;
-                            needs_refresh = true;
+                            needs_refresh = handle_interactive_response(response, &mut status_message);
                         }
                         InputAction::KillPane => {
-                            let _ = request_response(
+                            let response = request_response(
                                 paths,
                                 CommandRequest::KillPane {
                                     target: current_session.clone(),
                                 },
                             )?;
-                            needs_refresh = true;
+                            needs_refresh = handle_interactive_response(response, &mut status_message);
                         }
                         InputAction::PasteTopBuffer => {
-                            let _ = request_response(
+                            let response = request_response(
                                 paths,
                                 CommandRequest::PasteBuffer {
                                     target: current_session.clone(),
                                     buffer: None,
                                 },
                             )?;
-                            needs_refresh = true;
+                            needs_refresh = handle_interactive_response(response, &mut status_message);
                         }
                         InputAction::ListBuffers => {
                             let response = request_response(paths, CommandRequest::ListBuffers)?;
@@ -1115,15 +1128,17 @@ fn run_attach_loop(
                             overlay = OverlayState::ChooseBuffer(build_choose_buffer(paths)?);
                         }
                         InputAction::ReloadConfig => {
-                            let _ = request_response(paths, CommandRequest::ReloadConfig)?;
-                            let reloaded = load_config(paths)?;
-                            state.replace_config(
-                                reloaded.keys.clone(),
-                                reloaded.behavior.resize_step,
-                            );
-                            *config = reloaded;
-                            status_message = Some("config reloaded".into());
-                            needs_refresh = true;
+                            let response = request_response(paths, CommandRequest::ReloadConfig)?;
+                            if handle_interactive_response(response, &mut status_message) {
+                                let reloaded = load_config(paths)?;
+                                state.replace_config(
+                                    reloaded.keys.clone(),
+                                    reloaded.behavior.resize_step,
+                                );
+                                *config = reloaded;
+                                status_message = Some("config reloaded".into());
+                                needs_refresh = true;
+                            }
                         }
                         InputAction::CopyMove(direction) => {
                             let pane_dims = copy_mode.as_ref().and_then(|copy| {
@@ -2824,7 +2839,6 @@ mod tests {
     fn tempdir() -> TempDir {
         make_tempdir().expect("tempdir")
     }
-
     #[test]
     fn writes_and_reads_protocol_messages() {
         let response = CommandResponse::SessionCreated {
@@ -2937,6 +2951,7 @@ root = { command = ["sh"] }
         assert!(rendered.contains("protocol mismatch"));
         assert!(rendered.contains("restart admuxd"));
     }
+
 
     #[test]
     fn normalize_new_args_defaults_to_current_directory() {
@@ -3185,6 +3200,18 @@ root = { command = ["sh"] }
 
         assert_eq!(current_session, "logs");
         assert_eq!(last_size, (0, 0));
+    }
+
+    #[test]
+    fn interactive_command_errors_become_status_messages() {
+        let mut status = None;
+        assert!(!handle_interactive_response(
+            CommandResponse::Error {
+                message: "unknown pane".into(),
+            },
+            &mut status,
+        ));
+        assert_eq!(status.as_deref(), Some("unknown pane"));
     }
 
     #[test]
