@@ -1553,9 +1553,16 @@ fn handle_prompt_key(
         KeyCode::Enter => {
             let command = prompt.buffer.trim().to_string();
             if !command.is_empty() {
-                history.push(command.clone());
-                let result = execute_prompt_command(paths, snapshot, current_session, &command)?;
-                *status_message = result;
+                match execute_prompt_command(paths, snapshot, current_session, &command) {
+                    Ok(result) => {
+                        history.push(command);
+                        *status_message = result;
+                    }
+                    Err(error) => {
+                        *status_message = Some(error.to_string());
+                        return Ok(PromptResult::KeepOpen);
+                    }
+                }
             }
             return Ok(PromptResult::CloseAndClearSelection);
         }
@@ -2952,7 +2959,6 @@ root = { command = ["sh"] }
         assert!(rendered.contains("restart admuxd"));
     }
 
-
     #[test]
     fn normalize_new_args_defaults_to_current_directory() {
         let args = crate::cli::NewArgs {
@@ -3212,6 +3218,50 @@ root = { command = ["sh"] }
             &mut status,
         ));
         assert_eq!(status.as_deref(), Some("unknown pane"));
+    }
+
+    #[test]
+    fn prompt_parse_errors_stay_open_and_become_status_messages() {
+        let dir = tempdir();
+        let paths = RuntimePaths {
+            socket_path: dir.path().join("socket"),
+            config_path: dir.path().join("config.toml"),
+            state_path: dir.path().join("state.json"),
+            aliases_path: dir.path().join("aliases.json"),
+        };
+        let snapshot = RenderSnapshot {
+            sessions: Vec::new(),
+            windows: Vec::new(),
+            panes: Vec::new(),
+            dividers: Vec::new(),
+            active_window_id: 0,
+            active_pane_id: 0,
+        };
+        let mut prompt = PromptState {
+            buffer: "send-keys \"unterminated".into(),
+            cursor: 24,
+            completions: Vec::new(),
+            selected: 0,
+            history_index: None,
+        };
+        let mut session = "work".into();
+        let mut history = Vec::new();
+        let mut status = None;
+
+        let result = handle_prompt_key(
+            &paths,
+            &snapshot,
+            &mut session,
+            &mut prompt,
+            &mut history,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut status,
+        )
+        .expect("handle prompt key");
+
+        assert_eq!(result, PromptResult::KeepOpen);
+        assert!(status.is_some_and(|message| message.contains("unterminated")));
+        assert!(history.is_empty());
     }
 
     #[test]
