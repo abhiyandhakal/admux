@@ -769,16 +769,21 @@ impl Session {
         pane_id: Option<PaneId>,
     ) -> Result<Option<KillResult>> {
         let window_id = window_id.unwrap_or(self.active_window);
-        let window = match self.windows.get_mut(&window_id) {
+        let window = match self.windows.get(&window_id) {
             Some(window) => window,
             None => return Err(anyhow!("unknown window")),
         };
         let pane_id = pane_id.unwrap_or(window.layout.active);
         let pane = window
             .panes
-            .remove(&pane_id)
+            .get(&pane_id)
             .ok_or_else(|| anyhow!("unknown pane"))?;
         pane.process.kill()?;
+        let window = self
+            .windows
+            .get_mut(&window_id)
+            .expect("window was validated before pane shutdown");
+        window.panes.remove(&pane_id);
         if window.panes.is_empty() {
             self.windows.remove(&window_id);
             self.window_order.retain(|id| *id != window_id);
@@ -797,11 +802,39 @@ impl Session {
     pub fn kill_window(&mut self, window_id: WindowId) -> Result<bool> {
         let window = self
             .windows
-            .remove(&window_id)
+            .get(&window_id)
             .ok_or_else(|| anyhow!("unknown window"))?;
-        for pane in window.panes.into_values() {
-            pane.process.kill()?;
+        let mut stopped = Vec::new();
+        let mut failures = Vec::new();
+        for (pane_id, pane) in &window.panes {
+            match pane.process.kill() {
+                Ok(()) => stopped.push(*pane_id),
+                Err(error) => failures.push(format!("pane {}: {error}", pane_id.0)),
+            }
         }
+
+        if !failures.is_empty() {
+            let window = self
+                .windows
+                .get_mut(&window_id)
+                .expect("window was validated before pane shutdown");
+            for pane_id in stopped {
+                window.panes.remove(&pane_id);
+                if !window.panes.is_empty() {
+                    let _ = window.layout.remove_pane(pane_id);
+                }
+            }
+            if let Err(error) = self.sync_pane_sizes() {
+                failures.push(format!("resize after partial shutdown: {error}"));
+            }
+            return Err(anyhow!(
+                "failed to shut down every pane in window {}: {}",
+                window_id.0,
+                failures.join("; ")
+            ));
+        }
+
+        self.windows.remove(&window_id);
         self.window_order.retain(|id| *id != window_id);
         if self.active_window == window_id
             && let Some(next_window) = self.window_order.last().copied()

@@ -492,13 +492,13 @@ pub fn run_helper(args: PaneHelperArgs) -> Result<()> {
                 continue;
             }
         };
-        let shutdown = matches!(request, PaneRequest::Shutdown);
+        let shutdown_requested = matches!(request, PaneRequest::Shutdown);
         let response = handle_helper_request(&state, request);
         if let Err(error) = write_helper_response(&mut stream, &response) {
             eprintln!("admux-pane: failed to write client response: {error:#}");
             continue;
         }
-        if shutdown {
+        if shutdown_requested && matches!(response, PaneResponse::Ok) {
             break;
         }
     }
@@ -663,12 +663,17 @@ fn handle_helper_request(state: &Arc<HelperState>, request: PaneRequest) -> Pane
             }
         }
         PaneRequest::Shutdown => {
-            let _ = state
+            match state
                 .child
                 .lock()
                 .expect("pane helper child lock poisoned")
-                .kill();
-            PaneResponse::Ok
+                .kill()
+            {
+                Ok(()) => PaneResponse::Ok,
+                Err(error) => PaneResponse::Error {
+                    message: format!("failed to kill pane child: {error}"),
+                },
+            }
         }
         PaneRequest::IsAlive => PaneResponse::IsAlive {
             alive: state
