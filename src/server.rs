@@ -75,6 +75,28 @@ struct TargetRef {
     pane: Option<PaneId>,
 }
 
+fn request_changes_persisted_state(request: &CommandRequest) -> bool {
+    matches!(
+        request,
+        CommandRequest::NewSession { .. }
+            | CommandRequest::UpWorkspace { .. }
+            | CommandRequest::SetBuffer { .. }
+            | CommandRequest::DeleteBuffer { .. }
+            | CommandRequest::LoadBuffer { .. }
+            | CommandRequest::KillSession { .. }
+            | CommandRequest::KillWindow { .. }
+            | CommandRequest::KillPane { .. }
+            | CommandRequest::SplitPane { .. }
+            | CommandRequest::NewWindow { .. }
+            | CommandRequest::SelectPane { .. }
+            | CommandRequest::SelectWindow { .. }
+            | CommandRequest::CycleWindow { .. }
+            | CommandRequest::ResizePane { .. }
+            | CommandRequest::RenameWindow { .. }
+            | CommandRequest::Resize { .. }
+    )
+}
+
 impl SessionStore {
     pub fn with_paths(
         state_path: std::path::PathBuf,
@@ -122,7 +144,9 @@ impl SessionStore {
     }
 
     pub fn handle(&mut self, request: CommandRequest) -> CommandResponse {
-        self.prune_dead_sessions();
+        let persist_requested = request_changes_persisted_state(&request);
+        let previous_last_session = self.last_session.clone();
+        let pruned = self.prune_dead_sessions();
 
         let response = match request {
             CommandRequest::Hello { version } => self.handle_hello(version),
@@ -642,6 +666,9 @@ impl SessionStore {
                 },
             },
         };
+        if !(persist_requested || pruned || self.last_session != previous_last_session) {
+            return response;
+        }
         match self.persist_metadata() {
             Ok(()) => response,
             Err(error) => match response {
@@ -674,7 +701,8 @@ impl SessionStore {
         }
     }
 
-    fn prune_dead_sessions(&mut self) {
+    fn prune_dead_sessions(&mut self) -> bool {
+        let mut changed = false;
         let dead_sessions: Vec<_> = self
             .sessions
             .iter_mut()
@@ -683,15 +711,20 @@ impl SessionStore {
         for session in dead_sessions {
             self.sessions.remove(&session);
             self.persisted_sessions.remove(&session);
+            changed = true;
         }
+        let pending_switches = self.pending_switches.len();
         self.pending_switches.retain(|source, target| {
             self.sessions.contains_key(source) && self.sessions.contains_key(target)
         });
+        changed |= self.pending_switches.len() != pending_switches;
         if let Some(last) = self.last_session.as_ref()
             && !self.sessions.contains_key(last)
         {
             self.last_session = self.sessions.keys().next_back().cloned();
+            changed = true;
         }
+        changed
     }
 
     fn handle_hello(&self, version: ProtocolVersion) -> CommandResponse {
@@ -1672,6 +1705,20 @@ mod tests {
             store.buffers.get(None).map(|buffer| buffer.data.clone()),
             Some("hello".into())
         );
+    }
+
+    #[test]
+    fn read_only_requests_do_not_write_state() {
+        let dir = tempdir();
+        let blocked_parent = dir.path().join("not-a-directory");
+        fs::write(&blocked_parent, "file").expect("create blocked parent");
+        let mut store = SessionStore::default();
+        store.state_path = Some(blocked_parent.join("state.json"));
+
+        assert!(matches!(
+            store.handle(CommandRequest::ListSessions),
+            CommandResponse::SessionList { sessions } if sessions.is_empty()
+        ));
     }
 
     #[test]
