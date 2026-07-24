@@ -481,12 +481,14 @@ impl<'de> Deserialize<'de> for KeyConfig {
     {
         let raw = RawKeyConfig::deserialize(deserializer)?;
         let defaults = KeyConfig::default();
+        let mut copy_mode = defaults.copy_mode.clone();
+        copy_mode.extend(raw.copy_mode);
         let mut config = KeyConfig {
             prefix: raw.prefix.unwrap_or_else(|| defaults.prefix.clone()),
             bindings: raw.bindings,
             normal: raw.normal,
             leader: BTreeMap::new(),
-            copy_mode: raw.copy_mode,
+            copy_mode,
         };
 
         if let Some(value) = raw.leader {
@@ -945,6 +947,30 @@ mod tests {
         assert!(resolved.keys.leader.iter().any(|(pattern, action)| {
             *action == Action::NewWindow && *pattern == parse_key_pattern("w").expect("pattern")
         }));
+    }
+
+    #[test]
+    fn partial_copy_mode_configuration_extends_defaults() {
+        let config = Config::from_toml(
+            r#"
+                [keys.copy_mode]
+                exit_copy_mode = "q"
+            "#,
+        )
+        .expect("parse config");
+        let resolved = config.resolve().expect("resolve config");
+
+        assert!(resolved.keys.copy_mode.iter().any(|(pattern, action)| {
+            *action == Action::ExitCopyMode
+                && *pattern == parse_key_pattern("q").expect("exit pattern")
+        }));
+        assert!(
+            resolved
+                .keys
+                .copy_mode
+                .iter()
+                .any(|(_, action)| *action == Action::CopyMoveLeft)
+        );
     }
 
     #[test]
