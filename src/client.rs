@@ -1266,7 +1266,11 @@ fn run_attach_loop(
             }
             Event::Paste(text) => {
                 if matches!(overlay, OverlayState::None) && copy_mode.is_none() {
-                    send_input_bytes(paths, &snapshot, &current_session, text.as_bytes())?;
+                    let mut bytes = Vec::with_capacity(text.len() + 12);
+                    bytes.extend_from_slice(b"\x1b[200~");
+                    bytes.extend_from_slice(text.as_bytes());
+                    bytes.extend_from_slice(b"\x1b[201~");
+                    send_input_bytes(paths, &snapshot, &current_session, &bytes)?;
                     needs_refresh = true;
                 }
             }
