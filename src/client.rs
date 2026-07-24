@@ -880,8 +880,6 @@ fn run_attach_loop(
                 )?;
             }
         }
-        status_message = None;
-
         if !event::poll(ATTACH_FRAME_INTERVAL).context("failed to poll terminal events")? {
             snapshot =
                 fetch_attach_snapshot(paths, &mut current_session, &mut last_size, width, height)?;
