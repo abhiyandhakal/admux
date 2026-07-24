@@ -14,11 +14,15 @@ fn tempdir() -> TempDir {
     make_tempdir().expect("tempdir")
 }
 
-fn spawn_daemon(socket: &Path) -> Child {
+fn spawn_daemon(socket: &Path, state: &Path, config: &Path) -> Child {
     let child = StdCommand::new(env!("CARGO_BIN_EXE_admuxd"))
         .arg("serve")
         .arg("--socket")
         .arg(socket)
+        .arg("--state")
+        .arg(state)
+        .arg("--config")
+        .arg(config)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -34,7 +38,8 @@ fn daemon_backed_cli_can_manage_sessions() {
     let socket = temp.path().join("runtime").join("admux.sock");
     let config = temp.path().join("config.toml");
     std::fs::write(&config, "").expect("write config");
-    let mut daemon = spawn_daemon(&socket);
+    let state = temp.path().join("state.json");
+    let mut daemon = spawn_daemon(&socket, &state, &config);
 
     Command::new(env!("CARGO_BIN_EXE_admux"))
         .env("ADMUX_SOCKET", &socket)
@@ -119,7 +124,8 @@ root = { command = ["sh", "-lc", "printf tests-ready; sleep 2"] }
 "#,
     )
     .expect("write workspace");
-    let mut daemon = spawn_daemon(&socket);
+    let state = temp.path().join("state.json");
+    let mut daemon = spawn_daemon(&socket, &state, &config);
 
     Command::new(env!("CARGO_BIN_EXE_admux"))
         .current_dir(temp.path())
@@ -174,13 +180,19 @@ root = { command = ["sh", "-lc", "printf editor-ready; sleep 2"] }
 "#,
     )
     .expect("write workspace");
-    let mut daemon = spawn_daemon(&socket);
+    let state = temp.path().join("state.json");
+    let mut daemon = spawn_daemon(&socket, &state, &config);
 
     Command::new(env!("CARGO_BIN_EXE_admux"))
         .env("ADMUX_SOCKET", &socket)
         .env("ADMUX_CONFIG", &config)
         .env("ADMUX_ALIASES", &aliases)
-        .args(["alias", "add", "demo", workspace.to_str().expect("utf8 path")])
+        .args([
+            "alias",
+            "add",
+            "demo",
+            workspace.to_str().expect("utf8 path"),
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("added alias demo"));
@@ -247,7 +259,8 @@ fn save_writes_workspace_manifest_into_session_directory() {
     fs::create_dir_all(&session_dir).expect("session dir");
     fs::create_dir_all(&other_dir).expect("other dir");
     fs::write(&config, "").expect("write config");
-    let mut daemon = spawn_daemon(&socket);
+    let state = temp.path().join("state.json");
+    let mut daemon = spawn_daemon(&socket, &state, &config);
 
     Command::new(env!("CARGO_BIN_EXE_admux"))
         .env("ADMUX_SOCKET", &socket)
@@ -332,7 +345,8 @@ fn workspace_save_and_up_restore_snapshot_sidecar() {
     let session_dir = temp.path().join("project");
     fs::create_dir_all(&session_dir).expect("session dir");
     fs::write(&config, "").expect("write config");
-    let mut daemon = spawn_daemon(&socket);
+    let state = temp.path().join("state.json");
+    let mut daemon = spawn_daemon(&socket, &state, &config);
 
     Command::new(env!("CARGO_BIN_EXE_admux"))
         .env("ADMUX_SOCKET", &socket)

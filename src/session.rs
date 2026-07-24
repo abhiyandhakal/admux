@@ -941,6 +941,15 @@ impl WindowRuntime {
             .filter_map(|(pane_id, pane)| (!pane.process.is_alive()).then_some(*pane_id))
             .collect();
         for pane_id in dead {
+            let Some(pane) = self.panes.get(&pane_id) else {
+                continue;
+            };
+            // A dead child does not make its helper exit on its own. Do not
+            // discard the only control handle until helper shutdown succeeds:
+            // transport failures are retried on a later prune pass.
+            if pane.process.kill().is_err() {
+                continue;
+            }
             self.panes.remove(&pane_id);
             if !self.panes.is_empty() {
                 let _ = self.layout.remove_pane(pane_id);
@@ -989,6 +998,7 @@ fn clamp_cursor(content: Rect, row: u16, col: u16) -> Option<PaneCursor> {
 mod tests {
     use super::*;
     use crate::numbering::Numbering;
+    use std::{thread, time::Duration};
     use tempfile::{TempDir, tempdir as make_tempdir};
 
     fn tempdir() -> TempDir {
@@ -1123,5 +1133,111 @@ mod tests {
         let remaining = session.list_panes(Some(WindowId(1)));
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].id, 1);
+    }
+
+    #[test]
+    fn pruning_an_exited_pane_shuts_down_its_helper() {
+        let helper_dir = tempdir();
+        let mut session = Session::new(
+            "work".into(),
+            None,
+            None,
+            vec!["sh".into(), "-lc".into(), "exit 0".into()],
+            WindowId(1),
+            None,
+            10_000,
+            Numbering {
+                window_base: 0,
+                pane_base: 0,
+            },
+            WindowDefaults::default(),
+            helper_dir.path().to_path_buf(),
+        )
+        .expect("create session");
+        let socket = session
+            .windows
+            .get(&WindowId(1))
+            .expect("window")
+            .panes
+            .get(&PaneId(0))
+            .expect("pane")
+            .process
+            .socket_path()
+            .to_path_buf();
+
+        for _ in 0..50 {
+            if !session.is_alive() {
+                session.prune_dead();
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(!session.is_alive());
+        for _ in 0..20 {
+            if !socket.exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !socket.exists(),
+            "helper socket should be removed after pruning"
+        );
+    }
+
+    #[test]
+    fn pruning_keeps_a_dead_pane_when_helper_shutdown_fails() {
+        let helper_dir = tempdir();
+        let mut session = Session::new(
+            "work".into(),
+            None,
+            None,
+            vec!["sh".into(), "-lc".into(), "exit 0".into()],
+            WindowId(1),
+            None,
+            10_000,
+            Numbering {
+                window_base: 0,
+                pane_base: 0,
+            },
+            WindowDefaults::default(),
+            helper_dir.path().to_path_buf(),
+        )
+        .expect("create session");
+        let socket = session
+            .windows
+            .get(&WindowId(1))
+            .expect("window")
+            .panes
+            .get(&PaneId(0))
+            .expect("pane")
+            .process
+            .socket_path()
+            .to_path_buf();
+
+        for _ in 0..50 {
+            if !session.is_alive() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let hidden_socket = socket.with_extension("hidden");
+        std::fs::rename(&socket, &hidden_socket)
+            .expect("hide helper socket to force cleanup failure");
+
+        assert!(session.prune_dead());
+        assert_eq!(
+            session
+                .windows
+                .get(&WindowId(1))
+                .expect("window remains")
+                .panes
+                .len(),
+            1
+        );
+        std::fs::rename(&hidden_socket, &socket).expect("restore helper socket");
+        assert!(!session.prune_dead());
+        assert!(!socket.exists(), "helper should be cleaned up after retry");
     }
 }

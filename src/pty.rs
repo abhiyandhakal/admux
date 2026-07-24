@@ -229,7 +229,7 @@ impl PaneProcess {
         fs::create_dir_all(helper_dir).with_context(|| {
             format!("failed to create helper directory {}", helper_dir.display())
         })?;
-        let socket_path = helper_dir.join(unique_helper_name(admux_context));
+        let socket_path = helper_dir.join(unique_helper_name());
         let helper_bin = resolve_helper_binary()?;
 
         let args = PaneHelperArgs {
@@ -249,7 +249,9 @@ impl PaneProcess {
             .arg(payload)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            // Keep startup failures visible for manually supervised daemons;
+            // otherwise a helper failure surfaces only as a socket timeout.
+            .stderr(Stdio::inherit())
             .spawn()
             .context("failed to spawn admux-pane helper")?;
 
@@ -1001,38 +1003,19 @@ fn resolve_helper_binary() -> Result<PathBuf> {
     )
 }
 
-fn unique_helper_name(admux_context: Option<(&str, WindowId, PaneId)>) -> String {
+fn unique_helper_name() -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
     let pid = std::process::id();
     let counter = HELPER_NAME_COUNTER.fetch_add(1, Ordering::Relaxed);
-    match admux_context {
-        Some((session, window_id, pane_id)) => format!(
-            "{}-{}-{}-{}-{}-{}.sock",
-            sanitize_component(session),
-            window_id.0,
-            pane_id.0,
-            pid,
-            now,
-            counter
-        ),
-        None => format!("pane-{}-{}-{}.sock", pid, now, counter),
-    }
-}
-
-fn sanitize_component(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect()
+    // Unix-domain socket paths have a small, platform-defined maximum length.
+    // Session/window/pane identity is supplied in the helper payload, so it
+    // must not be repeated in the filename. PID + timestamp + counter keeps
+    // the name unique without allowing user-controlled input to exhaust the
+    // pathname budget.
+    format!("pane-{pid}-{now}-{counter}.sock")
 }
 
 #[cfg(test)]
@@ -1187,7 +1170,7 @@ mod tests {
     fn persistent_snapshot_prefers_foreground_command() {
         let dir = helper_dir();
         let pane = PaneProcess::spawn(
-            &["sh".into(), "-lc".into(), "exec sleep 1".into()],
+            &["sh".into(), "-lc".into(), "exec sleep 3".into()],
             None,
             None,
             None,
@@ -1196,8 +1179,33 @@ mod tests {
             None,
         )
         .expect("spawn pane");
-        thread::sleep(Duration::from_millis(50));
-        let snapshot = pane.persistent_snapshot(500).expect("persistent snapshot");
-        assert_eq!(snapshot.command.first().map(String::as_str), Some("sleep"));
+        let mut command = None;
+        for _ in 0..50 {
+            let snapshot = pane.persistent_snapshot(500).expect("persistent snapshot");
+            command = snapshot.command.first().cloned();
+            if command.as_deref() == Some("sleep") {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(command.as_deref(), Some("sleep"));
+        pane.kill().expect("clean up pane");
+    }
+
+    #[test]
+    fn helper_socket_names_are_bounded_and_unique() {
+        let dir = helper_dir();
+        let first = unique_helper_name();
+        let second = unique_helper_name();
+
+        assert!(
+            first.len() < 80,
+            "socket filename should preserve pathname budget"
+        );
+        assert!(
+            dir.path().join(&first).as_os_str().len() < 100,
+            "full helper socket path should fit typical Unix-domain socket limits"
+        );
+        assert_ne!(first, second);
     }
 }

@@ -1396,9 +1396,19 @@ mod tests {
             command: vec!["sh".into(), "-lc".into(), "printf attached; sleep 1".into()],
             switch_from: None,
         });
-        std::thread::sleep(std::time::Duration::from_millis(100));
-
-        let attached = store.handle(CommandRequest::Attach { session: None });
+        let mut attached = None;
+        for _ in 0..50 {
+            let response = store.handle(CommandRequest::Attach { session: None });
+            if matches!(
+                response,
+                CommandResponse::Attached { ref preview, .. } if preview.contains("attached")
+            ) {
+                attached = Some(response);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let attached = attached.expect("attach should eventually expose pane output");
 
         assert!(matches!(
             attached,
@@ -1408,6 +1418,12 @@ mod tests {
                 ..
             } if session == "work" && preview.contains("attached")
         ));
+        store
+            .sessions
+            .remove("work")
+            .expect("session")
+            .kill()
+            .expect("clean up session");
     }
 
     #[test]

@@ -12,6 +12,7 @@ dependencies = [
  "clap",
  "crossterm",
  "hostname",
+ "libc",
  "portable-pty",
  "predicates",
  "serde",

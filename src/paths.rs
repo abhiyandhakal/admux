@@ -20,35 +20,26 @@ impl RuntimePaths {
     where
         F: FnMut(&str) -> Option<PathBuf>,
     {
-        if let Some(socket_path) = get_var("ADMUX_SOCKET") {
-            let config_path =
-                get_var("ADMUX_CONFIG").unwrap_or_else(|| PathBuf::from("config.toml"));
-            let state_path = get_var("ADMUX_STATE").unwrap_or_else(|| PathBuf::from("state.json"));
-            let aliases_path =
-                get_var("ADMUX_ALIASES").unwrap_or_else(|| PathBuf::from("aliases.json"));
-            return Self {
-                socket_path,
-                config_path,
-                state_path,
-                aliases_path,
-            };
-        }
-
+        let runtime_root = get_var("XDG_RUNTIME_DIR")
+            .unwrap_or_else(|| std::env::temp_dir().join(format!("admux-{}", effective_uid())));
         let config_root = get_var("XDG_CONFIG_HOME")
             .or_else(|| get_var("HOME").map(|home| home.join(".config")))
-            .unwrap_or_else(|| PathBuf::from("."));
-        let runtime_root = get_var("XDG_RUNTIME_DIR").unwrap_or_else(|| {
-            let uid = get_var("UID")
-                .and_then(|value| value.into_os_string().into_string().ok())
-                .unwrap_or_else(|| "unknown".into());
-            PathBuf::from(format!("/tmp/admux-{uid}"))
-        });
+            // Do not put state into an arbitrary caller's working directory.
+            // This is an ephemeral fallback when neither XDG nor HOME exists.
+            .unwrap_or_else(|| runtime_root.join("config"));
 
-        Self {
+        let defaults = Self {
             socket_path: runtime_root.join("admux").join("socket"),
             config_path: config_root.join("admux").join("config.toml"),
             state_path: config_root.join("admux").join("state.json"),
             aliases_path: config_root.join("admux").join("aliases.json"),
+        };
+
+        Self {
+            socket_path: get_var("ADMUX_SOCKET").unwrap_or(defaults.socket_path),
+            config_path: get_var("ADMUX_CONFIG").unwrap_or(defaults.config_path),
+            state_path: get_var("ADMUX_STATE").unwrap_or(defaults.state_path),
+            aliases_path: get_var("ADMUX_ALIASES").unwrap_or(defaults.aliases_path),
         }
     }
 
@@ -57,6 +48,17 @@ impl RuntimePaths {
             .parent()
             .expect("socket path should always have a parent")
     }
+}
+
+#[cfg(unix)]
+fn effective_uid() -> u32 {
+    // SAFETY: geteuid has no preconditions and does not dereference pointers.
+    unsafe { libc::geteuid() }
+}
+
+#[cfg(not(unix))]
+fn effective_uid() -> u32 {
+    0
 }
 
 #[cfg(test)]
@@ -93,16 +95,15 @@ mod tests {
 
     #[test]
     fn falls_back_to_home_and_tmp_when_xdg_is_missing() {
-        let env = HashMap::from([
-            ("HOME", PathBuf::from("/home/tester")),
-            ("UID", PathBuf::from("1001")),
-        ]);
+        let env = HashMap::from([("HOME", PathBuf::from("/home/tester"))]);
 
         let paths = RuntimePaths::resolve_from_env(|key| env.get(key).cloned());
 
         assert_eq!(
             paths.socket_path,
-            PathBuf::from("/tmp/admux-1001/admux/socket")
+            std::env::temp_dir()
+                .join(format!("admux-{}", effective_uid()))
+                .join("admux/socket")
         );
         assert_eq!(
             paths.config_path,
@@ -119,14 +120,59 @@ mod tests {
     }
 
     #[test]
-    fn explicit_socket_override_wins() {
-        let env = HashMap::from([("ADMUX_SOCKET", PathBuf::from("/tmp/custom-admux.sock"))]);
+    fn overrides_are_independent_of_one_another() {
+        let env = HashMap::from([
+            ("XDG_RUNTIME_DIR", PathBuf::from("/run/user/1000")),
+            ("XDG_CONFIG_HOME", PathBuf::from("/home/test/.config")),
+            ("ADMUX_SOCKET", PathBuf::from("/tmp/custom-admux.sock")),
+            ("ADMUX_CONFIG", PathBuf::from("/tmp/custom-config.toml")),
+        ]);
 
         let paths = RuntimePaths::resolve_from_env(|key| env.get(key).cloned());
 
         assert_eq!(paths.socket_path, PathBuf::from("/tmp/custom-admux.sock"));
-        assert_eq!(paths.config_path, PathBuf::from("config.toml"));
-        assert_eq!(paths.state_path, PathBuf::from("state.json"));
-        assert_eq!(paths.aliases_path, PathBuf::from("aliases.json"));
+        assert_eq!(paths.config_path, PathBuf::from("/tmp/custom-config.toml"));
+        assert_eq!(
+            paths.state_path,
+            PathBuf::from("/home/test/.config/admux/state.json")
+        );
+        assert_eq!(
+            paths.aliases_path,
+            PathBuf::from("/home/test/.config/admux/aliases.json")
+        );
+    }
+
+    #[test]
+    fn config_and_state_overrides_work_without_socket_override() {
+        let env = HashMap::from([
+            ("XDG_RUNTIME_DIR", PathBuf::from("/run/user/1000")),
+            ("XDG_CONFIG_HOME", PathBuf::from("/home/test/.config")),
+            ("ADMUX_CONFIG", PathBuf::from("/tmp/custom-config.toml")),
+            ("ADMUX_STATE", PathBuf::from("/tmp/custom-state.json")),
+        ]);
+
+        let paths = RuntimePaths::resolve_from_env(|key| env.get(key).cloned());
+
+        assert_eq!(
+            paths.socket_path,
+            PathBuf::from("/run/user/1000/admux/socket")
+        );
+        assert_eq!(paths.config_path, PathBuf::from("/tmp/custom-config.toml"));
+        assert_eq!(paths.state_path, PathBuf::from("/tmp/custom-state.json"));
+    }
+
+    #[test]
+    fn missing_xdg_and_home_never_uses_the_current_directory_for_state() {
+        let paths = RuntimePaths::resolve_from_env(|_| None);
+        let cwd = std::env::current_dir().expect("current directory");
+
+        assert!(!paths.state_path.starts_with(&cwd));
+        assert!(!paths.config_path.starts_with(&cwd));
+        assert_eq!(
+            paths.config_path,
+            std::env::temp_dir()
+                .join(format!("admux-{}", effective_uid()))
+                .join("config/admux/config.toml")
+        );
     }
 }
