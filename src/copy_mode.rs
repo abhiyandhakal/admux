@@ -49,8 +49,8 @@ impl CopyMode {
     }
 
     pub fn clamp_to(&mut self, rows: usize, cols: usize) {
-        let max_row = rows.saturating_sub(1) as u16;
-        let max_col = cols.saturating_sub(1) as u16;
+        let max_row = terminal_index(rows);
+        let max_col = terminal_index(cols);
         self.cursor_row = self.cursor_row.min(max_row);
         self.cursor_col = self.cursor_col.min(max_col);
         if rows == 0 {
@@ -68,8 +68,7 @@ impl CopyMode {
     }
 
     pub fn move_right(&mut self, cols: usize) {
-        let max_col = cols.saturating_sub(1) as u16;
-        self.cursor_col = (self.cursor_col + 1).min(max_col);
+        self.cursor_col = self.cursor_col.saturating_add(1).min(terminal_index(cols));
         self.update_selection();
     }
 
@@ -79,8 +78,7 @@ impl CopyMode {
     }
 
     pub fn move_down(&mut self, rows: usize) {
-        let max_row = rows.saturating_sub(1) as u16;
-        self.cursor_row = (self.cursor_row + 1).min(max_row);
+        self.cursor_row = self.cursor_row.saturating_add(1).min(terminal_index(rows));
         self.update_selection();
     }
 
@@ -90,7 +88,7 @@ impl CopyMode {
     }
 
     pub fn move_line_end(&mut self, cols: usize) {
-        self.cursor_col = cols.saturating_sub(1) as u16;
+        self.cursor_col = terminal_index(cols);
         self.update_selection();
     }
 
@@ -100,7 +98,7 @@ impl CopyMode {
     }
 
     pub fn move_bottom(&mut self, rows: usize) {
-        self.cursor_row = rows.saturating_sub(1) as u16;
+        self.cursor_row = terminal_index(rows);
         self.update_selection();
     }
 
@@ -132,6 +130,10 @@ impl CopyMode {
     }
 
     fn update_selection(&mut self) {}
+}
+
+fn terminal_index(length: usize) -> u16 {
+    u16::try_from(length.saturating_sub(1)).unwrap_or(u16::MAX)
 }
 
 pub fn search_forward(buffer: &str, needle: &str) -> Option<usize> {
@@ -181,5 +183,13 @@ mod tests {
         mode.move_right(6);
 
         assert_eq!(mode.selection(), Some(Selection::new(1, 2, 2, 3)));
+    }
+
+    #[test]
+    fn copy_mode_movement_saturates_at_terminal_coordinate_limits() {
+        let mut mode = CopyMode::new(1, u16::MAX, u16::MAX);
+        mode.move_right(usize::MAX);
+        mode.move_down(usize::MAX);
+        assert_eq!((mode.cursor_row, mode.cursor_col), (u16::MAX, u16::MAX));
     }
 }
