@@ -89,7 +89,11 @@ impl InputState {
             }
             InputMode::Leader => {
                 self.mode = InputMode::Normal;
-                if let Some(action) = self.resolve(&self.keymap.leader, event) {
+                if config::key_event_matches(&self.keymap.prefix, event) {
+                    // Match tmux's prefix-prefix convention: the second prefix
+                    // key is delivered to the foreground application.
+                    key_to_bytes(event)
+                } else if let Some(action) = self.resolve(&self.keymap.leader, event) {
                     match action {
                         Action::EnterCopyMode => {
                             self.mode = InputMode::CopyMode;
@@ -241,6 +245,14 @@ mod tests {
             state.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)),
             InputAction::SendBytes(vec![0x0c])
         );
+    }
+
+    #[test]
+    fn pressing_the_prefix_twice_forwards_it_to_the_pane() {
+        let mut state = configured_state("");
+        let prefix = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        assert_eq!(state.handle_key(prefix), InputAction::Noop);
+        assert_eq!(state.handle_key(prefix), InputAction::SendBytes(vec![0x02]));
     }
 
     #[test]
