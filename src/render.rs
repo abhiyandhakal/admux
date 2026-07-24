@@ -1109,7 +1109,8 @@ fn render_prompt_line(buffer: &str, completions: &[String], selected: usize, wid
 }
 
 fn fit_width(value: &str, width: u16) -> String {
-    let mut fitted: String = value.chars().take(width as usize).collect();
+    let safe = terminal_safe(value);
+    let mut fitted: String = safe.chars().take(width as usize).collect();
     let current = fitted.chars().count();
     if current < width as usize {
         fitted.push_str(&" ".repeat(width as usize - current));
@@ -1118,7 +1119,19 @@ fn fit_width(value: &str, width: u16) -> String {
 }
 
 fn truncate(value: &str, width: u16) -> String {
-    value.chars().take(width as usize).collect()
+    terminal_safe(value).chars().take(width as usize).collect()
+}
+
+fn terminal_safe(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|ch| match ch {
+            '\x00'..='\x1f' => vec!['^', char::from_u32(ch as u32 + 0x40).unwrap_or('?')],
+            '\x7f' => vec!['^', '?'],
+            ch if ch.is_control() => vec!['�'],
+            ch => vec![ch],
+        })
+        .collect()
 }
 
 fn truncate_ansi_preserving_style(value: &str, width: usize) -> String {
@@ -1301,6 +1314,12 @@ mod tests {
 
         assert!(rendered.contains("\u{1b}[?25l"));
         assert!(!rendered.contains("\u{1b}[?25h"));
+    }
+
+    #[test]
+    fn ui_text_escapes_terminal_control_sequences() {
+        assert_eq!(terminal_safe("name\x1b[31m\n"), "name^[[31m^J");
+        assert_eq!(truncate("x\x07y", 4), "x^Gy");
     }
 
     #[test]
