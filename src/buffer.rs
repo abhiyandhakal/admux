@@ -120,9 +120,14 @@ impl BufferStore {
     }
 
     fn next_sequence(&mut self) -> u64 {
-        let seq = self.next_seq;
-        self.next_seq += 1;
-        seq
+        loop {
+            let seq = self.next_seq;
+            self.next_seq = self.next_seq.saturating_add(1);
+            let name = format!("buffer{seq:04}");
+            if !self.buffers.iter().any(|buffer| buffer.name == name) {
+                return seq;
+            }
+        }
     }
 
     fn enforce_limit(&mut self) {
@@ -169,6 +174,21 @@ mod tests {
         let updated = store.set(Some("named".into()), "beta".into(), false);
         assert_eq!(updated.data, "beta");
         assert_eq!(store.snapshot().len(), 1);
+    }
+
+    #[test]
+    fn automatic_names_skip_existing_explicit_buffer_names() {
+        let mut store = BufferStore::default();
+        store.set(Some("buffer0002".into()), "explicit".into(), false);
+        store.set(None, "first".into(), false);
+        store.set(None, "second".into(), false);
+
+        let names: Vec<_> = store
+            .snapshot()
+            .into_iter()
+            .map(|buffer| buffer.name)
+            .collect();
+        assert_eq!(names, vec!["buffer0004", "buffer0003", "buffer0002"]);
     }
 
     #[test]
