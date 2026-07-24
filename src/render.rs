@@ -1,7 +1,7 @@
 use std::io::Write;
 
 use crossterm::{
-    cursor::{MoveTo, Show},
+    cursor::{Hide, MoveTo, Show},
     queue,
     style::{Attribute, Color, Print, SetAttribute, SetBackgroundColor, SetForegroundColor},
     terminal::{BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate},
@@ -103,6 +103,7 @@ pub fn render_session<W: Write>(
     queue!(
         out,
         BeginSynchronizedUpdate,
+        Hide,
         Clear(ClearType::All),
         MoveTo(0, 0)
     )?;
@@ -1276,6 +1277,30 @@ mod tests {
 
         assert!(rendered.contains("\u{1b}[7m"));
         assert!(rendered.contains("\u{1b}[1;2H"));
+    }
+
+    #[test]
+    fn render_hides_a_stale_cursor_when_no_pane_cursor_is_available() {
+        let mut snapshot = sample_snapshot();
+        snapshot.panes[0].cursor = None;
+        let mut buf = Vec::new();
+        render_session(
+            &mut buf,
+            "work",
+            &snapshot,
+            BottomBar::Status { message: None },
+            None,
+            &sample_ui(),
+            TerminalSize {
+                width: 20,
+                height: 6,
+            },
+        )
+        .expect("render session");
+        let rendered = String::from_utf8_lossy(&buf);
+
+        assert!(rendered.contains("\u{1b}[?25l"));
+        assert!(!rendered.contains("\u{1b}[?25h"));
     }
 
     #[test]
