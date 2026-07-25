@@ -1,6 +1,10 @@
 use std::{
     collections::BTreeMap,
     fs,
+    fs::OpenOptions,
+    io::Write,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::io::AsRawFd,
     path::{Path, PathBuf},
     process,
     sync::atomic::{AtomicU64, Ordering},
@@ -204,8 +208,14 @@ impl PersistedPane {
 }
 
 pub fn load_state(path: &Path) -> Result<PersistedState> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create state directory {}", parent.display()))?;
+    }
+    // Recovery can mutate the state path, so serialize startup and ordinary writers.
+    let _writer_lock = lock_state_writer(path)?;
     if !path.exists() {
-        return Ok(PersistedState::default());
+        return Ok(recover_from_backup(path)?.unwrap_or_default());
     }
     let raw = fs::read_to_string(path)
         .with_context(|| format!("failed to read state file {}", path.display()))?;
@@ -224,9 +234,55 @@ pub fn load_state(path: &Path) -> Result<PersistedState> {
                     path.display()
                 ),
             }
-            return Ok(PersistedState::default());
+            return Ok(recover_from_backup(path)?.unwrap_or_default());
         }
     };
+    normalize_state_schema(path, &mut state)?;
+    Ok(state)
+}
+
+fn recover_from_backup(path: &Path) -> Result<Option<PersistedState>> {
+    let backup = state_backup_path(path);
+    if !backup.exists() {
+        return Ok(None);
+    }
+    match load_valid_state(&backup) {
+        Ok(state) => {
+            if let Err(restore_error) = restore_backup(path, &backup) {
+                eprintln!(
+                    "admuxd: recovered state from backup {} in memory, but could not restore it to {}: {restore_error:#}",
+                    backup.display(),
+                    path.display()
+                );
+            } else {
+                eprintln!(
+                    "admuxd: recovered state from backup {} after {} became corrupt",
+                    backup.display(),
+                    path.display()
+                );
+            }
+            Ok(Some(state))
+        }
+        Err(backup_error) => {
+            eprintln!(
+                "admuxd: backup state file {} is unusable: {backup_error:#}",
+                backup.display()
+            );
+            Ok(None)
+        }
+    }
+}
+
+fn load_valid_state(path: &Path) -> Result<PersistedState> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read backup state file {}", path.display()))?;
+    let mut state: PersistedState =
+        serde_json::from_str(&raw).with_context(|| format!("failed to parse backup state file {}", path.display()))?;
+    normalize_state_schema(path, &mut state)?;
+    Ok(state)
+}
+
+fn normalize_state_schema(path: &Path, state: &mut PersistedState) -> Result<()> {
     if state.schema_version > STATE_SCHEMA_VERSION {
         anyhow::bail!(
             "state file {} uses unsupported schema version {} (this admux supports {})",
@@ -237,7 +293,7 @@ pub fn load_state(path: &Path) -> Result<PersistedState> {
     }
     // Version 0 is the pre-versioned format and is structurally compatible.
     state.schema_version = STATE_SCHEMA_VERSION;
-    Ok(state)
+    Ok(())
 }
 
 fn quarantine_corrupt_state(path: &Path) -> Result<PathBuf> {
@@ -258,14 +314,135 @@ pub fn save_state(path: &Path, state: &PersistedState) -> Result<()> {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create state directory {}", parent.display()))?;
     }
+    let _writer_lock = lock_state_writer(path)?;
+    backup_current_state(path)?;
     let counter = STATE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp = path.with_extension(format!("json.{}.{}.tmp", process::id(), counter));
     let mut state = state.clone();
     state.schema_version = STATE_SCHEMA_VERSION;
     let raw = serde_json::to_vec_pretty(&state).context("failed to encode state file")?;
-    fs::write(&tmp, raw).with_context(|| format!("failed to write {}", tmp.display()))?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .with_context(|| format!("failed to create {}", tmp.display()))?;
+    file.write_all(&raw)
+        .with_context(|| format!("failed to write {}", tmp.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync {}", tmp.display()))?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to restrict permissions on {}", tmp.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync permissions on {}", tmp.display()))?;
     fs::rename(&tmp, path)
         .with_context(|| format!("failed to rename {} to {}", tmp.display(), path.display()))?;
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)
+            .with_context(|| format!("failed to open state directory {}", parent.display()))?
+            .sync_all()
+            .with_context(|| format!("failed to sync state directory {}", parent.display()))?;
+    }
+    Ok(())
+}
+
+fn state_backup_path(path: &Path) -> PathBuf {
+    path.with_extension("json.bak")
+}
+
+fn restore_backup(path: &Path, backup: &Path) -> Result<()> {
+    let counter = STATE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let temporary_state = path.with_extension(format!("json.recovered.{}.{}.tmp", process::id(), counter));
+    let backup_data = fs::read(backup)
+        .with_context(|| format!("failed to read backup state file {}", backup.display()))?;
+    let mut restored = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary_state)
+        .with_context(|| format!("failed to create {}", temporary_state.display()))?;
+    restored
+        .write_all(&backup_data)
+        .with_context(|| format!("failed to write {}", temporary_state.display()))?;
+    restored
+        .set_permissions(fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to restrict permissions on {}", temporary_state.display()))?;
+    restored
+        .sync_all()
+        .with_context(|| format!("failed to sync {}", temporary_state.display()))?;
+    fs::rename(&temporary_state, path).with_context(|| {
+        format!(
+            "failed to restore backup state file {} to {}",
+            backup.display(),
+            path.display()
+        )
+    })?;
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)
+            .with_context(|| format!("failed to open state directory {}", parent.display()))?
+            .sync_all()
+            .with_context(|| format!("failed to sync state directory {}", parent.display()))?;
+    }
+    Ok(())
+}
+
+fn lock_state_writer(path: &Path) -> Result<fs::File> {
+    let lock_path = path.with_extension("json.lock");
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open state lock {}", lock_path.display()))?;
+    lock.set_permissions(fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to restrict permissions on {}", lock_path.display()))?;
+    // SAFETY: `lock` stays open while the exclusive advisory lock is held.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to lock state file {}", path.display()));
+    }
+    Ok(lock)
+}
+
+fn backup_current_state(path: &Path) -> Result<()> {
+    let backup = state_backup_path(path);
+    let counter = STATE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let temporary_backup = backup.with_extension(format!("json.bak.{}.{}.tmp", process::id(), counter));
+    match fs::hard_link(path, &temporary_backup) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to create backup of state file {} as {}",
+                    path.display(),
+                    temporary_backup.display()
+                )
+            });
+        }
+    }
+    let backup_file = fs::File::open(&temporary_backup)
+        .with_context(|| format!("failed to open {}", temporary_backup.display()))?;
+    backup_file
+        .set_permissions(fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to restrict permissions on {}", temporary_backup.display()))?;
+    backup_file
+        .sync_all()
+        .with_context(|| format!("failed to sync {}", temporary_backup.display()))?;
+    fs::rename(&temporary_backup, &backup).with_context(|| {
+        format!(
+            "failed to replace backup state file {} with {}",
+            backup.display(),
+            temporary_backup.display()
+        )
+    })?;
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)
+            .with_context(|| format!("failed to open state directory {}", parent.display()))?
+            .sync_all()
+            .with_context(|| format!("failed to sync state directory {}", parent.display()))?;
+    }
     Ok(())
 }
 
@@ -346,6 +523,20 @@ mod tests {
         let loaded = load_state(&path).expect("load");
 
         assert_eq!(loaded, state);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+            .expect("make state file broadly readable");
+        save_state(&path, &state).expect("replace state with restricted permissions");
+        for protected_path in [&path, &state_backup_path(&path)] {
+            assert_eq!(
+                fs::metadata(protected_path)
+                    .expect("state metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600,
+                "state and backups can include pasted secrets and must not be world-readable"
+            );
+        }
     }
 
     #[test]
@@ -362,6 +553,33 @@ mod tests {
             .expect("read state directory")
             .filter_map(Result::ok)
             .any(|entry| entry.file_name().to_string_lossy().starts_with("state.json.corrupt.")));
+    }
+
+    #[test]
+    fn corrupt_current_state_recovers_the_last_valid_backup() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+        let first = PersistedState {
+            schema_version: STATE_SCHEMA_VERSION,
+            last_session: Some("first".into()),
+            ..PersistedState::default()
+        };
+        let second = PersistedState {
+            schema_version: STATE_SCHEMA_VERSION,
+            last_session: Some("second".into()),
+            ..PersistedState::default()
+        };
+
+        save_state(&path, &first).expect("save first state");
+        save_state(&path, &second).expect("save second state");
+        assert!(state_backup_path(&path).exists());
+        fs::write(&path, "not json").expect("corrupt current state");
+
+        assert_eq!(load_state(&path).expect("recover from backup"), first);
+        fs::write(&path, "corrupt again").expect("corrupt restored state");
+        assert_eq!(load_state(&path).expect("load restored backup"), first);
+        fs::remove_file(&path).expect("remove current state");
+        assert_eq!(load_state(&path).expect("recover missing state from backup"), first);
     }
 
     #[test]
