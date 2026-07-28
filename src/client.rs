@@ -931,6 +931,8 @@ fn run_attach_loop(
                             paths,
                             &snapshot,
                             &mut current_session,
+                            &mut state,
+                            config,
                             &mut prompt,
                             &mut prompt_history,
                             key,
@@ -1154,16 +1156,12 @@ fn run_attach_loop(
                             overlay = OverlayState::ChooseBuffer(build_choose_buffer(paths)?);
                         }
                         InputAction::ReloadConfig => {
-                            let response = request_response(paths, CommandRequest::ReloadConfig)?;
-                            if handle_interactive_response(response, &mut status_message) {
-                                let reloaded = load_config(paths)?;
-                                state.replace_config(
-                                    reloaded.keys.clone(),
-                                    reloaded.behavior.resize_step,
-                                );
-                                *config = reloaded;
+                            match reload_interactive_config(paths, &mut state, config) {
+                                Ok(()) => {
                                 status_message = Some("config reloaded".into());
                                 needs_refresh = true;
+                                }
+                                Err(error) => status_message = Some(error.to_string()),
                             }
                         }
                         InputAction::CopyMove(direction) => {
@@ -1569,6 +1567,8 @@ fn handle_prompt_key(
     paths: &RuntimePaths,
     snapshot: &RenderSnapshot,
     current_session: &mut String,
+    input_state: &mut InputState,
+    config: &mut ResolvedConfig,
     prompt: &mut PromptState,
     history: &mut Vec<String>,
     key: crossterm::event::KeyEvent,
@@ -1579,7 +1579,13 @@ fn handle_prompt_key(
         KeyCode::Enter => {
             let command = prompt.buffer.trim().to_string();
             if !command.is_empty() {
-                match execute_prompt_command(paths, snapshot, current_session, &command) {
+                let result = if matches!(parse_command(&command), Ok(InteractiveCommand::ReloadConfig)) {
+                    reload_interactive_config(paths, input_state, config)
+                        .map(|()| Some("config reloaded".into()))
+                } else {
+                    execute_prompt_command(paths, snapshot, current_session, &command)
+                };
+                match result {
                     Ok(result) => {
                         history.push(command);
                         *status_message = result;
@@ -1653,6 +1659,23 @@ fn handle_prompt_key(
 
     refresh_prompt_completions(prompt);
     Ok(PromptResult::KeepOpen)
+}
+
+fn reload_interactive_config(
+    paths: &RuntimePaths,
+    input_state: &mut InputState,
+    config: &mut ResolvedConfig,
+) -> Result<()> {
+    match request_response(paths, CommandRequest::ReloadConfig)? {
+        CommandResponse::ConfigReloaded => {
+            let reloaded = load_config(paths)?;
+            input_state.replace_config(reloaded.keys.clone(), reloaded.behavior.resize_step);
+            *config = reloaded;
+            Ok(())
+        }
+        CommandResponse::Error { message } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected reload response: {other:?}")),
+    }
 }
 
 fn insert_prompt_text(prompt: &mut PromptState, text: &str) {
@@ -3069,6 +3092,53 @@ root = { command = ["sh"] }
     }
 
     #[test]
+    fn reload_interactive_config_refreshes_the_client_key_state() {
+        let dir = tempdir();
+        let socket_path = dir.path().join("socket");
+        let config_path = dir.path().join("config.toml");
+        fs::write(&config_path, "[behavior]\nresize_step = 7").expect("write config");
+        let paths = RuntimePaths {
+            socket_path: socket_path.clone(),
+            config_path,
+            state_path: dir.path().join("state.json"),
+            aliases_path: dir.path().join("aliases.json"),
+        };
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).expect("bind");
+        let server = std::thread::spawn(move || {
+            for hello in [true, false] {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut input = Vec::new();
+                stream.read_to_end(&mut input).expect("read request");
+                let request: CommandRequest = serde_json::from_slice(&input).expect("decode request");
+                assert_eq!(hello, matches!(request, CommandRequest::Hello { .. }));
+                let response = if hello {
+                    CommandResponse::HelloAck {
+                        version: crate::ipc::CURRENT_PROTOCOL_VERSION,
+                    }
+                } else {
+                    assert_eq!(request, CommandRequest::ReloadConfig);
+                    CommandResponse::ConfigReloaded
+                };
+                stream
+                    .write_all(&serde_json::to_vec(&response).expect("encode response"))
+                    .expect("write response");
+            }
+        });
+        let mut config = Config::default().resolve().expect("default config");
+        let mut input_state = InputState::new(config.keys.clone(), config.behavior.resize_step);
+
+        reload_interactive_config(&paths, &mut input_state, &mut config).expect("reload config");
+
+        assert_eq!(config.behavior.resize_step, 7);
+        let _ = input_state.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        assert_eq!(
+            input_state.handle_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT)),
+            InputAction::ResizePane(NavigationDirection::Right, 7)
+        );
+        server.join().expect("server thread");
+    }
+
+    #[test]
     fn normalize_new_args_defaults_to_current_directory() {
         let args = crate::cli::NewArgs {
             detach: true,
@@ -3402,6 +3472,8 @@ root = { command = ["sh"] }
             history_index: None,
         };
         let mut session = "work".into();
+        let mut config = Config::default().resolve().expect("default config");
+        let mut input_state = InputState::new(config.keys.clone(), config.behavior.resize_step);
         let mut history = Vec::new();
         let mut status = None;
 
@@ -3409,6 +3481,8 @@ root = { command = ["sh"] }
             &paths,
             &snapshot,
             &mut session,
+            &mut input_state,
+            &mut config,
             &mut prompt,
             &mut history,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
