@@ -1605,11 +1605,8 @@ fn handle_prompt_key(
             return Ok(PromptResult::CloseAndClearSelection);
         }
         KeyCode::Tab => {
-            if !prompt.completions.is_empty() {
-                prompt.selected = (prompt.selected + 1) % prompt.completions.len();
-                prompt.buffer = prompt.completions[prompt.selected].clone();
-                prompt.cursor = prompt.buffer.len();
-            }
+            cycle_prompt_completion(prompt);
+            return Ok(PromptResult::KeepOpen);
         }
         KeyCode::Backspace => {
             if let Some(previous) = previous_char_boundary(&prompt.buffer, prompt.cursor) {
@@ -1695,6 +1692,20 @@ fn refresh_prompt_completions(prompt: &mut PromptState) {
     let prefix = prompt.buffer.split_whitespace().next().unwrap_or("");
     prompt.completions = command_completions(prefix);
     prompt.selected = 0;
+}
+
+fn cycle_prompt_completion(prompt: &mut PromptState) {
+    let Some(selected_completion) = prompt.completions.get(prompt.selected) else {
+        return;
+    };
+    if prompt.buffer == *selected_completion {
+        prompt.selected = (prompt.selected + 1) % prompt.completions.len();
+    }
+    let Some(completion) = prompt.completions.get(prompt.selected).cloned() else {
+        return;
+    };
+    prompt.buffer = completion;
+    prompt.cursor = prompt.buffer.len();
 }
 
 fn previous_char_boundary(text: &str, cursor: usize) -> Option<usize> {
@@ -3029,6 +3040,33 @@ root = { command = ["sh"] }
         assert!(!interactive_terminal_available_for(false, true, true));
         assert!(!interactive_terminal_available_for(true, false, true));
         assert!(!interactive_terminal_available_for(true, true, false));
+    }
+
+    #[test]
+    fn prompt_completion_starts_at_the_first_candidate_and_cycles() {
+        let mut prompt = PromptState {
+            buffer: "s".into(),
+            cursor: 1,
+            completions: vec!["send-keys".into(), "select-pane".into(), "split-window".into()],
+            selected: 0,
+            history_index: None,
+        };
+
+        cycle_prompt_completion(&mut prompt);
+        assert_eq!(prompt.buffer, "send-keys");
+        assert_eq!(prompt.selected, 0);
+
+        cycle_prompt_completion(&mut prompt);
+        assert_eq!(prompt.buffer, "select-pane");
+        assert_eq!(prompt.selected, 1);
+
+        cycle_prompt_completion(&mut prompt);
+        assert_eq!(prompt.buffer, "split-window");
+        assert_eq!(prompt.selected, 2);
+
+        cycle_prompt_completion(&mut prompt);
+        assert_eq!(prompt.buffer, "send-keys");
+        assert_eq!(prompt.selected, 0);
     }
 
     #[test]
