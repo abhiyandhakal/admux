@@ -680,14 +680,17 @@ impl SessionStore {
                 end_row,
                 end_col,
             } => match self.sessions.get(&session) {
-                Some(session) => CommandResponse::SelectionCopied {
-                    text: session.active_pane_selection_text(
+                Some(session) => match session.active_pane_selection_text(
                         pane_id.map(PaneId),
                         start_row,
                         start_col,
                         end_row,
                         end_col,
-                    ),
+                    ) {
+                    Ok(text) => CommandResponse::SelectionCopied { text },
+                    Err(error) => CommandResponse::Error {
+                        message: error.to_string(),
+                    },
                 },
                 None => CommandResponse::Error {
                     message: format!("unknown session {session}"),

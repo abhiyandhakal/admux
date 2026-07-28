@@ -357,15 +357,16 @@ impl PaneProcess {
         start_col: u16,
         end_row: u16,
         end_col: u16,
-    ) -> String {
+    ) -> Result<String> {
         match self.request(PaneRequest::SelectionText {
             start_row,
             start_col,
             end_row,
             end_col,
-        }) {
-            Ok(PaneResponse::SelectionText { text }) => text,
-            _ => String::new(),
+        })? {
+            PaneResponse::SelectionText { text } => Ok(text),
+            PaneResponse::Error { message } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected selection text response: {other:?}")),
         }
     }
 
@@ -1552,6 +1553,29 @@ mod tests {
         fs::rename(&socket, &hidden).expect("hide helper socket");
 
         assert!(pane.scroll_scrollback_by(1).is_err());
+
+        fs::rename(&hidden, &socket).expect("restore helper socket");
+        pane.kill().expect("clean up helper");
+    }
+
+    #[test]
+    fn selection_text_reports_helper_transport_failures() {
+        let dir = helper_dir();
+        let pane = PaneProcess::spawn(
+            &["sh".into(), "-lc".into(), "printf selected; sleep 1".into()],
+            None,
+            None,
+            None,
+            10_000,
+            dir.path(),
+            None,
+        )
+        .expect("spawn pane");
+        let socket = pane.socket_path().to_path_buf();
+        let hidden = socket.with_extension("hidden");
+        fs::rename(&socket, &hidden).expect("hide helper socket");
+
+        assert!(pane.selection_text(0, 0, 0, 7).is_err());
 
         fs::rename(&hidden, &socket).expect("restore helper socket");
         pane.kill().expect("clean up helper");

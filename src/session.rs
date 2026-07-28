@@ -258,17 +258,16 @@ impl Session {
         start_col: u16,
         end_row: u16,
         end_col: u16,
-    ) -> String {
-        self.active_window()
+    ) -> Result<String> {
+        let pane = self
+            .active_window()
             .and_then(|window| {
                 let pane_id = pane_id.unwrap_or(window.layout.active);
                 window.panes.get(&pane_id)
             })
-            .map(|pane| {
-                pane.process
-                    .selection_text(start_row, start_col, end_row, end_col)
-            })
-            .unwrap_or_default()
+            .ok_or_else(|| anyhow!("active pane is unavailable"))?;
+        pane.process
+            .selection_text(start_row, start_col, end_row, end_col)
     }
 
     pub fn active_pane_snapshot(&self) -> Option<PaneSnapshot> {
