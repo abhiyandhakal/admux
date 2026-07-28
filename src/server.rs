@@ -17,6 +17,7 @@ const MAX_IPC_MESSAGE_BYTES: u64 = 1024 * 1024;
 const MAX_SESSION_NAME_BYTES: usize = 64;
 const MAX_WINDOW_NAME_BYTES: usize = 128;
 const CLIENT_VIEWPORT_LEASE: Duration = Duration::from_secs(5);
+const INPUT_CLIENT_LEASE: Duration = Duration::from_secs(30);
 
 use anyhow::{Context, Result, anyhow, bail};
 
@@ -46,7 +47,8 @@ pub struct SessionStore {
     persisted_sessions: BTreeMap<String, PersistedSession>,
     state_path: Option<std::path::PathBuf>,
     helper_dir: PathBuf,
-    pending_switches: BTreeMap<String, String>,
+    pending_switches: BTreeMap<(String, String), String>,
+    input_clients: BTreeMap<(String, u64, u64), InputClientLease>,
     workspace_mappings: BTreeMap<String, String>,
     last_session: Option<String>,
     next_window_id: u64,
@@ -63,6 +65,12 @@ struct ClientViewportLease {
     last_seen: Instant,
 }
 
+#[derive(Debug, Clone)]
+struct InputClientLease {
+    client_id: String,
+    last_seen: Instant,
+}
+
 impl Default for SessionStore {
     fn default() -> Self {
         Self {
@@ -72,6 +80,7 @@ impl Default for SessionStore {
             state_path: None,
             helper_dir: PathBuf::from("/tmp/admux-helpers"),
             pending_switches: BTreeMap::new(),
+            input_clients: BTreeMap::new(),
             workspace_mappings: BTreeMap::new(),
             last_session: None,
             next_window_id: 0,
@@ -240,15 +249,8 @@ impl SessionStore {
                     Ok(session) => {
                         self.sessions.insert(name.clone(), session);
                         self.last_session = Some(name.clone());
-                        if let Some(source) = switch_from
-                            && self.sessions.get(&source.session).is_some_and(|session| {
-                                session.contains_window_pane(
-                                    WindowId(source.window_id),
-                                    PaneId(source.pane_id),
-                                )
-                            })
-                        {
-                            self.pending_switches.insert(source.session, name.clone());
+                        if let Some(source) = switch_from {
+                            self.queue_nested_switch(source, &name);
                         }
                         CommandResponse::SessionCreated {
                             session: name,
@@ -282,9 +284,10 @@ impl SessionStore {
                         message: "no sessions available".into(),
                     };
                 };
+                let client_id = viewport.as_ref().map(|viewport| viewport.client_id.clone());
                 let session_name = self
                     .pending_switches
-                    .remove(&session_name)
+                    .remove(&(session_name.clone(), client_id.unwrap_or_default()))
                     .filter(|target| self.sessions.contains_key(target))
                     .unwrap_or(session_name);
                 if self.sessions.contains_key(&session_name) {
@@ -601,6 +604,9 @@ impl SessionStore {
                 },
                 Err(message) => CommandResponse::Error { message },
             },
+            CommandRequest::RegisterInput { source, client_id } => {
+                self.register_input_client(source, client_id)
+            }
             CommandRequest::SplitPane {
                 target,
                 axis,
@@ -865,10 +871,16 @@ impl SessionStore {
             changed = true;
         }
         let pending_switches = self.pending_switches.len();
-        self.pending_switches.retain(|source, target| {
+        self.pending_switches.retain(|(source, _), target| {
             self.sessions.contains_key(source) && self.sessions.contains_key(target)
         });
         changed |= self.pending_switches.len() != pending_switches;
+        let input_clients = self.input_clients.len();
+        self.input_clients.retain(|(session, _, _), lease| {
+            self.sessions.contains_key(session)
+                && lease.last_seen.elapsed() <= INPUT_CLIENT_LEASE
+        });
+        changed |= self.input_clients.len() != input_clients;
         if let Some(last) = self.last_session.as_ref()
             && !self.sessions.contains_key(last)
         {
@@ -909,6 +921,52 @@ impl SessionStore {
             session.set_viewport(pty_rows, pty_cols)?;
         }
         Ok(session.pane_area_for_viewport(rows, cols))
+    }
+
+    fn register_input_client(&mut self, source: crate::ipc::SwitchSource, client_id: String) -> CommandResponse {
+        if client_id.is_empty() {
+            return CommandResponse::Error {
+                message: "client id cannot be empty".into(),
+            };
+        }
+        let Some(session) = self.sessions.get(&source.session) else {
+            return CommandResponse::Error {
+                message: format!("unknown session {}", source.session),
+            };
+        };
+        if !session.contains_window_pane(WindowId(source.window_id), PaneId(source.pane_id)) {
+            return CommandResponse::Error {
+                message: "unknown source pane".into(),
+            };
+        }
+        self.input_clients.insert(
+            (source.session, source.window_id, source.pane_id),
+            InputClientLease {
+                client_id,
+                last_seen: Instant::now(),
+            },
+        );
+        CommandResponse::InputRegistered
+    }
+
+    fn queue_nested_switch(&mut self, source: crate::ipc::SwitchSource, target: &str) {
+        let source_valid = self.sessions.get(&source.session).is_some_and(|session| {
+            session.contains_window_pane(WindowId(source.window_id), PaneId(source.pane_id))
+        });
+        if !source_valid {
+            return;
+        }
+        let key = (source.session.clone(), source.window_id, source.pane_id);
+        let Some(lease) = self.input_clients.get(&key) else {
+            return;
+        };
+        if lease.last_seen.elapsed() > INPUT_CLIENT_LEASE {
+            return;
+        }
+        self.pending_switches.insert(
+            (source.session, lease.client_id.clone()),
+            target.to_string(),
+        );
     }
 
     fn prune_due(&self) -> bool {
@@ -1276,16 +1334,8 @@ impl SessionStore {
                 self.workspace_mappings
                     .insert(manifest_key.clone(), session_name.clone());
                 self.last_session = Some(session_name.clone());
-                if let Some(source) = switch_from
-                    && self.sessions.get(&source.session).is_some_and(|session| {
-                        session.contains_window_pane(
-                            WindowId(source.window_id),
-                            PaneId(source.pane_id),
-                        )
-                    })
-                {
-                    self.pending_switches
-                        .insert(source.session, session_name.clone());
+                if let Some(source) = switch_from {
+                    self.queue_nested_switch(source, &session_name);
                 }
                 CommandResponse::WorkspaceReady {
                     session: session_name,
@@ -2394,7 +2444,7 @@ mod tests {
     }
 
     #[test]
-    fn nested_new_session_redirects_next_attach() {
+    fn nested_new_session_redirects_only_the_client_that_submitted_it() {
         let mut store = SessionStore::default();
         let created = store.handle(CommandRequest::NewSession {
             name: Some("work".into()),
@@ -2407,27 +2457,51 @@ mod tests {
             other => panic!("unexpected response: {other:?}"),
         }
 
+        let source = SwitchSource {
+            session: "work".into(),
+            window_id: 1,
+            pane_id: 0,
+        };
+        assert!(matches!(
+            store.handle(CommandRequest::RegisterInput {
+                source: source.clone(),
+                client_id: "author".into(),
+            }),
+            CommandResponse::InputRegistered
+        ));
         let response = store.handle(CommandRequest::NewSession {
             name: Some("logs".into()),
             cwd: None,
             command: vec!["sh".into()],
-            switch_from: Some(SwitchSource {
-                session: "work".into(),
-                window_id: 1,
-                pane_id: 0,
-            }),
+            switch_from: Some(source),
         });
         assert!(matches!(
             response,
             CommandResponse::SessionCreated { session, .. } if session == "logs"
         ));
 
-        let attached = store.handle(CommandRequest::Attach {
+        let other_client = store.handle(CommandRequest::Attach {
             session: Some("work".into()),
-            viewport: None,
+            viewport: Some(ClientViewport {
+                client_id: "viewer".into(),
+                rows: 24,
+                cols: 80,
+            }),
         });
         assert!(matches!(
-            attached,
+            other_client,
+            CommandResponse::Attached { session, .. } if session == "work"
+        ));
+        let author = store.handle(CommandRequest::Attach {
+            session: Some("work".into()),
+            viewport: Some(ClientViewport {
+                client_id: "author".into(),
+                rows: 24,
+                cols: 80,
+            }),
+        });
+        assert!(matches!(
+            author,
             CommandResponse::Attached { session, .. } if session == "logs"
         ));
     }

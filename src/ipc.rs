@@ -11,7 +11,7 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtocolVersion(pub u16);
 
-pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(6);
+pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(7);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientViewport {
@@ -95,6 +95,10 @@ pub enum CommandRequest {
     SendBytes {
         target: String,
         bytes: Vec<u8>,
+    },
+    RegisterInput {
+        source: SwitchSource,
+        client_id: String,
     },
     SplitPane {
         target: String,
@@ -245,6 +249,7 @@ pub enum CommandResponse {
         pane_id: u64,
     },
     KeysSent,
+    InputRegistered,
     SelectionCopied {
         text: String,
     },

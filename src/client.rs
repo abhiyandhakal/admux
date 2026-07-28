@@ -792,6 +792,7 @@ fn print_response(paths: &RuntimePaths, response: CommandResponse) -> Result<()>
         CommandResponse::SelectionCopied { .. }
         | CommandResponse::Scrolled
         | CommandResponse::Resized
+        | CommandResponse::InputRegistered
         | CommandResponse::FocusChanged => {}
         CommandResponse::ConfigReloaded => println!("config reloaded"),
         CommandResponse::Error { message } => return Err(anyhow!(message)),
@@ -1174,7 +1175,13 @@ fn run_attach_loop(
                             copy_mode = None;
                         }
                         InputAction::SendBytes(bytes) => {
-                            send_input_bytes(paths, &snapshot, &current_session, &bytes)?;
+                            send_input_bytes(
+                                paths,
+                                &snapshot,
+                                &current_session,
+                                &bytes,
+                                Some(&client_id),
+                            )?;
                             needs_refresh = true;
                         }
                         InputAction::SplitPane(axis) => {
@@ -1490,7 +1497,13 @@ fn run_attach_loop(
                     bytes.extend_from_slice(b"\x1b[200~");
                     bytes.extend_from_slice(text.as_bytes());
                     bytes.extend_from_slice(b"\x1b[201~");
-                    send_input_bytes(paths, &snapshot, &current_session, &bytes)?;
+                    send_input_bytes(
+                        paths,
+                        &snapshot,
+                        &current_session,
+                        &bytes,
+                        Some(&client_id),
+                    )?;
                     needs_refresh = true;
                 }
             }
@@ -3319,9 +3332,26 @@ fn send_input_bytes(
     snapshot: &RenderSnapshot,
     session: &str,
     bytes: &[u8],
+    client_id: Option<&str>,
 ) -> Result<()> {
     if bytes.is_empty() {
         return Ok(());
+    }
+
+    if bytes.iter().any(|byte| matches!(byte, b'\r' | b'\n'))
+        && let Some(client_id) = client_id
+    {
+        ensure_command_succeeded(request_response(
+            paths,
+            CommandRequest::RegisterInput {
+                source: SwitchSource {
+                    session: session.to_string(),
+                    window_id: snapshot.active_window_id,
+                    pane_id: snapshot.active_pane_id,
+                },
+                client_id: client_id.to_string(),
+            },
+        )?)?;
     }
 
     if let Some(pane) = focused_pane(snapshot)
@@ -4142,8 +4172,64 @@ root = { command = ["sh"] }
         let mut snapshot = fallback_snapshot(String::new(), 80, 24);
         snapshot.panes[0].helper_socket = Some(helper_socket);
 
-        send_input_bytes(&paths, &snapshot, "work", b"x").expect("daemon fallback");
+        send_input_bytes(&paths, &snapshot, "work", b"x", None)
+            .expect("daemon fallback");
         helper.join().expect("helper thread");
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn submitted_input_registers_its_client_before_forwarding() {
+        let dir = tempdir();
+        let socket_path = dir.path().join("socket");
+        let paths = RuntimePaths {
+            socket_path: socket_path.clone(),
+            config_path: dir.path().join("config.toml"),
+            state_path: dir.path().join("state.json"),
+            aliases_path: dir.path().join("aliases.json"),
+        };
+        let listener = UnixListener::bind(&socket_path).expect("bind daemon socket");
+        let server = std::thread::spawn(move || {
+            for expected in [
+                CommandRequest::Hello {
+                    version: crate::ipc::CURRENT_PROTOCOL_VERSION,
+                },
+                CommandRequest::RegisterInput {
+                    source: SwitchSource {
+                        session: "work".into(),
+                        window_id: 1,
+                        pane_id: 1,
+                    },
+                    client_id: "client-1".into(),
+                },
+                CommandRequest::Hello {
+                    version: crate::ipc::CURRENT_PROTOCOL_VERSION,
+                },
+                CommandRequest::SendBytes {
+                    target: "work".into(),
+                    bytes: b"\r".to_vec(),
+                },
+            ] {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut input = Vec::new();
+                stream.read_to_end(&mut input).expect("read request");
+                let request: CommandRequest = serde_json::from_slice(&input).expect("decode request");
+                assert_eq!(request, expected);
+                let response = match request {
+                    CommandRequest::Hello { version } => CommandResponse::HelloAck { version },
+                    CommandRequest::RegisterInput { .. } => CommandResponse::InputRegistered,
+                    CommandRequest::SendBytes { .. } => CommandResponse::KeysSent,
+                    other => panic!("unexpected request: {other:?}"),
+                };
+                stream
+                    .write_all(&serde_json::to_vec(&response).expect("encode response"))
+                    .expect("write response");
+            }
+        });
+
+        let snapshot = fallback_snapshot(String::new(), 80, 24);
+        send_input_bytes(&paths, &snapshot, "work", b"\r", Some("client-1"))
+            .expect("submit input");
         server.join().expect("server thread");
     }
 
