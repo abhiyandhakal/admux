@@ -9,7 +9,7 @@ use crate::{
     config::WindowDefaults,
     ipc::{
         NavigationDirection, PaneCursor, PaneMouseKind, PaneRender, PaneSummary, RenderSnapshot,
-        ScrollDirection,
+        ScrollDirection, ScrollbackPosition,
     },
     layout::{Direction, LayoutTree, SplitAxis},
     numbering::Numbering,
@@ -285,9 +285,9 @@ impl Session {
         &self,
         window_id: Option<u64>,
         pane_id: Option<u64>,
-        start_row: u16,
+        start_from_bottom: u32,
         start_col: u16,
-        end_row: u16,
+        end_from_bottom: u32,
         end_col: u16,
     ) -> Result<String> {
         let window = self.window_for_public_id(window_id)?;
@@ -297,7 +297,7 @@ impl Session {
             .get(&pane_id)
             .ok_or_else(|| anyhow!("pane is unavailable"))?;
         pane.process
-            .selection_text(start_row, start_col, end_row, end_col)
+            .selection_text(start_from_bottom, start_col, end_from_bottom, end_col)
     }
 
     pub fn render_snapshot(&self, size: Rect) -> Option<RenderSnapshot> {
@@ -433,6 +433,7 @@ impl Session {
                 helper_socket,
                 mouse_reporting: render.mouse_reporting,
                 application_cursor: render.application_cursor,
+                scrollback: render.scrollback,
                 preview: render.preview,
                 formatted_preview: render.formatted_preview,
                 formatted_cursor: render.formatted_cursor,
@@ -448,6 +449,7 @@ impl Session {
                 helper_socket,
                 mouse_reporting: false,
                 application_cursor: false,
+                scrollback: 0,
                 preview: "[admux: pane helper unavailable]".into(),
                 formatted_preview: "[admux: pane helper unavailable]".into(),
                 formatted_cursor: String::new(),
@@ -638,6 +640,24 @@ impl Session {
             .get(&pane_id)
             .ok_or_else(|| anyhow!("unknown pane"))?;
         pane.process.scroll_scrollback_by(lines)
+    }
+
+    pub fn scroll_pane_to(
+        &self,
+        window_id: Option<u64>,
+        pane_id: Option<u64>,
+        position: ScrollbackPosition,
+    ) -> Result<()> {
+        let window = self.window_for_public_id(window_id)?;
+        let pane_id = self.pane_id_from_public(pane_id, window.layout.active)?;
+        let pane = window
+            .panes
+            .get(&pane_id)
+            .ok_or_else(|| anyhow!("unknown pane"))?;
+        match position {
+            ScrollbackPosition::Top => pane.process.scroll_scrollback_to_top(),
+            ScrollbackPosition::Bottom => pane.process.scroll_scrollback_to_bottom(),
+        }
     }
 
     pub fn split_active_pane(

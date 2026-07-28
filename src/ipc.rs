@@ -11,7 +11,7 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtocolVersion(pub u16);
 
-pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(9);
+pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(11);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientViewport {
@@ -150,9 +150,9 @@ pub enum CommandRequest {
         session: String,
         window_id: Option<u64>,
         pane_id: Option<u64>,
-        start_row: u16,
+        start_from_bottom: u32,
         start_col: u16,
-        end_row: u16,
+        end_from_bottom: u32,
         end_col: u16,
     },
     ScrollPane {
@@ -160,6 +160,12 @@ pub enum CommandRequest {
         window_id: Option<u64>,
         pane_id: Option<u64>,
         lines: i16,
+    },
+    ScrollPaneTo {
+        session: String,
+        window_id: Option<u64>,
+        pane_id: Option<u64>,
+        position: ScrollbackPosition,
     },
     Resize {
         session: String,
@@ -274,6 +280,12 @@ pub enum ScrollDirection {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScrollbackPosition {
+    Top,
+    Bottom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PaneMouseKind {
     LeftDown,
     LeftDrag,
@@ -325,6 +337,8 @@ pub struct PaneRender {
     pub mouse_reporting: bool,
     #[serde(default)]
     pub application_cursor: bool,
+    #[serde(default)]
+    pub scrollback: u32,
     #[serde(default)]
     pub preview: String,
     #[serde(default)]

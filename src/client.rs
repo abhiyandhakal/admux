@@ -978,9 +978,10 @@ fn run_attach_loop(
                 .iter()
                 .find(|pane| pane.pane_id == copy.pane_id)
             {
-                copy.clamp_to(
+                copy.sync_viewport(
                     pane.rows_plain.len().max(1),
                     pane.rect.width.max(1) as usize,
+                    pane.scrollback,
                 );
             } else {
                 copy_mode = None;
@@ -1388,19 +1389,42 @@ fn run_attach_loop(
                         }
                         InputAction::CopyTop => {
                             if let Some(copy) = copy_mode.as_mut() {
-                                copy.move_top();
+                                let response = request_response(
+                                    paths,
+                                    CommandRequest::ScrollPaneTo {
+                                        session: current_session.clone(),
+                                        window_id: Some(snapshot.active_window_id),
+                                        pane_id: Some(copy.pane_id),
+                                        position: crate::ipc::ScrollbackPosition::Top,
+                                    },
+                                )?;
+                                if handle_interactive_response(response, &mut status_message) {
+                                    copy.move_top();
+                                    needs_refresh = true;
+                                }
                             }
                         }
                         InputAction::CopyBottom => {
-                            let rows = copy_mode.as_ref().and_then(|copy| {
-                                snapshot
-                                    .panes
-                                    .iter()
-                                    .find(|pane| pane.pane_id == copy.pane_id)
-                                    .map(|pane| pane.rows_plain.len().max(1))
-                            });
-                            if let (Some(copy), Some(rows)) = (copy_mode.as_mut(), rows) {
-                                copy.move_bottom(rows);
+                            if let Some(copy) = copy_mode.as_mut() {
+                                let response = request_response(
+                                    paths,
+                                    CommandRequest::ScrollPaneTo {
+                                        session: current_session.clone(),
+                                        window_id: Some(snapshot.active_window_id),
+                                        pane_id: Some(copy.pane_id),
+                                        position: crate::ipc::ScrollbackPosition::Bottom,
+                                    },
+                                )?;
+                                if handle_interactive_response(response, &mut status_message) {
+                                    let rows = snapshot
+                                        .panes
+                                        .iter()
+                                        .find(|pane| pane.pane_id == copy.pane_id)
+                                        .map(|pane| pane.rows_plain.len().max(1))
+                                        .unwrap_or(1);
+                                    copy.move_bottom(rows);
+                                    needs_refresh = true;
+                                }
                             }
                         }
                         InputAction::CopyPageUp => {
@@ -1417,7 +1441,7 @@ fn run_attach_loop(
                                             .map(|pane| pane.rect.height.max(1) as i16)
                                             .unwrap_or(10)
                                     });
-                                let _ = request_response(
+                                let response = request_response(
                                     paths,
                                     CommandRequest::ScrollPane {
                                         session: current_session.clone(),
@@ -1426,7 +1450,7 @@ fn run_attach_loop(
                                         lines: -page,
                                     },
                                 )?;
-                                needs_refresh = true;
+                                needs_refresh = handle_interactive_response(response, &mut status_message);
                             }
                         }
                         InputAction::CopyPageDown => {
@@ -1443,7 +1467,7 @@ fn run_attach_loop(
                                             .map(|pane| pane.rect.height.max(1) as i16)
                                             .unwrap_or(10)
                                     });
-                                let _ = request_response(
+                                let response = request_response(
                                     paths,
                                     CommandRequest::ScrollPane {
                                         session: current_session.clone(),
@@ -1452,7 +1476,7 @@ fn run_attach_loop(
                                         lines: page,
                                     },
                                 )?;
-                                needs_refresh = true;
+                                needs_refresh = handle_interactive_response(response, &mut status_message);
                             }
                         }
                         InputAction::CopyStartSelection => {
@@ -1462,18 +1486,19 @@ fn run_attach_loop(
                         }
                         InputAction::CopyYank => {
                             if let Some(copy) = copy_mode.take() {
-                                let selection =
-                                    copy.selection().unwrap_or_else(|| copy.cursor_selection());
+                                let selection = copy
+                                    .history_selection()
+                                    .unwrap_or_else(|| copy.cursor_history_selection());
                                 let copied = request_response(
                                     paths,
                                     CommandRequest::CopySelection {
                                         session: current_session.clone(),
                                         window_id: Some(snapshot.active_window_id),
                                         pane_id: Some(copy.pane_id),
-                                        start_row: selection.start_row,
-                                        start_col: selection.start_col,
-                                        end_row: selection.end_row,
-                                        end_col: selection.end_col,
+                                        start_from_bottom: selection.start.from_bottom,
+                                        start_col: selection.start.col,
+                                        end_from_bottom: selection.end.from_bottom,
+                                        end_col: selection.end.col,
                                     },
                                 )?;
                                 if let CommandResponse::SelectionCopied { text } = copied {
@@ -2816,9 +2841,10 @@ fn focused_pane(snapshot: &RenderSnapshot) -> Option<&PaneRender> {
 fn copy_mode_from_pane(pane: &PaneRender) -> CopyMode {
     let cursor = pane.cursor.clone().unwrap_or(PaneCursor { row: 0, col: 0 });
     let mut mode = CopyMode::new(pane.pane_id, cursor.row, cursor.col);
-    mode.clamp_to(
+    mode.sync_viewport(
         pane.rows_plain.len().max(1),
         pane.rect.width.max(1) as usize,
+        pane.scrollback,
     );
     mode
 }
@@ -3093,9 +3119,9 @@ fn handle_mouse_event(
                         session: session.to_string(),
                         window_id: Some(snapshot.active_window_id),
                         pane_id: Some(pane.pane_id),
-                        start_row: selection.start_row,
+                        start_from_bottom: pane_row_from_bottom(pane, selection.start_row),
                         start_col: selection.start_col,
-                        end_row: selection.end_row,
+                        end_from_bottom: pane_row_from_bottom(pane, selection.end_row),
                         end_col: selection.end_col,
                     },
                 )?;
@@ -3204,6 +3230,12 @@ fn pane_content_hit(
             None
         }
     })
+}
+
+fn pane_row_from_bottom(pane: &PaneRender, row: u16) -> u32 {
+    pane.scrollback.saturating_add(u32::from(
+        pane.rect.height.saturating_sub(1).saturating_sub(row),
+    ))
 }
 
 fn captured_pane_mouse_position(
@@ -3330,6 +3362,7 @@ fn fallback_snapshot(preview: String, width: u16, height: u16) -> RenderSnapshot
             helper_socket: None,
             mouse_reporting: false,
             application_cursor: false,
+            scrollback: 0,
             preview: preview.clone(),
             formatted_preview: preview.clone(),
             formatted_cursor: String::new(),

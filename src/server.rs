@@ -752,17 +752,17 @@ impl SessionStore {
                 session,
                 window_id,
                 pane_id,
-                start_row,
+                start_from_bottom,
                 start_col,
-                end_row,
+                end_from_bottom,
                 end_col,
             } => match self.sessions.get(&session) {
                 Some(session) => match session.pane_selection_text(
                         window_id,
                         pane_id,
-                        start_row,
+                        start_from_bottom,
                         start_col,
-                        end_row,
+                        end_from_bottom,
                         end_col,
                     ) {
                     Ok(text) => CommandResponse::SelectionCopied { text },
@@ -781,6 +781,22 @@ impl SessionStore {
                 lines,
             } => match self.sessions.get(&session) {
                 Some(session) => match session.scroll_pane(window_id, pane_id, lines) {
+                    Ok(_) => CommandResponse::Scrolled,
+                    Err(error) => CommandResponse::Error {
+                        message: error.to_string(),
+                    },
+                },
+                None => CommandResponse::Error {
+                    message: format!("unknown session {session}"),
+                },
+            },
+            CommandRequest::ScrollPaneTo {
+                session,
+                window_id,
+                pane_id,
+                position,
+            } => match self.sessions.get(&session) {
+                Some(session) => match session.scroll_pane_to(window_id, pane_id, position) {
                     Ok(_) => CommandResponse::Scrolled,
                     Err(error) => CommandResponse::Error {
                         message: error.to_string(),

@@ -28,7 +28,7 @@ const MAX_REPLAY_HISTORY_BYTES: usize = 64 * 1024 * 1024;
 const IPC_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_IPC_MESSAGE_BYTES: u64 = 1024 * 1024;
 const MAX_HELPER_CLIENTS: usize = 64;
-const HELPER_PROTOCOL_VERSION: u16 = 1;
+const HELPER_PROTOCOL_VERSION: u16 = 3;
 static HELPER_NAME_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct TerminalState {
@@ -70,6 +70,7 @@ pub struct PaneSnapshot {
     pub cursor_col: u16,
     pub screen_rows: u16,
     pub screen_cols: u16,
+    pub scrollback: u32,
     pub mouse_reporting: bool,
     pub application_cursor: bool,
     pub alive: bool,
@@ -118,9 +119,9 @@ enum PaneRequest {
     },
     ScreenSize,
     SelectionText {
-        start_row: u16,
+        start_from_bottom: u32,
         start_col: u16,
-        end_row: u16,
+        end_from_bottom: u32,
         end_col: u16,
     },
     Resize {
@@ -140,6 +141,8 @@ enum PaneRequest {
     Scrollback {
         lines: i16,
     },
+    ScrollbackTop,
+    ScrollbackBottom,
     SendKeys {
         keys: Vec<String>,
     },
@@ -184,6 +187,8 @@ struct PaneSnapshotWire {
     cursor_col: u16,
     screen_rows: u16,
     screen_cols: u16,
+    #[serde(default)]
+    scrollback: u32,
     mouse_reporting: bool,
     application_cursor: bool,
     alive: bool,
@@ -214,6 +219,7 @@ impl From<PaneSnapshotWire> for PaneSnapshot {
             cursor_col: value.cursor_col,
             screen_rows: value.screen_rows,
             screen_cols: value.screen_cols,
+            scrollback: value.scrollback,
             mouse_reporting: value.mouse_reporting,
             application_cursor: value.application_cursor,
             alive: value.alive,
@@ -354,15 +360,15 @@ impl PaneProcess {
 
     pub fn selection_text(
         &self,
-        start_row: u16,
+        start_from_bottom: u32,
         start_col: u16,
-        end_row: u16,
+        end_from_bottom: u32,
         end_col: u16,
     ) -> Result<String> {
         match self.request(PaneRequest::SelectionText {
-            start_row,
+            start_from_bottom,
             start_col,
-            end_row,
+            end_from_bottom,
             end_col,
         })? {
             PaneResponse::SelectionText { text } => Ok(text),
@@ -406,6 +412,22 @@ impl PaneProcess {
 
     pub fn scroll_scrollback_by(&self, lines: i16) -> Result<()> {
         match self.request(PaneRequest::Scrollback { lines })? {
+            PaneResponse::Ok => Ok(()),
+            PaneResponse::Error { message } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected scrollback response: {other:?}")),
+        }
+    }
+
+    pub fn scroll_scrollback_to_top(&self) -> Result<()> {
+        match self.request(PaneRequest::ScrollbackTop)? {
+            PaneResponse::Ok => Ok(()),
+            PaneResponse::Error { message } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected scrollback response: {other:?}")),
+        }
+    }
+
+    pub fn scroll_scrollback_to_bottom(&self) -> Result<()> {
+        match self.request(PaneRequest::ScrollbackBottom)? {
             PaneResponse::Ok => Ok(()),
             PaneResponse::Error { message } => Err(anyhow!(message)),
             other => Err(anyhow!("unexpected scrollback response: {other:?}")),
@@ -799,18 +821,22 @@ fn handle_helper_request(state: &Arc<HelperState>, request: PaneRequest) -> Pane
             PaneResponse::ScreenSize { rows, cols }
         }
         PaneRequest::SelectionText {
-            start_row,
+            start_from_bottom,
             start_col,
-            end_row,
+            end_from_bottom,
             end_col,
         } => PaneResponse::SelectionText {
-            text: state
-                .terminal
-                .lock()
-                .expect("pane helper terminal lock poisoned")
-                .parser
-                .screen()
-                .contents_between(start_row, start_col, end_row, end_col),
+            text: helper_history_selection_text(
+                &mut state
+                    .terminal
+                    .lock()
+                    .expect("pane helper terminal lock poisoned")
+                    .parser,
+                start_from_bottom,
+                start_col,
+                end_from_bottom,
+                end_col,
+            ),
         },
         PaneRequest::Resize { rows, cols } => match helper_resize(state, rows, cols) {
             Ok(()) => PaneResponse::Ok,
@@ -838,6 +864,26 @@ fn handle_helper_request(state: &Arc<HelperState>, request: PaneRequest) -> Pane
         }
         PaneRequest::Scrollback { lines } => {
             helper_scroll_scrollback(state, lines);
+            PaneResponse::Ok
+        }
+        PaneRequest::ScrollbackTop => {
+            state
+                .terminal
+                .lock()
+                .expect("pane helper terminal lock poisoned")
+                .parser
+                .screen_mut()
+                .set_scrollback(usize::MAX);
+            PaneResponse::Ok
+        }
+        PaneRequest::ScrollbackBottom => {
+            state
+                .terminal
+                .lock()
+                .expect("pane helper terminal lock poisoned")
+                .parser
+                .screen_mut()
+                .set_scrollback(0);
             PaneResponse::Ok
         }
         PaneRequest::SendKeys { keys } => match helper_send_keys(state, &keys) {
@@ -926,6 +972,7 @@ fn helper_snapshot(state: &Arc<HelperState>, width: u16, height: u16) -> Result<
         cursor_col,
         screen_rows,
         screen_cols,
+        scrollback: u32::try_from(screen.scrollback()).unwrap_or(u32::MAX),
         mouse_reporting,
         application_cursor,
         alive,
@@ -1125,6 +1172,54 @@ fn helper_scroll_scrollback(state: &Arc<HelperState>, lines: i16) {
         current.saturating_sub(lines as usize)
     };
     terminal.parser.screen_mut().set_scrollback(next);
+}
+
+fn helper_history_selection_text(
+    parser: &mut vt100::Parser,
+    start_from_bottom: u32,
+    start_col: u16,
+    end_from_bottom: u32,
+    end_col: u16,
+) -> String {
+    let (start_from_bottom, start_col, end_from_bottom, end_col) =
+        if (start_from_bottom, std::cmp::Reverse(start_col))
+            >= (end_from_bottom, std::cmp::Reverse(end_col))
+        {
+            (start_from_bottom, start_col, end_from_bottom, end_col)
+        } else {
+            (end_from_bottom, end_col, start_from_bottom, start_col)
+        };
+    let original_scrollback = parser.screen().scrollback();
+    let (rows, cols) = parser.screen().size();
+    if rows == 0 || cols == 0 {
+        return String::new();
+    }
+
+    let mut text = String::new();
+    for from_bottom in (end_from_bottom..=start_from_bottom).rev() {
+        parser.screen_mut().set_scrollback(from_bottom as usize);
+        let row_start = if from_bottom == start_from_bottom {
+            start_col.min(cols)
+        } else {
+            0
+        };
+        let row_end = if from_bottom == end_from_bottom {
+            end_col.saturating_add(1).min(cols)
+        } else {
+            cols
+        };
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&parser.screen().contents_between(
+            rows.saturating_sub(1),
+            row_start,
+            rows.saturating_sub(1),
+            row_end,
+        ));
+    }
+    parser.screen_mut().set_scrollback(original_scrollback);
+    text
 }
 
 fn helper_send_keys(state: &Arc<HelperState>, keys: &[String]) -> Result<()> {
@@ -1533,6 +1628,65 @@ mod tests {
         let error = PaneProcess::connect(socket).expect_err("incompatible helper must fail");
         assert!(error.to_string().contains("protocol mismatch"));
         server.join().expect("server thread");
+    }
+
+    #[test]
+    fn history_selection_spans_scrollback_and_restores_the_viewport() {
+        let mut parser = vt100::Parser::new(2, 20, 20);
+        parser.process(b"first\r\nsecond\r\nthird\r\nfourth");
+        parser.screen_mut().set_scrollback(1);
+        let original_scrollback = parser.screen().scrollback();
+        let (_, cols) = parser.screen().size();
+        let mut expected_rows = Vec::new();
+        for from_bottom in (0..=2).rev() {
+            parser.screen_mut().set_scrollback(from_bottom);
+            expected_rows.push(
+                parser
+                    .screen()
+                    .rows(0, cols)
+                    .last()
+                    .expect("bottom visible row"),
+            );
+        }
+        parser.screen_mut().set_scrollback(original_scrollback);
+
+        let selection = helper_history_selection_text(&mut parser, 2, 0, 0, cols - 1);
+
+        assert_eq!(selection, expected_rows.join("\n"));
+        assert_eq!(parser.screen().scrollback(), original_scrollback);
+    }
+
+    #[test]
+    fn pane_process_can_move_to_scrollback_bounds() {
+        let dir = helper_dir();
+        let pane = PaneProcess::spawn(
+            &[
+                "sh".into(),
+                "-lc".into(),
+                "sleep 0.1; printf 'one\\ntwo\\nthree\\nfour\\n'; sleep 1".into(),
+            ],
+            None,
+            None,
+            None,
+            100,
+            dir.path(),
+            None,
+        )
+        .expect("spawn pane");
+        pane.resize(2, 20).expect("shrink pane");
+        let _ = wait_for_preview(&pane, "four");
+
+        pane.scroll_scrollback_to_top()
+            .expect("scroll to top of history");
+        let top = pane.render(20, 2).expect("render top history");
+        assert!(top.scrollback > 0);
+
+        pane.scroll_scrollback_to_bottom()
+            .expect("scroll to bottom of history");
+        let bottom = pane.render(20, 2).expect("render live screen");
+        assert_eq!(bottom.scrollback, 0);
+        assert!(bottom.preview.contains("four"));
+        pane.kill().expect("clean up pane");
     }
 
     #[test]
