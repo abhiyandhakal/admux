@@ -931,6 +931,7 @@ fn run_attach_loop(
         }
 
         let mut needs_refresh = false;
+        let mut refresh_before_next_input = false;
         match read_attach_event(&mut pending_event, event_logger.as_deref_mut())? {
             Event::Key(key) => {
                 let current_overlay = std::mem::replace(&mut overlay, OverlayState::None);
@@ -1001,6 +1002,7 @@ fn run_attach_loop(
                     OverlayState::None => {
                         let mode_before = state.mode;
                         let action = state.handle_key(key);
+                        refresh_before_next_input = action_changes_input_target(&action);
                         if let Some(logger) = event_logger.as_deref_mut() {
                             logger.log_line(&format!(
                                 "handled: key={key:?} mode_before={mode_before:?} mode_after={:?} action={action:?}",
@@ -1371,7 +1373,7 @@ fn run_attach_loop(
 
         if needs_refresh {
             snapshot_dirty = true;
-            if last_snapshot_refresh.elapsed() >= ATTACH_FRAME_INTERVAL {
+            if refresh_before_next_input || last_snapshot_refresh.elapsed() >= ATTACH_FRAME_INTERVAL {
                 snapshot = fetch_attach_snapshot(
                     paths,
                     &mut current_session,
@@ -1385,6 +1387,19 @@ fn run_attach_loop(
         }
     }
     Ok(())
+}
+
+fn action_changes_input_target(action: &InputAction) -> bool {
+    matches!(
+        action,
+        InputAction::SplitPane(_)
+            | InputAction::SelectWindowIndex(_)
+            | InputAction::NewWindow
+            | InputAction::NextWindow
+            | InputAction::PrevWindow
+            | InputAction::FocusPane(_)
+            | InputAction::KillPane
+    )
 }
 
 fn read_attach_event(
@@ -3177,6 +3192,20 @@ root = { command = ["sh"] }
             prompt_overlay_command(&InteractiveCommand::DetachClient),
             Some(PromptResult::Detach)
         );
+    }
+
+    #[test]
+    fn focus_and_window_actions_refresh_before_following_input() {
+        assert!(action_changes_input_target(&InputAction::FocusPane(
+            NavigationDirection::Right
+        )));
+        assert!(action_changes_input_target(&InputAction::NextWindow));
+        assert!(action_changes_input_target(&InputAction::SplitPane(SplitAxis::Horizontal)));
+        assert!(!action_changes_input_target(&InputAction::SendBytes(vec![b'x'])));
+        assert!(!action_changes_input_target(&InputAction::ResizePane(
+            NavigationDirection::Right,
+            1,
+        )));
     }
 
     #[test]
