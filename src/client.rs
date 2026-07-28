@@ -529,7 +529,7 @@ fn with_connection<T>(
 ) -> Result<T> {
     match UnixStream::connect(&paths.socket_path) {
         Ok(mut stream) => f(&mut stream),
-        Err(_) => {
+        Err(error) if should_autostart_daemon(&error) => {
             spawn_daemon(paths)?;
             let deadline = Instant::now() + Duration::from_secs(3);
             loop {
@@ -550,7 +550,20 @@ fn with_connection<T>(
                 }
             }
         }
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to connect to admuxd at {}; not attempting autostart",
+                paths.socket_path.display()
+            )
+        }),
     }
+}
+
+fn should_autostart_daemon(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+    )
 }
 
 fn spawn_daemon(paths: &RuntimePaths) -> Result<()> {
@@ -3469,6 +3482,22 @@ root = { command = ["sh"] }
         let rendered = format!("{error:#}");
         assert!(rendered.contains("protocol mismatch"));
         assert!(rendered.contains("restart admuxd"));
+    }
+
+    #[test]
+    fn daemon_autostart_is_limited_to_missing_or_refused_sockets() {
+        assert!(should_autostart_daemon(&std::io::Error::from(
+            std::io::ErrorKind::NotFound,
+        )));
+        assert!(should_autostart_daemon(&std::io::Error::from(
+            std::io::ErrorKind::ConnectionRefused,
+        )));
+        assert!(!should_autostart_daemon(&std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied,
+        )));
+        assert!(!should_autostart_daemon(&std::io::Error::from(
+            std::io::ErrorKind::InvalidInput,
+        )));
     }
 
     #[test]
