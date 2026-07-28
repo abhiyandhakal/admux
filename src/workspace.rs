@@ -10,6 +10,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
+use toml_edit::{DocumentMut, Item, Table, Value};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -277,7 +278,7 @@ pub fn save_workspace(session: &Session, snapshot_lines: usize) -> Result<PathBu
     let path = session_dir.join("admux.toml");
     let mut snapshot = export_snapshot(session, &path, "", snapshot_lines)?;
     let manifest = export_workspace(session)?;
-    let raw = toml::to_string_pretty(&manifest).context("failed to encode workspace manifest")?;
+    let raw = merge_workspace_manifest(&path, &manifest)?;
     snapshot.manifest_digest = manifest_digest(&raw);
     let snapshot_path = prepare_snapshot_sidecar(&path)?;
     let manifest_tmp = stage_workspace_file(&path, raw.as_bytes())?;
@@ -296,6 +297,213 @@ pub fn save_workspace(session: &Session, snapshot_lines: usize) -> Result<PathBu
     }
     commit_workspace_file(&manifest_tmp, &path)?;
     Ok(path)
+}
+
+fn merge_workspace_manifest(path: &Path, manifest: &WorkspaceManifestOut) -> Result<String> {
+    let generated_raw =
+        toml::to_string_pretty(manifest).context("failed to encode workspace manifest")?;
+    let Ok(existing_raw) = fs::read_to_string(path) else {
+        return Ok(generated_raw);
+    };
+    let mut existing = existing_raw
+        .parse::<DocumentMut>()
+        .with_context(|| format!("failed to parse existing workspace manifest {}", path.display()))?;
+    let generated = generated_raw
+        .parse::<DocumentMut>()
+        .context("failed to parse generated workspace manifest")?;
+
+    merge_manifest_table(existing.as_table_mut(), generated.as_table());
+    Ok(existing.to_string())
+}
+
+fn merge_manifest_table(existing: &mut Table, generated: &Table) {
+    merge_known_table_item(existing, generated, "version");
+    merge_workspace_table(existing, generated);
+    merge_windows(existing, generated);
+}
+
+fn merge_workspace_table(existing: &mut Table, generated: &Table) {
+    let Some(generated_workspace) = generated.get("workspace") else {
+        existing.remove("workspace");
+        return;
+    };
+    let Some(generated_workspace) = generated_workspace.as_table() else {
+        existing.insert("workspace", generated_workspace.clone());
+        return;
+    };
+    match existing.get_mut("workspace").and_then(Item::as_table_mut) {
+        Some(existing_workspace) => {
+            for key in ["name", "cwd", "active_window"] {
+                merge_known_table_item(existing_workspace, generated_workspace, key);
+            }
+        }
+        None => {
+            existing.insert("workspace", Item::Table(generated_workspace.clone()));
+        }
+    }
+}
+
+fn merge_windows(existing: &mut Table, generated: &Table) {
+    let Some(generated_windows) = generated
+        .get("windows")
+        .and_then(Item::as_array_of_tables)
+    else {
+        existing.remove("windows");
+        return;
+    };
+    let Some(existing_windows) = existing
+        .get_mut("windows")
+        .and_then(Item::as_array_of_tables_mut)
+    else {
+        existing.insert("windows", Item::ArrayOfTables(generated_windows.clone()));
+        return;
+    };
+
+    for index in 0..existing_windows.len().min(generated_windows.len()) {
+        let existing_window = existing_windows.get_mut(index).expect("window index exists");
+        let generated_window = generated_windows.get(index).expect("window index exists");
+        merge_window_table(existing_window, generated_window);
+    }
+    while existing_windows.len() > generated_windows.len() {
+        existing_windows.remove(existing_windows.len() - 1);
+    }
+    for index in existing_windows.len()..generated_windows.len() {
+        existing_windows.push(generated_windows.get(index).expect("window index exists").clone());
+    }
+}
+
+fn merge_window_table(existing: &mut Table, generated: &Table) {
+    for key in ["name", "cwd", "active_pane"] {
+        merge_known_table_item(existing, generated, key);
+    }
+    merge_pane_spec(existing, generated, "root");
+    merge_splits(existing, generated);
+}
+
+fn merge_splits(existing: &mut Table, generated: &Table) {
+    let Some(generated_splits) = generated
+        .get("splits")
+        .and_then(Item::as_array_of_tables)
+    else {
+        existing.remove("splits");
+        return;
+    };
+    let Some(existing_splits) = existing
+        .get_mut("splits")
+        .and_then(Item::as_array_of_tables_mut)
+    else {
+        existing.insert("splits", Item::ArrayOfTables(generated_splits.clone()));
+        return;
+    };
+    for index in 0..existing_splits.len().min(generated_splits.len()) {
+        let existing_split = existing_splits.get_mut(index).expect("split index exists");
+        let generated_split = generated_splits.get(index).expect("split index exists");
+        for key in ["target", "direction", "size", "cwd", "command"] {
+            merge_known_table_item(existing_split, generated_split, key);
+        }
+    }
+    while existing_splits.len() > generated_splits.len() {
+        existing_splits.remove(existing_splits.len() - 1);
+    }
+    for index in existing_splits.len()..generated_splits.len() {
+        existing_splits.push(generated_splits.get(index).expect("split index exists").clone());
+    }
+}
+
+fn merge_pane_spec(existing: &mut Table, generated: &Table, key: &str) {
+    let Some(generated_item) = generated.get(key) else {
+        existing.remove(key);
+        return;
+    };
+    if let Some(generated_table) = generated_item.as_table() {
+        match existing.get_mut(key) {
+            Some(existing_item) => {
+                if let Some(existing_table) = existing_item.as_table_mut() {
+                    for field in ["cwd", "command"] {
+                        merge_known_table_item(existing_table, generated_table, field);
+                    }
+                } else if let Some(existing_inline) = existing_item
+                    .as_value_mut()
+                    .and_then(Value::as_inline_table_mut)
+                {
+                    for field in ["cwd", "command"] {
+                        match generated_table.get(field).and_then(Item::as_value) {
+                            Some(generated_value) => match existing_inline.get_mut(field) {
+                                Some(existing_value) => {
+                                    replace_value_preserving_decor(existing_value, generated_value);
+                                }
+                                None => {
+                                    existing_inline.insert(field, generated_value.clone());
+                                }
+                            },
+                            None => {
+                                existing_inline.remove(field);
+                            }
+                        }
+                    }
+                } else {
+                    *existing_item = generated_item.clone();
+                }
+            }
+            None => {
+                existing.insert(key, generated_item.clone());
+            }
+        }
+        return;
+    }
+    let Some(generated_inline) = generated_item
+        .as_value()
+        .and_then(Value::as_inline_table)
+    else {
+        existing.insert(key, generated_item.clone());
+        return;
+    };
+    let Some(existing_inline) = existing
+        .get_mut(key)
+        .and_then(Item::as_value_mut)
+        .and_then(Value::as_inline_table_mut)
+    else {
+        existing.insert(key, generated_item.clone());
+        return;
+    };
+    for field in ["cwd", "command"] {
+        match generated_inline.get(field) {
+            Some(generated_value) => match existing_inline.get_mut(field) {
+                Some(existing_value) => replace_value_preserving_decor(existing_value, generated_value),
+                None => {
+                    existing_inline.insert(field, generated_value.clone());
+                }
+            },
+            None => {
+                existing_inline.remove(field);
+            }
+        }
+    }
+}
+
+fn merge_known_table_item(existing: &mut Table, generated: &Table, key: &str) {
+    match generated.get(key) {
+        Some(generated_item) => match existing.get_mut(key) {
+            Some(existing_item) => match (existing_item.as_value_mut(), generated_item.as_value()) {
+                (Some(existing_value), Some(generated_value)) => {
+                    replace_value_preserving_decor(existing_value, generated_value);
+                }
+                _ => *existing_item = generated_item.clone(),
+            },
+            None => {
+                existing.insert(key, generated_item.clone());
+            }
+        },
+        None => {
+            existing.remove(key);
+        }
+    }
+}
+
+fn replace_value_preserving_decor(existing: &mut Value, generated: &Value) {
+    let decor = existing.decor().clone();
+    *existing = generated.clone();
+    *existing.decor_mut() = decor;
 }
 
 fn resolve_workspace(
@@ -1217,6 +1425,77 @@ command = ["cargo", "test"]
         assert!(invalid.to_string().contains("invalid dimensions"));
 
         let _ = session.kill();
+    }
+
+    #[test]
+    fn save_preserves_existing_comments_formatting_and_unknown_manifest_fields() {
+        let dir = tempdir();
+        let session_dir = dir.path().join("project");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        let manifest_path = session_dir.join("admux.toml");
+        fs::write(
+            &manifest_path,
+            r#"# retained document comment
+version = 1 # retained version comment
+custom_root = "keep-root"
+
+[workspace]
+# retained workspace comment
+name = "old-name" # retained workspace value comment
+custom_workspace = "keep-workspace"
+
+[[windows]]
+# retained window comment
+name = "old-window"
+custom_window = "keep-window"
+root = { command = ["old"], custom_root_pane = "keep-pane" }
+"#,
+        )
+        .expect("write existing manifest");
+        let session = Session::new(
+            "workspace".into(),
+            None,
+            Some(session_dir),
+            vec!["sh".into()],
+            WindowId(1),
+            None,
+            10_000,
+            Numbering {
+                window_base: 0,
+                pane_base: 0,
+            },
+            WindowDefaults::default(),
+            dir.path().join("helpers"),
+        )
+        .expect("session");
+
+        let saved_path = save_workspace(&session, 500).expect("save workspace");
+        assert_eq!(saved_path, manifest_path);
+        let saved = fs::read_to_string(&saved_path).expect("read saved manifest");
+        for retained in [
+            "# retained document comment",
+            "version = 1 # retained version comment",
+            "custom_root = \"keep-root\"",
+            "# retained workspace comment",
+            "custom_workspace = \"keep-workspace\"",
+            "# retained window comment",
+            "custom_window = \"keep-window\"",
+            "custom_root_pane = \"keep-pane\"",
+        ] {
+            assert!(saved.contains(retained), "missing retained manifest content: {retained}");
+        }
+        let parsed: toml::Value = toml::from_str(&saved).expect("saved manifest stays valid TOML");
+        assert_eq!(parsed["custom_root"].as_str(), Some("keep-root"));
+        assert_eq!(
+            parsed["workspace"]["custom_workspace"].as_str(),
+            Some("keep-workspace")
+        );
+        assert_eq!(
+            parsed["windows"][0]["root"]["custom_root_pane"].as_str(),
+            Some("keep-pane")
+        );
+
+        session.kill().expect("clean up session");
     }
 
     #[test]
