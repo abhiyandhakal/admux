@@ -2688,7 +2688,7 @@ fn handle_mouse_event(
             } else {
                 crate::ipc::ScrollDirection::Down
             };
-            let _ = request_response(
+            let response = request_response(
                 paths,
                 CommandRequest::MouseScroll {
                     session: session.to_string(),
@@ -2697,6 +2697,9 @@ fn handle_mouse_event(
                     direction,
                 },
             )?;
+            if !handle_interactive_response(response, status_message) {
+                return Ok(true);
+            }
         }
         _ => {}
     }

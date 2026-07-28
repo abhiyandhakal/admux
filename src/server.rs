@@ -607,16 +607,21 @@ impl SessionStore {
                 direction,
             } => match self.sessions.get(&session) {
                 Some(session) => {
-                    let pane_id = session
+                    let pane = session
                         .render_snapshot(session.pane_area())
                         .and_then(|snapshot| {
                             snapshot
                                 .panes
                                 .into_iter()
                                 .find(|pane| pane.rect.contains(row, col))
-                        })
-                        .map(|pane| PaneId(pane.pane_id));
-                    match session.handle_mouse_scroll(pane_id, direction, row, col) {
+                        });
+                    let Some(pane) = pane else {
+                        return CommandResponse::Error {
+                            message: "mouse wheel event is outside all panes".into(),
+                        };
+                    };
+                    let (pane_id, local_row, local_col) = pane_local_mouse_coordinates(&pane, row, col);
+                    match session.handle_mouse_scroll(Some(pane_id), direction, local_row, local_col) {
                         Ok(_) => CommandResponse::Scrolled,
                         Err(error) => CommandResponse::Error {
                             message: error.to_string(),
@@ -1544,6 +1549,18 @@ fn configure_ipc_stream(stream: &UnixStream) -> Result<()> {
     Ok(())
 }
 
+fn pane_local_mouse_coordinates(
+    pane: &crate::ipc::PaneRender,
+    row: u16,
+    col: u16,
+) -> (PaneId, u16, u16) {
+    (
+        PaneId(pane.pane_id),
+        row.saturating_sub(pane.rect.y),
+        col.saturating_sub(pane.rect.x),
+    )
+}
+
 fn read_limited(stream: &mut UnixStream, limit: u64, kind: &str) -> Result<Vec<u8>> {
     let mut payload = Vec::new();
     (&mut *stream)
@@ -1599,6 +1616,30 @@ mod tests {
         assert!(acquire_daemon_lock(&socket).is_err());
         drop(first);
         assert!(acquire_daemon_lock(&socket).is_ok());
+    }
+
+    #[test]
+    fn wheel_coordinates_are_converted_to_pane_local_cells() {
+        let pane = crate::ipc::PaneRender {
+            pane_id: 7,
+            title: "pane".into(),
+            rect: crate::pane::Rect {
+                x: 30,
+                y: 12,
+                width: 20,
+                height: 8,
+            },
+            focused: false,
+            helper_socket: None,
+            mouse_reporting: true,
+            rows_plain: Vec::new(),
+            rows_formatted: Vec::new(),
+            cursor: None,
+        };
+        assert_eq!(
+            pane_local_mouse_coordinates(&pane, 15, 35),
+            (PaneId(7), 3, 5)
+        );
     }
 
     #[test]
