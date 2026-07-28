@@ -789,7 +789,7 @@ fn handle_helper_request(state: &Arc<HelperState>, request: PaneRequest) -> Pane
             let shutdown = match child.try_wait() {
                 Ok(Some(_)) => Ok(()),
                 Ok(None) => match child.kill() {
-                    Ok(()) => Ok(()),
+                    Ok(()) => child.wait().map(|_| ()),
                     Err(kill_error) => match child.try_wait() {
                         Ok(Some(_)) => Ok(()),
                         _ => Err(kill_error),
