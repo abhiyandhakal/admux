@@ -3164,6 +3164,9 @@ fn handle_mouse_event(
             if !config.mouse.wheel_scroll {
                 return Ok(false);
             }
+            let Some((pane, row, col)) = pane_content_hit(snapshot, mouse.row, mouse.column) else {
+                return Ok(false);
+            };
             let direction = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
                 crate::ipc::ScrollDirection::Up
             } else {
@@ -3173,8 +3176,10 @@ fn handle_mouse_event(
                 paths,
                 CommandRequest::MouseScroll {
                     session: session.to_string(),
-                    row: mouse.row,
-                    col: mouse.column,
+                    window_id: snapshot.active_window_id,
+                    pane_id: pane.pane_id,
+                    row,
+                    col,
                     direction,
                 },
             )?;

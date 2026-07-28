@@ -577,15 +577,14 @@ impl Session {
 
     pub fn handle_mouse_scroll(
         &self,
-        pane_id: Option<PaneId>,
+        window_id: Option<u64>,
+        pane_id: Option<u64>,
         direction: ScrollDirection,
         row: u16,
         col: u16,
     ) -> Result<()> {
-        let window = self
-            .active_window()
-            .ok_or_else(|| anyhow!("unknown window"))?;
-        let pane_id = pane_id.unwrap_or(window.layout.active);
+        let window = self.window_for_public_id(window_id)?;
+        let pane_id = self.pane_id_from_public(pane_id, window.layout.active)?;
         let pane = window
             .panes
             .get(&pane_id)
@@ -1530,6 +1529,46 @@ mod tests {
         assert!(error.to_string().contains("failed to connect pane helper"));
 
         fs::rename(&hidden_socket, &target_socket).expect("restore target helper socket");
+        session.kill().expect("clean up session");
+    }
+
+    #[test]
+    fn mouse_scroll_resolves_public_window_and_pane_ids() {
+        let helper_dir = tempdir();
+        let session = Session::new(
+            "work".into(),
+            None,
+            None,
+            vec!["sh".into()],
+            WindowId(1),
+            None,
+            10_000,
+            Numbering {
+                window_base: 1,
+                pane_base: 10,
+            },
+            WindowDefaults::default(),
+            helper_dir.path().to_path_buf(),
+        )
+        .expect("create session");
+        let socket = session
+            .active_window()
+            .expect("active window")
+            .panes
+            .get(&PaneId(0))
+            .expect("root pane")
+            .process
+            .socket_path()
+            .to_path_buf();
+        let hidden_socket = socket.with_extension("hidden");
+        fs::rename(&socket, &hidden_socket).expect("hide root helper socket");
+
+        let error = session
+            .handle_mouse_scroll(Some(1), Some(10), ScrollDirection::Up, 3, 5)
+            .expect_err("public pane number must resolve to the root helper");
+        assert!(error.to_string().contains("failed to connect pane helper"));
+
+        fs::rename(&hidden_socket, &socket).expect("restore root helper socket");
         session.kill().expect("clean up session");
     }
 

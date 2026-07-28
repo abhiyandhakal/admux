@@ -11,7 +11,7 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtocolVersion(pub u16);
 
-pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(8);
+pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(9);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientViewport {
@@ -132,6 +132,8 @@ pub enum CommandRequest {
     },
     MouseScroll {
         session: String,
+        window_id: u64,
+        pane_id: u64,
         row: u16,
         col: u16,
         direction: ScrollDirection,
