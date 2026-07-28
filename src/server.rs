@@ -14,6 +14,7 @@ use std::{
 const IPC_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_IPC_MESSAGE_BYTES: u64 = 1024 * 1024;
 const MAX_SESSION_NAME_BYTES: usize = 64;
+const MAX_WINDOW_NAME_BYTES: usize = 128;
 
 use anyhow::{Context, Result, bail};
 
@@ -109,6 +110,19 @@ fn validate_session_name(name: &str) -> Result<()> {
     }
     if name.chars().any(char::is_control) {
         bail!("session name cannot contain control characters");
+    }
+    Ok(())
+}
+
+fn validate_window_name(name: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        bail!("window name cannot be empty");
+    }
+    if name.len() > MAX_WINDOW_NAME_BYTES {
+        bail!("window name exceeds {MAX_WINDOW_NAME_BYTES} bytes");
+    }
+    if name.chars().any(char::is_control) {
+        bail!("window name cannot contain control characters");
     }
     Ok(())
 }
@@ -523,6 +537,13 @@ impl SessionStore {
                 name,
                 command,
             } => {
+                if let Some(name) = name.as_deref()
+                    && let Err(error) = validate_window_name(name)
+                {
+                    return CommandResponse::Error {
+                        message: error.to_string(),
+                    };
+                }
                 if !self.sessions.contains_key(&session) {
                     CommandResponse::Error {
                         message: format!("unknown session {session}"),
@@ -1044,6 +1065,11 @@ impl SessionStore {
     }
 
     fn rename_window(&mut self, target: TargetRef, name: String) -> CommandResponse {
+        if let Err(error) = validate_window_name(&name) {
+            return CommandResponse::Error {
+                message: error.to_string(),
+            };
+        }
         match self.sessions.get_mut(&target.session) {
             Some(session) => {
                 if let Some(window_id) = target.window {
@@ -2100,6 +2126,42 @@ mod tests {
                 }]
             }
         );
+    }
+
+    #[test]
+    fn window_names_reject_empty_control_and_overlong_values() {
+        let mut store = SessionStore::default();
+        let _ = store.handle(CommandRequest::NewSession {
+            name: Some("work".into()),
+            cwd: None,
+            command: vec!["sh".into()],
+            switch_from: None,
+        });
+
+        for name in [String::new(), "line\nbreak".into(), "x".repeat(MAX_WINDOW_NAME_BYTES + 1)] {
+            assert!(matches!(
+                store.handle(CommandRequest::RenameWindow {
+                    target: "work:1".into(),
+                    name,
+                }),
+                CommandResponse::Error { .. }
+            ));
+        }
+        assert!(matches!(
+            store.handle(CommandRequest::NewWindow {
+                session: "work".into(),
+                name: Some("\u{1b}[2J".into()),
+                command: vec!["sh".into()],
+            }),
+            CommandResponse::Error { .. }
+        ));
+        assert_eq!(store.next_window_id, 1, "invalid names must not consume IDs");
+        store
+            .sessions
+            .get("work")
+            .expect("work session")
+            .kill()
+            .expect("clean up session");
     }
 
     #[test]
