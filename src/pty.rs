@@ -488,7 +488,6 @@ pub fn run_helper(args: PaneHelperArgs) -> Result<()> {
         })?;
     }
 
-    let state = Arc::new(start_helper_state(&args)?);
     let listener = UnixListener::bind(&args.socket).with_context(|| {
         format!(
             "failed to bind pane helper socket {}",
@@ -501,6 +500,13 @@ pub fn run_helper(args: PaneHelperArgs) -> Result<()> {
             args.socket.display()
         )
     })?;
+    let state = match start_helper_state(&args) {
+        Ok(state) => Arc::new(state),
+        Err(error) => {
+            let _ = fs::remove_file(&args.socket);
+            return Err(error);
+        }
+    };
 
     for stream in listener.incoming() {
         let Ok(mut stream) = stream else {
@@ -1264,6 +1270,27 @@ mod tests {
             command: Vec::new(),
         };
         assert!(PanePersistentSnapshot::try_from(invalid_utf8).is_err());
+    }
+
+    #[test]
+    fn helper_startup_failure_removes_its_prebound_socket() {
+        let dir = helper_dir();
+        let socket = dir.path().join("helper.sock");
+        let error = run_helper(PaneHelperArgs {
+            socket: socket.clone(),
+            cwd: None,
+            session_name: None,
+            window_id: None,
+            pane_id: None,
+            default_shell: None,
+            scrollback_lines: 10_000,
+            command: vec!["/definitely/not/an-admux-command".into()],
+            restore_seed: None,
+        })
+        .expect_err("invalid command should fail helper startup");
+
+        assert!(error.to_string().contains("failed to spawn pane command"));
+        assert!(!socket.exists(), "failed helper startup must remove its socket");
     }
 
     fn wait_for_preview(pane: &PaneProcess, needle: &str) -> String {
