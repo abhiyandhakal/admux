@@ -291,21 +291,7 @@ impl Session {
             .filter_map(|pane_id| {
                 let pane = window.panes.get(&pane_id)?;
                 let rect = *rects.get(&pane_id)?;
-                let render = pane.process.render(rect.width, rect.height).ok()?;
-                let cursor = clamp_cursor(rect, render.cursor_row, render.cursor_col);
-
-                Some(PaneRender {
-                    pane_id: self.numbering.public_pane_number(pane.id).ok()?,
-                    title: pane.title.clone(),
-                    rect,
-                    focused: pane_id == window.layout.active,
-                    helper_socket: Some(pane.process.socket_path().to_path_buf()),
-                    mouse_reporting: render.mouse_reporting,
-                    application_cursor: render.application_cursor,
-                    rows_plain: render.rows_plain,
-                    rows_formatted: render.rows_formatted,
-                    cursor,
-                })
+                self.render_pane(pane, rect, pane_id == window.layout.active)
             })
             .collect();
 
@@ -350,20 +336,11 @@ impl Session {
             for pane_id in window.layout.panes() {
                 let pane = window.panes.get(&pane_id)?;
                 let rect = *rects.get(&pane_id)?;
-                let render = pane.process.render(rect.width, rect.height).ok()?;
-                let cursor = clamp_cursor(rect, render.cursor_row, render.cursor_col);
-                panes.push(PaneRender {
-                    pane_id: self.numbering.public_pane_number(pane.id).ok()?,
-                    title: pane.title.clone(),
+                panes.push(self.render_pane(
+                    pane,
                     rect,
-                    focused: pane_id == window.layout.active && *window_id == self.active_window,
-                    helper_socket: Some(pane.process.socket_path().to_path_buf()),
-                    mouse_reporting: render.mouse_reporting,
-                    application_cursor: render.application_cursor,
-                    rows_plain: render.rows_plain,
-                    rows_formatted: render.rows_formatted,
-                    cursor,
-                });
+                    pane_id == window.layout.active && *window_id == self.active_window,
+                )?);
             }
             dividers.extend(window.layout.divider_cells(window_rect));
             offset_y = offset_y.saturating_add(window_height);
@@ -383,6 +360,37 @@ impl Session {
                 .and_then(|window| self.numbering.public_pane_number(window.layout.active).ok())
                 .unwrap_or(0),
         })
+    }
+
+    fn render_pane(&self, pane: &PaneRuntime, rect: Rect, focused: bool) -> Option<PaneRender> {
+        let pane_id = self.numbering.public_pane_number(pane.id).ok()?;
+        let helper_socket = Some(pane.process.socket_path().to_path_buf());
+        match pane.process.render(rect.width, rect.height) {
+            Ok(render) => Some(PaneRender {
+                pane_id,
+                title: pane.title.clone(),
+                rect,
+                focused,
+                helper_socket,
+                mouse_reporting: render.mouse_reporting,
+                application_cursor: render.application_cursor,
+                rows_plain: render.rows_plain,
+                rows_formatted: render.rows_formatted,
+                cursor: clamp_cursor(rect, render.cursor_row, render.cursor_col),
+            }),
+            Err(_) => Some(PaneRender {
+                pane_id,
+                title: format!("{} (unavailable)", pane.title),
+                rect,
+                focused,
+                helper_socket,
+                mouse_reporting: false,
+                application_cursor: false,
+                rows_plain: vec!["[admux: pane helper unavailable]".into()],
+                rows_formatted: vec!["[admux: pane helper unavailable]".into()],
+                cursor: None,
+            }),
+        }
     }
 
     pub fn list_windows(&self) -> Vec<WindowSummary> {
@@ -1071,7 +1079,7 @@ fn clamp_cursor(content: Rect, row: u16, col: u16) -> Option<PaneCursor> {
 mod tests {
     use super::*;
     use crate::numbering::Numbering;
-    use std::{thread, time::Duration};
+    use std::{fs, thread, time::Duration};
     use tempfile::{TempDir, tempdir as make_tempdir};
 
     fn tempdir() -> TempDir {
@@ -1127,6 +1135,56 @@ mod tests {
 
         assert_eq!(cursor.row, 4);
         assert_eq!(cursor.col, 9);
+    }
+
+    #[test]
+    fn render_snapshot_keeps_a_placeholder_for_an_unreachable_helper() {
+        let helper_dir = tempdir();
+        let session = Session::new(
+            "work".into(),
+            None,
+            None,
+            vec!["sh".into()],
+            WindowId(1),
+            None,
+            10_000,
+            Numbering {
+                window_base: 0,
+                pane_base: 0,
+            },
+            WindowDefaults::default(),
+            helper_dir.path().to_path_buf(),
+        )
+        .expect("create session");
+        let pane = session
+            .windows
+            .get(&WindowId(1))
+            .expect("window")
+            .panes
+            .get(&PaneId(0))
+            .expect("pane");
+        let socket = pane.process.socket_path().to_path_buf();
+        let hidden = socket.with_extension("hidden");
+        fs::rename(&socket, &hidden).expect("hide helper socket");
+
+        let snapshot = session
+            .render_snapshot(Rect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 23,
+            })
+            .expect("render snapshot");
+        assert_eq!(snapshot.panes.len(), 1);
+        assert!(snapshot.panes[0].focused);
+        assert!(snapshot.panes[0].title.ends_with("(unavailable)"));
+        assert_eq!(
+            snapshot.panes[0].rows_plain,
+            vec!["[admux: pane helper unavailable]"]
+        );
+
+        fs::rename(&hidden, &socket).expect("restore helper socket");
+        session.kill().expect("clean up pane");
     }
 
     #[test]
