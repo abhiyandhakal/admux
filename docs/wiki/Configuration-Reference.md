@@ -15,6 +15,7 @@ Global config lives at:
 - `[ui.dividers]`
 - `[ui.theme.*]`
 - `[mouse]`
+- `[clipboard]`
 - `[behavior]`
 - `[defaults.session]`
 - `[defaults.window]`
@@ -41,6 +42,12 @@ focus_on_click = true
 selection_copy = true
 border_resize = true
 wheel_scroll = true
+
+[clipboard]
+# The default is "osc52". For a local clipboard integration, configure an
+# explicit command that accepts copied text on stdin.
+backend = "external-command"
+command = ["wl-copy", "--type", "text/plain"]
 
 [behavior]
 default_shell = "/bin/zsh"

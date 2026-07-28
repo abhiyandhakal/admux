@@ -34,6 +34,7 @@ use crate::{
         is_reserved_top_level_name,
     },
     commands::{InteractiveCommand, complete as complete_commands, parse as parse_command},
+    clipboard::{ClipboardBackend, ClipboardConfig},
     config::{Config, ResolvedConfig, StatusPosition},
     copy_mode::{CopyMode, Selection},
     input::{InputAction, InputMode, InputState},
@@ -1449,7 +1450,12 @@ fn run_attach_loop(
                                 )?;
                                 if let CommandResponse::SelectionCopied { text } = copied {
                                     status_message =
-                                        copy_text_to_buffer_and_clipboard(paths, stdout, &text)?;
+                                        copy_text_to_buffer_and_clipboard(
+                                            paths,
+                                            stdout,
+                                            &text,
+                                            &config.clipboard,
+                                        )?;
                                 }
                                 needs_refresh = true;
                             }
@@ -3045,7 +3051,12 @@ fn handle_mouse_event(
                     },
                 )?;
                 if let CommandResponse::SelectionCopied { text } = copied {
-                    *status_message = copy_text_to_buffer_and_clipboard(paths, stdout, &text)?;
+                    *status_message = copy_text_to_buffer_and_clipboard(
+                        paths,
+                        stdout,
+                        &text,
+                        &config.clipboard,
+                    )?;
                 }
             }
             *active_selection = None;
@@ -3335,6 +3346,7 @@ fn copy_text_to_buffer_and_clipboard(
     paths: &RuntimePaths,
     out: &mut impl Write,
     text: &str,
+    clipboard: &ClipboardConfig,
 ) -> Result<Option<String>> {
     let copied_chars = text.chars().count();
     if copied_chars == 0 {
@@ -3352,10 +3364,46 @@ fn copy_text_to_buffer_and_clipboard(
         CommandResponse::Error { message } => return Err(anyhow!(message)),
         other => return Err(anyhow!("unexpected set-buffer response: {other:?}")),
     };
-    copy_via_osc52(out, text).context("failed to send OSC52 clipboard copy")?;
+    copy_to_clipboard(clipboard, out, text)?;
     Ok(Some(format!(
         "copied {copied_chars} chars to {buffer_name}"
     )))
+}
+
+fn copy_to_clipboard(
+    clipboard: &ClipboardConfig,
+    out: &mut impl Write,
+    text: &str,
+) -> Result<()> {
+    match clipboard.backend {
+        ClipboardBackend::Osc52 => {
+            copy_via_osc52(out, text).context("failed to send OSC52 clipboard copy")
+        }
+        ClipboardBackend::ExternalCommand => {
+            let (program, arguments) = clipboard
+                .command
+                .split_first()
+                .ok_or_else(|| anyhow!("clipboard.command is required for external-command"))?;
+            let mut child = Command::new(program)
+                .args(arguments)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .with_context(|| format!("failed to spawn clipboard command {program}"))?;
+            child
+                .stdin
+                .as_mut()
+                .ok_or_else(|| anyhow!("clipboard command stdin is unavailable"))?
+                .write_all(text.as_bytes())
+                .context("failed to write clipboard command stdin")?;
+            let status = child.wait().context("failed to wait for clipboard command")?;
+            if !status.success() {
+                bail!("clipboard command {program} exited with {status}");
+            }
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4284,5 +4332,26 @@ root = { command = ["sh"] }
                 PaneMouseKind::RightUp,
             ))
         );
+    }
+
+    #[test]
+    fn external_clipboard_command_receives_copied_text_on_stdin() {
+        let dir = tempdir();
+        let output = dir.path().join("clipboard.txt");
+        let clipboard = ClipboardConfig {
+            backend: ClipboardBackend::ExternalCommand,
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                format!("cat > {}", output.display()),
+            ],
+        };
+        let mut terminal = Vec::new();
+
+        copy_to_clipboard(&clipboard, &mut terminal, "copied text")
+            .expect("copy through external command");
+
+        assert_eq!(fs::read_to_string(output).expect("read clipboard output"), "copied text");
+        assert!(terminal.is_empty(), "external backend must not emit OSC52");
     }
 }

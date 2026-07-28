@@ -6,6 +6,8 @@ use crossterm::{
 use serde::{Deserialize, Deserializer, Serialize};
 use std::{collections::BTreeMap, fs, path::Path};
 
+use crate::clipboard::{ClipboardBackend, ClipboardConfig};
+
 const MAX_SCROLLBACK_LINES: usize = 50_000;
 const MAX_WORKSPACE_SNAPSHOT_LINES: usize = 10_000;
 const MAX_RESIZE_STEP: u16 = 1_000;
@@ -17,6 +19,7 @@ pub struct Config {
     pub ui: UiConfig,
     pub keys: KeyConfig,
     pub mouse: MouseConfig,
+    pub clipboard: ClipboardConfig,
     pub behavior: BehaviorConfig,
     pub defaults: DefaultsConfig,
 }
@@ -212,6 +215,7 @@ pub struct ResolvedConfig {
     pub ui: ResolvedUiConfig,
     pub keys: ResolvedKeyConfig,
     pub mouse: MouseConfig,
+    pub clipboard: ClipboardConfig,
     pub behavior: BehaviorConfig,
     pub defaults: DefaultsConfig,
 }
@@ -326,6 +330,7 @@ impl Default for Config {
             ui: UiConfig::default(),
             keys: KeyConfig::default(),
             mouse: MouseConfig::default(),
+            clipboard: ClipboardConfig::default(),
             behavior: BehaviorConfig::default(),
             defaults: DefaultsConfig::default(),
         }
@@ -615,6 +620,11 @@ impl Config {
                 "behavior.workspace_snapshot_lines must not exceed {MAX_WORKSPACE_SNAPSHOT_LINES}"
             );
         }
+        if matches!(self.clipboard.backend, ClipboardBackend::ExternalCommand)
+            && self.clipboard.command.is_empty()
+        {
+            bail!("clipboard.command is required when clipboard.backend is external-command");
+        }
         let status = resolve_status_config(&self.ui);
         let key_config = resolve_key_config(
             &self.keys,
@@ -634,6 +644,7 @@ impl Config {
             },
             keys: key_config,
             mouse: self.mouse.clone(),
+            clipboard: self.clipboard.clone(),
             behavior: self.behavior.clone(),
             defaults: self.defaults.clone(),
         })
@@ -1069,6 +1080,35 @@ mod tests {
                 .resolve()
                 .is_err());
         }
+    }
+
+    #[test]
+    fn external_clipboard_requires_a_command() {
+        let error = Config::from_toml(
+            r#"
+[clipboard]
+backend = "external-command"
+"#,
+        )
+        .expect("parse config")
+        .resolve()
+        .expect_err("external backend without command must fail");
+        assert!(error.to_string().contains("clipboard.command"));
+
+        let resolved = Config::from_toml(
+            r#"
+[clipboard]
+backend = "external-command"
+command = ["wl-copy", "--type", "text/plain"]
+"#,
+        )
+        .expect("parse config")
+        .resolve()
+        .expect("resolve configured external clipboard");
+        assert_eq!(
+            resolved.clipboard.backend,
+            ClipboardBackend::ExternalCommand
+        );
     }
 
     #[test]
