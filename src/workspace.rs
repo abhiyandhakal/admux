@@ -1,7 +1,10 @@
 use std::{
     collections::BTreeMap,
-    fs,
+    fs::{self, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
+    process,
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -76,6 +79,7 @@ const MAX_SNAPSHOT_VT_BYTES: usize = 1024 * 1024;
 const MAX_SNAPSHOT_TITLE_BYTES: usize = 1024;
 const MAX_SNAPSHOT_ROWS: u16 = 1_000;
 const MAX_SNAPSHOT_COLS: u16 = 1_000;
+static WORKSPACE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceWindowSnapshot {
@@ -274,14 +278,23 @@ pub fn save_workspace(session: &Session, snapshot_lines: usize) -> Result<PathBu
     let mut snapshot = export_snapshot(session, &path, "", snapshot_lines)?;
     let manifest = export_workspace(session)?;
     let raw = toml::to_string_pretty(&manifest).context("failed to encode workspace manifest")?;
-    fs::write(&path, raw)
-        .with_context(|| format!("failed to write workspace manifest {}", path.display()))?;
-    let digest = manifest_digest(
-        &fs::read_to_string(&path)
-            .with_context(|| format!("failed to reread workspace manifest {}", path.display()))?,
-    );
-    snapshot.manifest_digest = digest.clone();
-    write_snapshot_sidecar(&snapshot, &path)?;
+    snapshot.manifest_digest = manifest_digest(&raw);
+    let snapshot_path = prepare_snapshot_sidecar(&path)?;
+    let manifest_tmp = stage_workspace_file(&path, raw.as_bytes())?;
+    let snapshot_raw = serde_json::to_vec_pretty(&snapshot)
+        .context("failed to encode workspace snapshot")?;
+    let snapshot_tmp = match stage_workspace_file(&snapshot_path, &snapshot_raw) {
+        Ok(path) => path,
+        Err(error) => {
+            let _ = fs::remove_file(&manifest_tmp);
+            return Err(error);
+        }
+    };
+    if let Err(error) = commit_workspace_file(&snapshot_tmp, &snapshot_path) {
+        let _ = fs::remove_file(&manifest_tmp);
+        return Err(error);
+    }
+    commit_workspace_file(&manifest_tmp, &path)?;
     Ok(path)
 }
 
@@ -568,17 +581,47 @@ fn relativize(path: &Path, base: &Path) -> Option<PathBuf> {
         .or_else(|| Some(path.to_path_buf()))
 }
 
-fn write_snapshot_sidecar(snapshot: &WorkspaceSnapshot, manifest_path: &Path) -> Result<()> {
+fn prepare_snapshot_sidecar(manifest_path: &Path) -> Result<PathBuf> {
     let state_dir = workspace_state_dir(manifest_path);
     fs::create_dir_all(&state_dir)
         .with_context(|| format!("failed to create {}", state_dir.display()))?;
     let gitignore = state_dir.join(".gitignore");
     ensure_snapshot_gitignore(&gitignore)?;
-    let snapshot_path = workspace_snapshot_path(manifest_path);
-    let raw = serde_json::to_vec_pretty(snapshot).context("failed to encode workspace snapshot")?;
-    fs::write(&snapshot_path, raw)
-        .with_context(|| format!("failed to write {}", snapshot_path.display()))?;
-    Ok(())
+    Ok(workspace_snapshot_path(manifest_path))
+}
+
+fn stage_workspace_file(path: &Path, contents: &[u8]) -> Result<PathBuf> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("workspace file {} has no parent directory", path.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("workspace file {} has no valid file name", path.display()))?;
+    let counter = WORKSPACE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let temporary = parent.join(format!(".{file_name}.{}.{}.tmp", process::id(), counter));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .with_context(|| format!("failed to create {}", temporary.display()))?;
+    file.write_all(contents)
+        .with_context(|| format!("failed to write {}", temporary.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync {}", temporary.display()))?;
+    Ok(temporary)
+}
+
+fn commit_workspace_file(temporary: &Path, path: &Path) -> Result<()> {
+    fs::rename(temporary, path)
+        .with_context(|| format!("failed to rename {} to {}", temporary.display(), path.display()))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("workspace file {} has no parent directory", path.display()))?;
+    fs::File::open(parent)
+        .with_context(|| format!("failed to open workspace directory {}", parent.display()))?
+        .sync_all()
+        .with_context(|| format!("failed to sync workspace directory {}", parent.display()))
 }
 
 fn ensure_snapshot_gitignore(gitignore: &Path) -> Result<()> {
@@ -1256,6 +1299,41 @@ root = { command = ["sh"] }
                 .contains("command"),
             "snapshot should not persist helper-reported commands"
         );
+
+        let _ = session.kill();
+    }
+
+    #[test]
+    fn save_failure_before_snapshot_staging_preserves_existing_manifest() {
+        let dir = tempdir();
+        let session_dir = dir.path().join("project");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        let session = Session::new(
+            "workspace".into(),
+            None,
+            Some(session_dir.clone()),
+            vec!["sh".into(), "-lc".into(), "sleep 1".into()],
+            WindowId(1),
+            None,
+            10_000,
+            Numbering {
+                window_base: 0,
+                pane_base: 0,
+            },
+            WindowDefaults::default(),
+            dir.path().join("helpers"),
+        )
+        .expect("session");
+        let manifest_path = session_dir.join("admux.toml");
+        let original = "# user-maintained manifest\nversion = 1\n";
+        fs::write(&manifest_path, original).expect("write manifest");
+        fs::write(session_dir.join(".admux"), "not a directory")
+            .expect("block snapshot directory");
+
+        let error = save_workspace(&session, 500).expect_err("save should fail");
+
+        assert!(error.to_string().contains("failed to create"));
+        assert_eq!(fs::read_to_string(&manifest_path).expect("read manifest"), original);
 
         let _ = session.kill();
     }
