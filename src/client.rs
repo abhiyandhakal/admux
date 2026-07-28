@@ -3672,6 +3672,18 @@ root = { command = ["sh"] }
         let helper_socket = dir.path().join("helper");
         let helper_listener = UnixListener::bind(&helper_socket).expect("bind helper socket");
         let helper = std::thread::spawn(move || {
+            let (mut stream, _) = helper_listener.accept().expect("accept handshake request");
+            let mut input = Vec::new();
+            stream.read_to_end(&mut input).expect("read handshake request");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&input).expect("decode handshake request"),
+                serde_json::json!({"Hello":{"version":1}}),
+            );
+            stream
+                .write_all(br#"{"HelloAck":{"version":1}}"#)
+                .expect("write handshake response");
+            drop(stream);
+
             let (mut stream, _) = helper_listener.accept().expect("accept liveness request");
             let mut input = Vec::new();
             stream.read_to_end(&mut input).expect("read liveness request");

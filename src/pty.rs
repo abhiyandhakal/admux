@@ -24,6 +24,7 @@ use std::{
 const HISTORY_LIMIT: usize = 2 * 1024 * 1024;
 const IPC_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_IPC_MESSAGE_BYTES: u64 = 1024 * 1024;
+const HELPER_PROTOCOL_VERSION: u16 = 1;
 static HELPER_NAME_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct TerminalState {
@@ -97,6 +98,7 @@ pub struct PaneHelperArgs {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum PaneRequest {
+    Hello { version: u16 },
     Snapshot {
         width: u16,
         height: u16,
@@ -137,6 +139,7 @@ enum PaneRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum PaneResponse {
+    HelloAck { version: u16 },
     Snapshot(PaneSnapshotWire),
     ScreenSize { rows: u16, cols: u16 },
     SelectionText { text: String },
@@ -274,6 +277,7 @@ impl PaneProcess {
             bail!("missing pane helper socket {}", socket_path.display());
         }
         let process = Self { socket_path };
+        process.ensure_protocol()?;
         if !process.is_alive() {
             bail!(
                 "pane helper at {} is not alive",
@@ -455,6 +459,20 @@ impl PaneProcess {
         let response = read_limited(&mut stream, "pane response")?;
         serde_json::from_slice(&response).context("failed to decode pane response")
     }
+
+    fn ensure_protocol(&self) -> Result<()> {
+        match self.request(PaneRequest::Hello {
+            version: HELPER_PROTOCOL_VERSION,
+        })? {
+            PaneResponse::HelloAck { version } if version == HELPER_PROTOCOL_VERSION => Ok(()),
+            PaneResponse::HelloAck { version } => bail!(
+                "pane helper protocol mismatch: daemon={}, helper={version}",
+                HELPER_PROTOCOL_VERSION
+            ),
+            PaneResponse::Error { message } => bail!("pane helper protocol rejected handshake: {message}"),
+            other => bail!("pane helper returned invalid handshake response: {other:?}"),
+        }
+    }
 }
 
 pub fn run_helper(args: PaneHelperArgs) -> Result<()> {
@@ -620,6 +638,17 @@ fn start_helper_state(args: &PaneHelperArgs) -> Result<HelperState> {
 
 fn handle_helper_request(state: &Arc<HelperState>, request: PaneRequest) -> PaneResponse {
     match request {
+        PaneRequest::Hello { version } => {
+            if version == HELPER_PROTOCOL_VERSION {
+                PaneResponse::HelloAck { version }
+            } else {
+                PaneResponse::Error {
+                    message: format!(
+                        "pane helper protocol mismatch: daemon={version}, helper={HELPER_PROTOCOL_VERSION}"
+                    ),
+                }
+            }
+        }
         PaneRequest::Snapshot { width, height } => match helper_snapshot(state, width, height) {
             Ok(snapshot) => PaneResponse::Snapshot(snapshot),
             Err(error) => PaneResponse::Error {
@@ -1193,6 +1222,29 @@ mod tests {
     #[test]
     fn send_keys_preserves_literal_text() {
         assert_eq!(encode_send_key("echo hello"), b"echo hello".to_vec());
+    }
+
+    #[test]
+    fn connect_rejects_incompatible_helper_protocol() {
+        let dir = helper_dir();
+        let socket = dir.path().join("helper");
+        let listener = UnixListener::bind(&socket).expect("bind helper socket");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept handshake");
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).expect("read handshake");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&request).expect("decode handshake"),
+                serde_json::json!({"Hello":{"version":HELPER_PROTOCOL_VERSION}}),
+            );
+            stream
+                .write_all(br#"{"HelloAck":{"version":999}}"#)
+                .expect("write mismatched handshake");
+        });
+
+        let error = PaneProcess::connect(socket).expect_err("incompatible helper must fail");
+        assert!(error.to_string().contains("protocol mismatch"));
+        server.join().expect("server thread");
     }
 
     #[test]
