@@ -193,9 +193,9 @@ Core wiki pages:
 - [Architecture](https://github.com/abhiyandhakal/admux/wiki/Architecture)
 - [Troubleshooting](https://github.com/abhiyandhakal/admux/wiki/Troubleshooting)
 
-The staged source for those pages is kept in [docs/wiki](/home/abhiyan/coding/projects/admux/docs/wiki).
+The staged source for those pages is kept in [docs/wiki](docs/wiki).
 
 Engineering records remain in-repo:
 
-- [Implementation log](/home/abhiyan/coding/projects/admux/docs/implementation-log.md)
-- [Detailed status](/home/abhiyan/coding/projects/admux/docs/detailed-status.md)
+- [Implementation log](docs/implementation-log.md)
+- [Detailed status](docs/detailed-status.md)
