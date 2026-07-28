@@ -801,7 +801,10 @@ impl SessionStore {
             Some(_) => None,
             None => self
                 .last_session
-                .clone()
+                .as_ref()
+                .filter(|session| self.sessions.contains_key(*session))
+                .cloned()
+                .or_else(|| self.sessions.keys().next_back().cloned())
                 .or_else(|| self.persisted_sessions.keys().next_back().cloned()),
         }
     }
@@ -1981,6 +1984,30 @@ mod tests {
             .expect("session")
             .kill()
             .expect("clean up session");
+    }
+
+    #[test]
+    fn default_attachment_prefers_live_session_over_stale_last_session() {
+        let mut store = SessionStore::default();
+        let _ = store.handle(CommandRequest::NewSession {
+            name: Some("live".into()),
+            cwd: None,
+            command: vec!["sh".into(), "-lc".into(), "sleep 1".into()],
+            switch_from: None,
+        });
+        let persisted = PersistedSession::from_live(
+            store.sessions.get("live").expect("live session"),
+        );
+        store.persisted_sessions.insert("stale".into(), persisted);
+        store.last_session = Some("stale".into());
+
+        assert_eq!(store.resolve_session(None).as_deref(), Some("live"));
+        store
+            .sessions
+            .get("live")
+            .expect("live session")
+            .kill()
+            .expect("clean up live session");
     }
 
     #[test]
