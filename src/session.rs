@@ -148,7 +148,14 @@ impl Session {
             window_defaults,
             helper_dir,
         };
-        session.sync_pane_sizes()?;
+        if let Err(error) = session.sync_pane_sizes() {
+            return match session.kill() {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(error.context(format!(
+                    "additionally failed to clean up initial session pane: {cleanup_error}"
+                ))),
+            };
+        }
         Ok(session)
     }
 
@@ -700,6 +707,10 @@ impl Session {
             return Err(anyhow!("unknown pane"));
         }
         let pane_id = PaneId(window.next_pane_id);
+        let next_pane_id = window
+            .next_pane_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("pane id space exhausted"))?;
         let process = PaneProcess::spawn(
             &default_command,
             cwd.as_deref(),
@@ -716,13 +727,33 @@ impl Session {
             command: default_command.clone(),
             process,
         };
-        window.next_pane_id = window
-            .next_pane_id
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("pane id space exhausted"))?;
+        window.next_pane_id = next_pane_id;
         window.panes.insert(pane_id, pane);
         debug_assert!(window.layout.split_pane(target_pane, axis, ratio, pane_id));
-        self.sync_pane_sizes()?;
+        if let Err(error) = self.sync_pane_sizes() {
+            let cleanup = self
+                .windows
+                .get(&window_id)
+                .and_then(|window| window.panes.get(&pane_id))
+                .expect("new pane was inserted before resize")
+                .process
+                .kill();
+            return match cleanup {
+                Ok(()) => {
+                    let window = self
+                        .windows
+                        .get_mut(&window_id)
+                        .expect("window was validated before resize");
+                    window.panes.remove(&pane_id);
+                    let _ = window.layout.remove_pane(pane_id);
+                    window.next_pane_id = pane_id.0;
+                    Err(error)
+                }
+                Err(cleanup_error) => Err(error.context(format!(
+                    "failed to roll back new pane {pane_id:?}; it remains in the session: {cleanup_error}"
+                ))),
+            };
+        }
         Ok(SplitResult { window_id, pane_id })
     }
 
@@ -771,10 +802,31 @@ impl Session {
             restore_seed,
         )?;
         let pane_id = window.layout.active;
+        let previous_active = self.active_window;
+        let previous_last = self.last_window;
         self.windows.insert(window_id, window);
         self.window_order.push(window_id);
         self.remember_window_switch(window_id);
-        self.sync_pane_sizes()?;
+        if let Err(error) = self.sync_pane_sizes() {
+            let cleanup = self
+                .windows
+                .get(&window_id)
+                .expect("new window was inserted before resize")
+                .kill();
+            return match cleanup {
+                Ok(()) => {
+                    self.windows.remove(&window_id);
+                    self.window_order.retain(|id| *id != window_id);
+                    self.active_window = previous_active;
+                    self.last_window = previous_last;
+                    Err(error)
+                }
+                Err(cleanup_error) => Err(error.context(format!(
+                    "failed to roll back new window {}; it remains in the session: {cleanup_error}",
+                    window_id.0
+                ))),
+            };
+        }
         Ok(WindowCreation { window_id, pane_id })
     }
 
@@ -1096,6 +1148,19 @@ impl Session {
 }
 
 impl WindowRuntime {
+    fn kill(&self) -> Result<()> {
+        let mut failures = Vec::new();
+        for (pane_id, pane) in &self.panes {
+            if let Err(error) = pane.process.kill() {
+                failures.push(format!("pane {}: {error}", pane_id.0));
+            }
+        }
+        if !failures.is_empty() {
+            bail!("failed to shut down window panes: {}", failures.join("; "));
+        }
+        Ok(())
+    }
+
     fn new(
         id: WindowId,
         name: String,
@@ -1292,6 +1357,57 @@ mod tests {
         );
 
         fs::rename(&hidden_path, &hidden_socket).expect("restore helper socket");
+        session.kill().expect("clean up session");
+    }
+
+    #[test]
+    fn failed_split_resize_rolls_back_the_new_helper_and_model_entry() {
+        let helper_dir = tempdir();
+        let mut session = Session::new(
+            "work".into(),
+            None,
+            None,
+            vec!["sh".into()],
+            WindowId(1),
+            None,
+            10_000,
+            Numbering {
+                window_base: 0,
+                pane_base: 0,
+            },
+            WindowDefaults::default(),
+            helper_dir.path().to_path_buf(),
+        )
+        .expect("create session");
+        let socket = session
+            .active_window()
+            .expect("active window")
+            .panes
+            .get(&PaneId(0))
+            .expect("root pane")
+            .process
+            .socket_path()
+            .to_path_buf();
+        let hidden_socket = socket.with_extension("hidden");
+        fs::rename(&socket, &hidden_socket).expect("hide root helper socket");
+
+        let error = match session.split_active_pane(SplitAxis::Horizontal, &["sh".into()]) {
+            Ok(_) => panic!("resize must fail through the hidden root helper"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("failed to connect pane helper"));
+        let window = session.active_window().expect("active window");
+        assert_eq!(window.panes.len(), 1);
+        assert_eq!(window.layout.panes(), vec![PaneId(0)]);
+        assert_eq!(window.next_pane_id, 1);
+        assert!(
+            fs::read_dir(helper_dir.path())
+                .expect("read helper directory")
+                .all(|entry| entry.expect("helper directory entry").path().extension() != Some("sock".as_ref())),
+            "the rolled-back helper socket must not remain"
+        );
+
+        fs::rename(&hidden_socket, &socket).expect("restore root helper socket");
         session.kill().expect("clean up session");
     }
 
