@@ -794,6 +794,19 @@ fn build_tmux_status_zones(
     } else {
         vec![StatusSegment::session(format!("[{session}] "))]
     };
+    if ui.status_show_pane {
+        if let Some(pane) = snapshot
+            .panes
+            .iter()
+            .find(|pane| pane.pane_id == snapshot.active_pane_id)
+        {
+            left.push(StatusSegment::plain(format!(
+                " pane:{}:{} ",
+                pane.pane_id,
+                terminal_safe(&pane.title)
+            )));
+        }
+    }
     let mut center = if ui.status.show_window_list {
         snapshot
             .windows
@@ -1378,6 +1391,7 @@ mod tests {
         ResolvedUiConfig {
             status_position: StatusPosition::Bottom,
             show_pane_labels: true,
+            status_show_pane: true,
             status: StatusConfig::default(),
             dividers: DividerConfig {
                 charset: DividerCharset::Unicode,
@@ -1698,6 +1712,28 @@ mod tests {
             .collect::<String>();
         assert!(joined.contains("copied 5 chars"));
         assert!(!joined.contains("shell"));
+    }
+
+    #[test]
+    fn status_pane_segment_honors_ui_configuration() {
+        let snapshot = sample_snapshot();
+        let shown = build_tmux_status_zones("work", &snapshot, &sample_ui(), 80)
+            .expect("status zones")
+            .left
+            .into_iter()
+            .map(|segment| segment.text)
+            .collect::<String>();
+        assert!(shown.contains("pane:1:shell"));
+
+        let mut ui = sample_ui();
+        ui.status_show_pane = false;
+        let hidden = build_tmux_status_zones("work", &snapshot, &ui, 80)
+            .expect("status zones")
+            .left
+            .into_iter()
+            .map(|segment| segment.text)
+            .collect::<String>();
+        assert!(!hidden.contains("pane:1:shell"));
     }
 
     #[test]

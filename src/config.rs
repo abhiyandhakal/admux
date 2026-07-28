@@ -224,6 +224,7 @@ pub struct ResolvedConfig {
 pub struct ResolvedUiConfig {
     pub status_position: StatusPosition,
     pub show_pane_labels: bool,
+    pub status_show_pane: bool,
     pub status: StatusConfig,
     pub dividers: DividerConfig,
     pub theme: ThemeConfig,
@@ -635,6 +636,7 @@ impl Config {
             ui: ResolvedUiConfig {
                 status_position: self.ui.status_position,
                 show_pane_labels: self.ui.show_pane_labels,
+                status_show_pane: self.ui.status_show_pane,
                 status,
                 dividers: self.ui.dividers.clone(),
                 theme: self.ui.theme.clone(),
@@ -1016,6 +1018,19 @@ mod tests {
         assert!(resolved.keys.leader.iter().any(|(pattern, action)| {
             *action == Action::NewWindow && *pattern == parse_key_pattern("w").expect("pattern")
         }));
+    }
+
+    #[test]
+    fn status_show_pane_is_preserved_in_resolved_ui_config() {
+        let config = Config::from_toml(
+            r#"
+                [ui]
+                status_show_pane = false
+            "#,
+        )
+        .expect("config");
+        let resolved = config.resolve().expect("resolve config");
+        assert!(!resolved.ui.status_show_pane);
     }
 
     #[test]
