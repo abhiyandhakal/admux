@@ -1532,6 +1532,8 @@ fn run_attach_loop(
             Event::Paste(text) => {
                 if let OverlayState::Prompt(prompt) = &mut overlay {
                     insert_prompt_text(prompt, &text);
+                } else if let OverlayState::ChooseTree(tree) = &mut overlay {
+                    insert_choose_tree_search_text(tree, &text);
                 } else if matches!(overlay, OverlayState::None) && copy_mode.is_none() {
                     let mut bytes = Vec::with_capacity(text.len() + 12);
                     bytes.extend_from_slice(b"\x1b[200~");
@@ -2812,6 +2814,10 @@ fn choose_tree_status(tree: &ChooseTreeState) -> String {
     } else {
         "choose-tree | C-s search | n/N repeat | Alt-+ expand all | Alt-- collapse all | Enter select | q cancel".into()
     }
+}
+
+fn insert_choose_tree_search_text(tree: &mut ChooseTreeState, text: &str) {
+    tree.search_input.get_or_insert_with(String::new).push_str(text);
 }
 
 fn focused_pane(snapshot: &RenderSnapshot) -> Option<&PaneRender> {
@@ -4159,6 +4165,26 @@ root = { command = ["sh"] }
 
         assert_eq!(tree.selected, 1);
         assert!(tree.lines[1].selected);
+    }
+
+    #[test]
+    fn pasting_into_choose_tree_starts_or_extends_search_input() {
+        let mut tree = ChooseTreeState {
+            items: Vec::new(),
+            lines: Vec::new(),
+            selected: 0,
+            expanded_sessions: BTreeSet::new(),
+            expanded_windows: BTreeSet::new(),
+            attached_session: "work".into(),
+            search_input: None,
+            last_search: None,
+            preview: None,
+        };
+
+        insert_choose_tree_search_text(&mut tree, "log");
+        insert_choose_tree_search_text(&mut tree, "s");
+
+        assert_eq!(tree.search_input.as_deref(), Some("logs"));
     }
 
     #[test]
