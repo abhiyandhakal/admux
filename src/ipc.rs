@@ -37,6 +37,7 @@ pub enum CommandRequest {
     },
     PreviewSession {
         session: String,
+        target: Option<String>,
     },
     ListSessions,
     ListWindows {

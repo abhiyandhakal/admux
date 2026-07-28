@@ -291,13 +291,24 @@ impl SessionStore {
                     };
                 }
             }
-            CommandRequest::PreviewSession { session } => match self.sessions.get(&session) {
-                Some(runtime) => match runtime.render_session_preview(crate::pane::Rect {
-                    x: 0,
-                    y: 0,
-                    width: 80,
-                    height: 24,
-                }) {
+            CommandRequest::PreviewSession { session, target } => match self.sessions.get(&session) {
+                Some(runtime) => {
+                    let size = crate::pane::Rect {
+                        x: 0,
+                        y: 0,
+                        width: 80,
+                        height: 24,
+                    };
+                    let preview = match target {
+                        Some(target) => match self.parse_target(&target) {
+                            Ok(target) if target.session == session => target.window.and_then(|window| {
+                                runtime.render_window_preview(window, target.pane, size)
+                            }),
+                            _ => None,
+                        },
+                        None => runtime.render_session_preview(size),
+                    };
+                    match preview {
                     Some(mut snapshot) => {
                         snapshot.sessions = self.list_session_summaries();
                         CommandResponse::SessionPreview { snapshot }
@@ -305,7 +316,8 @@ impl SessionStore {
                     None => CommandResponse::Error {
                         message: format!("could not render session preview for {session}"),
                     },
-                },
+                    }
+                }
                 None => CommandResponse::Error {
                     message: format!("unknown session {session}"),
                 },

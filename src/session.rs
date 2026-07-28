@@ -307,6 +307,46 @@ impl Session {
         })
     }
 
+    pub fn render_window_preview(
+        &self,
+        window_id: WindowId,
+        pane_id: Option<PaneId>,
+        size: Rect,
+    ) -> Option<RenderSnapshot> {
+        let window = self.windows.get(&window_id)?;
+        let active_pane = pane_id.unwrap_or(window.layout.active);
+        if !window.panes.contains_key(&active_pane) {
+            return None;
+        }
+        let rects = window.layout.pane_rects(size);
+        let panes = window
+            .layout
+            .panes()
+            .into_iter()
+            .filter_map(|pane_id| {
+                let pane = window.panes.get(&pane_id)?;
+                let rect = *rects.get(&pane_id)?;
+                self.render_pane(pane, rect, pane_id == active_pane)
+            })
+            .collect();
+        let mut windows = self.list_windows();
+        for summary in &mut windows {
+            summary.active = summary.id == window.id.0;
+        }
+
+        Some(RenderSnapshot {
+            sessions: Vec::new(),
+            windows,
+            panes,
+            dividers: window.layout.divider_cells(size),
+            active_window_id: self
+                .numbering
+                .public_window_id(window.id, &self.window_order)
+                .ok()?,
+            active_pane_id: self.numbering.public_pane_number(active_pane).ok()?,
+        })
+    }
+
     pub fn render_session_preview(&self, size: Rect) -> Option<RenderSnapshot> {
         let mut panes = Vec::new();
         let mut dividers = Vec::new();
@@ -1122,6 +1162,51 @@ mod tests {
 
         assert_eq!(rows, 29);
         assert_eq!(cols, 120);
+    }
+
+    #[test]
+    fn selected_window_preview_does_not_mutate_the_live_selection() {
+        let helper_dir = tempdir();
+        let mut session = Session::new(
+            "work".into(),
+            None,
+            None,
+            vec!["sh".into()],
+            WindowId(1),
+            None,
+            10_000,
+            Numbering {
+                window_base: 0,
+                pane_base: 0,
+            },
+            WindowDefaults::default(),
+            helper_dir.path().to_path_buf(),
+        )
+        .expect("create session");
+        let created = session
+            .new_window(WindowId(2), Some("logs".into()), &["sh".into()])
+            .expect("create window");
+        session.select_window(WindowId(1)).expect("select original window");
+        let original_window = session.active_window;
+
+        let preview = session
+            .render_window_preview(
+                created.window_id,
+                Some(created.pane_id),
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 80,
+                    height: 24,
+                },
+            )
+            .expect("render selected window preview");
+
+        assert_eq!(preview.active_window_id, 1);
+        assert_eq!(preview.active_pane_id, 0);
+        assert_eq!(session.active_window, original_window);
+        assert!(preview.panes.iter().all(|pane| pane.focused));
+        session.kill().expect("clean up session");
     }
 
     #[test]

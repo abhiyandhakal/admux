@@ -2266,29 +2266,25 @@ fn chooser_preview(
         | ChooseItem::Window { session, .. }
         | ChooseItem::Pane { session, .. } => session.clone(),
     };
-    if matches!(item, ChooseItem::Session(_)) {
-        let snapshot = match request_response(
-            paths,
-            CommandRequest::PreviewSession {
-                session: session.clone(),
-            },
-        )? {
-            CommandResponse::SessionPreview { snapshot } => snapshot,
-            CommandResponse::Error { message } => return Err(anyhow!(message)),
-            other => return Err(anyhow!("unexpected session preview response: {other:?}")),
-        };
-        return Ok((session, snapshot));
-    }
+    let target = match item {
+        ChooseItem::Session(_) => None,
+        ChooseItem::Window { window_index, .. } => Some(format!("{session}:{window_index}")),
+        ChooseItem::Pane {
+            window_index,
+            pane_id,
+            ..
+        } => Some(format!("{session}:{window_index}.{pane_id}")),
+    };
     let snapshot = match request_response(
         paths,
-        CommandRequest::Attach {
-            session: Some(session.clone()),
+        CommandRequest::PreviewSession {
+            session: session.clone(),
+            target,
         },
     )? {
-        CommandResponse::Attached {
-            preview, snapshot, ..
-        } => snapshot.unwrap_or_else(|| fallback_snapshot(preview, 80, 24)),
-        _ => fallback_snapshot(String::new(), 80, 24),
+        CommandResponse::SessionPreview { snapshot } => snapshot,
+        CommandResponse::Error { message } => return Err(anyhow!(message)),
+        other => return Err(anyhow!("unexpected session preview response: {other:?}")),
     };
     Ok((session, snapshot))
 }
