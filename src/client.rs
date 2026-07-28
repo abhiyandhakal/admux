@@ -2284,12 +2284,15 @@ fn handle_choose_tree_key(
                         session,
                         window_index,
                     } => {
-                        let _ = request_response(
+                        let response = request_response(
                             paths,
                             CommandRequest::SelectWindow {
                                 target: format!("{session}:{window_index}"),
                             },
                         )?;
+                        if !chooser_command_succeeded(response, status_message) {
+                            return Ok(true);
+                        }
                         *current_session = session;
                         tree.attached_session = current_session.clone();
                     }
@@ -2298,19 +2301,25 @@ fn handle_choose_tree_key(
                         window_index,
                         pane_id,
                     } => {
-                        let _ = request_response(
+                        let response = request_response(
                             paths,
                             CommandRequest::SelectWindow {
                                 target: format!("{session}:{window_index}"),
                             },
                         )?;
-                        let _ = request_response(
+                        if !chooser_command_succeeded(response, status_message) {
+                            return Ok(true);
+                        }
+                        let response = request_response(
                             paths,
                             CommandRequest::SelectPane {
                                 target: Some(format!("{session}:{window_index}.{pane_id}")),
                                 direction: None,
                             },
                         )?;
+                        if !chooser_command_succeeded(response, status_message) {
+                            return Ok(true);
+                        }
                         *current_session = session;
                         tree.attached_session = current_session.clone();
                     }
@@ -2322,6 +2331,16 @@ fn handle_choose_tree_key(
     }
     rebuild_choose_tree(paths, tree)?;
     Ok(true)
+}
+
+fn chooser_command_succeeded(response: CommandResponse, status_message: &mut Option<String>) -> bool {
+    match response {
+        CommandResponse::Error { message } => {
+            *status_message = Some(message);
+            false
+        }
+        _ => true,
+    }
 }
 
 fn handle_choose_buffer_key(
@@ -3083,6 +3102,18 @@ root = { command = ["sh"] }
         })
         .expect_err("daemon error must not look successful");
         assert!(error.to_string().contains("unknown pane"));
+    }
+
+    #[test]
+    fn chooser_command_errors_keep_the_chooser_open() {
+        let mut status = None;
+        assert!(!chooser_command_succeeded(
+            CommandResponse::Error {
+                message: "unknown window".into(),
+            },
+            &mut status,
+        ));
+        assert_eq!(status.as_deref(), Some("unknown window"));
     }
 
     #[test]
