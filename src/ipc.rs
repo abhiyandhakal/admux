@@ -306,6 +306,12 @@ pub struct PaneRender {
     pub mouse_reporting: bool,
     #[serde(default)]
     pub application_cursor: bool,
+    #[serde(default)]
+    pub preview: String,
+    #[serde(default)]
+    pub formatted_preview: String,
+    #[serde(default)]
+    pub formatted_cursor: String,
     pub rows_plain: Vec<String>,
     pub rows_formatted: Vec<String>,
     pub cursor: Option<PaneCursor>,

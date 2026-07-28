@@ -280,18 +280,29 @@ impl SessionStore {
                 if self.sessions.contains_key(&session_name) {
                     self.last_session = Some(session_name.clone());
                     let session = self.sessions.get(&session_name).expect("checked contains");
-                    let snapshot =
+                    let mut snapshot =
                         session
                             .render_snapshot(session.pane_area())
-                            .map(|mut snapshot| {
-                                snapshot.sessions = self.list_session_summaries();
-                                snapshot
-                            });
+                            ;
+                    let (preview, formatted_preview, formatted_cursor) = snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.panes.iter().find(|pane| pane.focused))
+                        .map(|pane| {
+                            (
+                                pane.preview.clone(),
+                                pane.formatted_preview.clone(),
+                                pane.formatted_cursor.clone(),
+                            )
+                        })
+                        .unwrap_or_default();
+                    if let Some(snapshot) = &mut snapshot {
+                        snapshot.sessions = self.list_session_summaries();
+                    }
                     CommandResponse::Attached {
                         session: session_name,
-                        preview: session.active_pane_preview(),
-                        formatted_preview: session.active_pane_formatted_preview(),
-                        formatted_cursor: session.active_pane_formatted_cursor(),
+                        preview,
+                        formatted_preview,
+                        formatted_cursor,
                         snapshot,
                     }
                 } else if self.persisted_sessions.contains_key(&session_name) {
@@ -1735,6 +1746,9 @@ mod tests {
             helper_socket: None,
             mouse_reporting: true,
             application_cursor: false,
+            preview: String::new(),
+            formatted_preview: String::new(),
+            formatted_cursor: String::new(),
             rows_plain: Vec::new(),
             rows_formatted: Vec::new(),
             cursor: None,
@@ -2080,13 +2094,32 @@ mod tests {
         let attached = attached.expect("attach should eventually expose pane output");
 
         assert!(matches!(
-            attached,
+            &attached,
             CommandResponse::Attached {
                 session,
                 preview,
                 ..
             } if session == "work" && preview.contains("attached")
         ));
+        if let CommandResponse::Attached {
+            preview,
+            formatted_preview,
+            formatted_cursor,
+            snapshot: Some(snapshot),
+            ..
+        } = attached
+        {
+            let focused = snapshot
+                .panes
+                .iter()
+                .find(|pane| pane.focused)
+                .expect("focused pane");
+            assert_eq!(preview, focused.preview);
+            assert_eq!(formatted_preview, focused.formatted_preview);
+            assert_eq!(formatted_cursor, focused.formatted_cursor);
+        } else {
+            panic!("expected attached snapshot");
+        }
         store
             .sessions
             .remove("work")
