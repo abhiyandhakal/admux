@@ -301,7 +301,7 @@ fn resolve_workspace(
                 .unwrap_or("workspace")
                 .to_string()
         });
-    let cwd = resolve_cwd(workspace.cwd.as_ref(), &manifest_dir);
+    let cwd = resolve_cwd(workspace.cwd.as_ref(), &manifest_dir)?;
     let active_window_public = workspace.active_window.unwrap_or(numbering.window_base as usize);
     let active_window = numbering
         .parse_public_window_number(active_window_public as u64)?
@@ -316,7 +316,7 @@ fn resolve_workspace(
 
     let mut windows = Vec::with_capacity(manifest.windows.len());
     for (window_index, window) in manifest.windows.into_iter().enumerate() {
-        let window_cwd = resolve_cwd(window.cwd.as_ref(), &cwd);
+        let window_cwd = resolve_cwd(window.cwd.as_ref(), &cwd)?;
         let root = resolve_pane_spec(window.root, &window_cwd)?;
         let mut known_panes = 1u64;
         let mut splits = Vec::with_capacity(window.splits.len());
@@ -720,17 +720,25 @@ fn resolve_pane_spec(raw: RawPaneSpec, base: &Path) -> Result<WorkspacePaneSpec>
         bail!("workspace pane command cannot be empty");
     }
     Ok(WorkspacePaneSpec {
-        cwd: resolve_cwd(raw.cwd.as_ref(), base),
+        cwd: resolve_cwd(raw.cwd.as_ref(), base)?,
         command: raw.command,
     })
 }
 
-fn resolve_cwd(path: Option<&PathBuf>, base: &Path) -> PathBuf {
-    match path {
+fn resolve_cwd(path: Option<&PathBuf>, base: &Path) -> Result<PathBuf> {
+    let candidate = match path {
         Some(path) if path.is_absolute() => path.clone(),
         Some(path) => base.join(path),
         None => base.to_path_buf(),
+    };
+    let metadata = fs::metadata(&candidate)
+        .with_context(|| format!("workspace cwd {} does not exist", candidate.display()))?;
+    if !metadata.is_dir() {
+        bail!("workspace cwd {} is not a directory", candidate.display());
     }
+    candidate
+        .canonicalize()
+        .with_context(|| format!("failed to resolve workspace cwd {}", candidate.display()))
 }
 
 fn resolve_ratio(value: Option<f32>) -> Result<u16> {
@@ -826,6 +834,8 @@ command = ["cargo", "test"]
 "#,
         )
         .expect("write");
+        fs::create_dir_all(dir.path().join("repo/frontend/src")).expect("create root cwd");
+        fs::create_dir_all(dir.path().join("repo/frontend/tests")).expect("create split cwd");
 
         let workspace = load_workspace(
             &path,
@@ -848,6 +858,28 @@ command = ["cargo", "test"]
             workspace.spec.windows[0].splits[0].pane.cwd,
             dir.path().join("repo").join("frontend").join("tests")
         );
+    }
+
+    #[test]
+    fn rejects_workspace_cwds_that_are_missing_or_not_directories() {
+        let missing = load(
+            r#"
+version = 1
+[workspace]
+cwd = "missing"
+[[windows]]
+name = "editor"
+root = { command = ["nvim"] }
+"#,
+        )
+        .expect_err("missing cwd rejected");
+        assert!(missing.to_string().contains("does not exist"));
+
+        let dir = tempdir();
+        let file = dir.path().join("not-a-directory");
+        fs::write(&file, "file").expect("write file");
+        let error = resolve_cwd(Some(&file), dir.path()).expect_err("file cwd rejected");
+        assert!(error.to_string().contains("not a directory"));
     }
 
     #[test]
