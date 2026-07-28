@@ -180,7 +180,7 @@ impl Session {
                     );
                     continue;
                 };
-                match PaneProcess::connect(socket_path) {
+                match PaneProcess::connect_live(socket_path) {
                     Ok(process) => {
                         panes.insert(
                             pane_id,

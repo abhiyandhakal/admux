@@ -4055,18 +4055,6 @@ root = { command = ["sh"] }
                 .expect("write handshake response");
             drop(stream);
 
-            let (mut stream, _) = helper_listener.accept().expect("accept liveness request");
-            let mut input = Vec::new();
-            stream.read_to_end(&mut input).expect("read liveness request");
-            assert_eq!(
-                serde_json::from_slice::<serde_json::Value>(&input).expect("decode liveness request"),
-                serde_json::json!("IsAlive"),
-            );
-            stream
-                .write_all(br#"{"IsAlive":{"alive":true}}"#)
-                .expect("write liveness response");
-            drop(stream);
-
             let (mut stream, _) = helper_listener.accept().expect("accept send request");
             let mut input = Vec::new();
             stream.read_to_end(&mut input).expect("read send request");

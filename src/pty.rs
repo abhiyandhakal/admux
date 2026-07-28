@@ -293,6 +293,11 @@ impl PaneProcess {
         }
         let process = Self { socket_path };
         process.ensure_protocol()?;
+        Ok(process)
+    }
+
+    pub fn connect_live(socket_path: PathBuf) -> Result<Self> {
+        let process = Self::connect(socket_path)?;
         if !process.is_alive() {
             bail!(
                 "pane helper at {} is not alive",
