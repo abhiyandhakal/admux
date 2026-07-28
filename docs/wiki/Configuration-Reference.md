@@ -8,6 +8,14 @@ Global config lives at:
 
 `admux` keeps config intentionally grouped and typed.
 
+For isolated runs and tests, the runtime paths can be overridden independently:
+
+```text
+ADMUX_SOCKET=/path/to/admux.sock
+ADMUX_CONFIG=/path/to/config.toml
+ADMUX_STATE=/path/to/state.json
+```
+
 ## Main Sections
 
 - `[ui]`
@@ -55,6 +63,8 @@ scrollback_lines = 10000
 workspace_snapshot_lines = 500
 resize_step = 25
 copy_page_size = 20
+window_base = 1
+pane_base = 1
 
 [defaults.session]
 name_prefix = "work"
