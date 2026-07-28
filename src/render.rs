@@ -1,4 +1,6 @@
 use std::io::Write;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
@@ -478,7 +480,7 @@ fn render_preview_snapshot<W: Write>(
                     content.y + u16::try_from(offset).expect("content height bounds offset"),
                 )
             )?;
-            if plain_row.chars().count() <= content.width as usize {
+            if display_width(plain_row) <= content.width as usize {
                 out.write_all(formatted_row.as_bytes())?;
             } else {
                 queue_style(out, &ui.theme.help)?;
@@ -615,7 +617,7 @@ fn render_bottom_bar<W: Write>(
                 SetAttribute(Attribute::Reset)
             )?;
             return Ok(Some(
-                (1 + buffer[..cursor.min(buffer.len())].chars().count())
+                (1 + display_width(&buffer[..cursor.min(buffer.len())]))
                     .min(size.width.saturating_sub(1) as usize) as u16,
             ));
         }
@@ -675,14 +677,14 @@ fn render_selection_overlay<W: Write>(
             pane.rect.width.saturating_sub(1)
         };
         for col in start_col..=end_col.min(pane.rect.width.saturating_sub(1)) {
-            let ch = line
-                .and_then(|line| line.chars().nth(col as usize))
-                .unwrap_or(' ');
+            let cell = line
+                .and_then(|line| terminal_cell_at(line, col as usize))
+                .unwrap_or(" ");
             queue!(
                 out,
                 MoveTo(pane.rect.x + col, offset_row(pane.rect.y + row, ui)),
                 SetAttribute(Attribute::Reverse),
-                Print(ch)
+                Print(cell)
             )?;
         }
     }
@@ -735,7 +737,7 @@ impl StatusSegment {
     }
 
     fn len(&self) -> usize {
-        self.text.chars().count()
+        display_width(&self.text)
     }
 }
 
@@ -939,8 +941,8 @@ fn shorten_window_segment(segment: &mut StatusSegment) -> bool {
     };
     let marker = rest.chars().last().filter(|ch| matches!(ch, '*' | '-'));
     let name = rest.trim_end_matches(['*', '-']);
-    if name.chars().count() > 1 {
-        let shortened = truncate(name, (name.chars().count().saturating_sub(1)) as u16);
+    if display_width(name) > 1 {
+        let shortened = truncate(name, display_width(name).saturating_sub(1) as u16);
         let marker = marker.map(|ch| ch.to_string()).unwrap_or_default();
         segment.text = format!(" {}:{}{} ", index, shortened, marker);
         return true;
@@ -965,7 +967,7 @@ fn simplify_clock_segment(segment: &mut StatusSegment) -> bool {
 fn shorten_non_active_session_segment(segment: &mut StatusSegment) -> bool {
     let trimmed = segment.text.trim();
     let label = trimmed.trim_end_matches('?');
-    let label_len = label.chars().count();
+    let label_len = display_width(label);
     if label_len <= 1 {
         return false;
     }
@@ -982,7 +984,7 @@ fn shorten_non_active_session_segment(segment: &mut StatusSegment) -> bool {
 fn shorten_active_session_segment(segment: &mut StatusSegment) -> bool {
     let trimmed = segment.text.trim();
     let name = trimmed.trim_matches(['[', ']']);
-    let name_len = name.chars().count();
+    let name_len = display_width(name);
     if name_len <= 1 {
         return false;
     }
@@ -1021,7 +1023,7 @@ fn render_status_segments<W: Write>(
             break;
         }
         let text = truncate(&segment.text, remaining as u16);
-        written += text.chars().count();
+        written += display_width(&text);
         queue!(out, Print(text))?;
     }
     if written < width as usize {
@@ -1076,7 +1078,7 @@ fn render_status_segments_at<W: Write>(
         }
         let remaining = width as usize - written;
         let text = truncate(&segment.text, remaining as u16);
-        written += text.chars().count();
+        written += display_width(&text);
         queue!(out, Print(text), SetAttribute(Attribute::Reset))?;
     }
     Ok(())
@@ -1157,8 +1159,8 @@ fn chooser_viewport_start(selected: usize, item_count: usize, visible: usize) ->
 
 fn fit_width(value: &str, width: u16) -> String {
     let safe = terminal_safe(value);
-    let mut fitted: String = safe.chars().take(width as usize).collect();
-    let current = fitted.chars().count();
+    let mut fitted = truncate_display_width(&safe, width as usize);
+    let current = display_width(&fitted);
     if current < width as usize {
         fitted.push_str(&" ".repeat(width as usize - current));
     }
@@ -1166,7 +1168,40 @@ fn fit_width(value: &str, width: u16) -> String {
 }
 
 fn truncate(value: &str, width: u16) -> String {
-    terminal_safe(value).chars().take(width as usize).collect()
+    truncate_display_width(&terminal_safe(value), width as usize)
+}
+
+fn display_width(value: &str) -> usize {
+    UnicodeWidthStr::width(value)
+}
+
+fn truncate_display_width(value: &str, width: usize) -> String {
+    let mut out = String::new();
+    let mut used: usize = 0;
+    for grapheme in UnicodeSegmentation::graphemes(value, true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if grapheme_width > 0 && used.saturating_add(grapheme_width) > width {
+            break;
+        }
+        out.push_str(grapheme);
+        used = used.saturating_add(grapheme_width);
+    }
+    out
+}
+
+fn terminal_cell_at(line: &str, column: usize) -> Option<&str> {
+    let mut start: usize = 0;
+    for grapheme in UnicodeSegmentation::graphemes(line, true) {
+        let width = UnicodeWidthStr::width(grapheme);
+        if width == 0 {
+            continue;
+        }
+        if (start..start.saturating_add(width)).contains(&column) {
+            return (column == start).then_some(grapheme).or(Some(" "));
+        }
+        start = start.saturating_add(width);
+    }
+    None
 }
 
 fn terminal_safe(value: &str) -> String {
@@ -1187,34 +1222,47 @@ fn truncate_ansi_preserving_style(value: &str, width: usize) -> String {
     }
 
     let mut out = String::new();
-    let mut chars = value.chars().peekable();
     let mut visible = 0usize;
+    let mut rest = value;
 
-    while let Some(ch) = chars.next() {
-        if ch == '\x1b' {
-            out.push(ch);
-            if let Some(next) = chars.next() {
-                out.push(next);
-                if next == '[' {
-                    for esc in chars.by_ref() {
-                        out.push(esc);
-                        if ('@'..='~').contains(&esc) {
-                            break;
-                        }
-                    }
-                }
-            }
+    while !rest.is_empty() {
+        if rest.starts_with('\x1b') {
+            let sequence_len = ansi_sequence_len(rest);
+            out.push_str(&rest[..sequence_len]);
+            rest = &rest[sequence_len..];
             continue;
         }
 
-        if visible >= width {
+        let grapheme = UnicodeSegmentation::graphemes(rest, true)
+            .next()
+            .expect("nonempty text has a grapheme");
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if grapheme_width > 0 && visible.saturating_add(grapheme_width) > width {
             break;
         }
-        out.push(ch);
-        visible += 1;
+        out.push_str(grapheme);
+        visible = visible.saturating_add(grapheme_width);
+        rest = &rest[grapheme.len()..];
     }
 
     if visible == 0 { String::new() } else { out }
+}
+
+fn ansi_sequence_len(value: &str) -> usize {
+    let mut chars = value.char_indices();
+    let _ = chars.next();
+    let Some((_, next)) = chars.next() else {
+        return value.len();
+    };
+    if next != '[' {
+        return 1 + next.len_utf8();
+    }
+    for (index, ch) in chars {
+        if ('@'..='~').contains(&ch) {
+            return index + ch.len_utf8();
+        }
+    }
+    value.len()
 }
 
 #[cfg(test)]
@@ -1375,6 +1423,25 @@ mod tests {
     fn ui_text_escapes_terminal_control_sequences() {
         assert_eq!(terminal_safe("name\x1b[31m\n"), "name^[[31m^J");
         assert_eq!(truncate("x\x07y", 4), "x^Gy");
+    }
+
+    #[test]
+    fn width_helpers_use_terminal_cells_not_unicode_scalar_counts() {
+        assert_eq!(display_width("界e\u{301}"), 3);
+        assert_eq!(fit_width("界", 4), "界  ");
+        assert_eq!(truncate("a界b", 2), "a");
+        assert_eq!(truncate("a界b", 3), "a界");
+        assert_eq!(truncate("e\u{301}x", 1), "e\u{301}");
+        assert_eq!(truncate_ansi_preserving_style("\x1b[31m界x\x1b[0m", 2), "\x1b[31m界");
+    }
+
+    #[test]
+    fn selection_cells_follow_wide_character_columns() {
+        assert_eq!(terminal_cell_at("a界b", 0), Some("a"));
+        assert_eq!(terminal_cell_at("a界b", 1), Some("界"));
+        assert_eq!(terminal_cell_at("a界b", 2), Some(" "));
+        assert_eq!(terminal_cell_at("a界b", 3), Some("b"));
+        assert_eq!(terminal_cell_at("e\u{301}", 0), Some("e\u{301}"));
     }
 
     #[test]

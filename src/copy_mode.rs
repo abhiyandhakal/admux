@@ -88,7 +88,7 @@ impl CopyMode {
     }
 
     pub fn move_line_end(&mut self, line: &str) {
-        self.cursor_col = terminal_index(line.trim_end().chars().count());
+        self.cursor_col = terminal_index(UnicodeWidthStr::width(line.trim_end()));
         self.update_selection();
     }
 
@@ -195,6 +195,15 @@ mod tests {
     }
 
     #[test]
+    fn line_end_uses_terminal_cell_width() {
+        let mut mode = CopyMode::new(1, 0, 0);
+
+        mode.move_line_end("a界  ");
+
+        assert_eq!(mode.cursor_col, 2);
+    }
+
+    #[test]
     fn copy_mode_movement_saturates_at_terminal_coordinate_limits() {
         let mut mode = CopyMode::new(1, u16::MAX, u16::MAX);
         mode.move_right(usize::MAX);
@@ -202,3 +211,4 @@ mod tests {
         assert_eq!((mode.cursor_row, mode.cursor_col), (u16::MAX, u16::MAX));
     }
 }
+use unicode_width::UnicodeWidthStr;
