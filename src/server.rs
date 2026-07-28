@@ -134,6 +134,7 @@ impl SessionStore {
         helper_dir: PathBuf,
     ) -> Result<Self> {
         let persisted = load_state(&state_path)?;
+        let legacy_buffers_present = !persisted.buffers.is_empty();
         let next_window_id = persisted.next_window_id.max(
             persisted
                 .sessions
@@ -144,7 +145,7 @@ impl SessionStore {
                 .unwrap_or(0),
         );
         let mut store = Self {
-            buffers: BufferStore::from_persisted(persisted.buffers),
+            buffers: BufferStore::default(),
             workspace_mappings: persisted.workspaces,
             persisted_sessions: persisted.sessions,
             state_path: Some(state_path),
@@ -173,6 +174,9 @@ impl SessionStore {
                 store.persisted_sessions.remove(&name);
                 store.remove_workspace_mappings_for_session(&name);
             }
+        }
+        if legacy_buffers_present {
+            store.persist_metadata()?;
         }
         Ok(store)
     }
@@ -900,7 +904,7 @@ impl SessionStore {
             schema_version: crate::persistence::STATE_SCHEMA_VERSION,
             last_session: self.last_session.clone(),
             next_window_id: self.next_window_id,
-            buffers: self.buffers.snapshot(),
+            buffers: Vec::new(),
             workspaces: self.workspace_mappings.clone(),
             sessions: self.persisted_sessions.clone(),
         };
@@ -2259,7 +2263,7 @@ mod tests {
     }
 
     #[test]
-    fn persisted_metadata_survives_store_restart() {
+    fn persisted_metadata_survives_store_restart_without_paste_contents() {
         let dir = tempdir();
         let state_path = dir.path().join("state.json");
         let config_path = dir.path().join("config.toml");
@@ -2307,13 +2311,10 @@ mod tests {
             }),
             CommandResponse::Attached { session, .. } if session == "work"
         ));
-        assert_eq!(
+        assert!(matches!(
             restarted.handle(CommandRequest::ShowBuffer { buffer: None }),
-            CommandResponse::BufferShown {
-                name: "buffer0001".into(),
-                data: "hello".into(),
-            }
-        );
+            CommandResponse::Error { message } if message == "no matching paste buffer"
+        ));
     }
 
     #[test]

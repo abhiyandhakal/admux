@@ -29,7 +29,7 @@ pub struct PersistedState {
     pub schema_version: u32,
     pub last_session: Option<String>,
     pub next_window_id: u64,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub buffers: Vec<PasteBuffer>,
     #[serde(default)]
     pub workspaces: BTreeMap<String, String>,
@@ -409,21 +409,30 @@ fn backup_current_state(path: &Path) -> Result<()> {
     let backup = state_backup_path(path);
     let counter = STATE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let temporary_backup = backup.with_extension(format!("json.bak.{}.{}.tmp", process::id(), counter));
-    match fs::hard_link(path, &temporary_backup) {
-        Ok(()) => {}
+    let raw = match fs::read(path) {
+        Ok(raw) => raw,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => {
-            return Err(error).with_context(|| {
-                format!(
-                    "failed to create backup of state file {} as {}",
-                    path.display(),
-                    temporary_backup.display()
-                )
-            });
+            return Err(error)
+                .with_context(|| format!("failed to read state file {}", path.display()));
         }
+    };
+    let mut value: serde_json::Value = serde_json::from_slice(&raw)
+        .with_context(|| format!("failed to decode state file {} for backup", path.display()))?;
+    if let Some(object) = value.as_object_mut() {
+        object.remove("buffers");
     }
-    let backup_file = fs::File::open(&temporary_backup)
-        .with_context(|| format!("failed to open {}", temporary_backup.display()))?;
+    let sanitized =
+        serde_json::to_vec_pretty(&value).context("failed to encode sanitized state backup")?;
+    let mut backup_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary_backup)
+        .with_context(|| format!("failed to create {}", temporary_backup.display()))?;
+    backup_file
+        .write_all(&sanitized)
+        .with_context(|| format!("failed to write {}", temporary_backup.display()))?;
     backup_file
         .set_permissions(fs::Permissions::from_mode(0o600))
         .with_context(|| format!("failed to restrict permissions on {}", temporary_backup.display()))?;
@@ -522,10 +531,18 @@ mod tests {
         save_state(&path, &state).expect("save");
         let loaded = load_state(&path).expect("load");
 
-        assert_eq!(loaded, state);
+        let mut expected = state.clone();
+        expected.buffers.clear();
+        assert_eq!(loaded, expected);
+        let saved = fs::read_to_string(&path).expect("read saved state");
+        assert!(!saved.contains("buffer0001"));
+        assert!(!saved.contains("hello"));
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
             .expect("make state file broadly readable");
         save_state(&path, &state).expect("replace state with restricted permissions");
+        let backup = fs::read_to_string(state_backup_path(&path)).expect("read backup state");
+        assert!(!backup.contains("buffer0001"));
+        assert!(!backup.contains("hello"));
         for protected_path in [&path, &state_backup_path(&path)] {
             assert_eq!(
                 fs::metadata(protected_path)
@@ -536,6 +553,34 @@ mod tests {
                 0o600,
                 "state and backups can include pasted secrets and must not be world-readable"
             );
+        }
+    }
+
+    #[test]
+    fn saving_legacy_buffer_state_redacts_primary_and_backup() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+        fs::write(
+            &path,
+            br#"{
+                "schema_version": 1,
+                "last_session": null,
+                "next_window_id": 0,
+                "buffers": [{"name":"buffer0001","data":"secret-token","explicit_name":false,"created_seq":1}],
+                "workspaces": {},
+                "sessions": {}
+            }"#,
+        )
+        .expect("write legacy state");
+
+        let state = load_state(&path).expect("load legacy state");
+        assert_eq!(state.buffers.len(), 1);
+        save_state(&path, &state).expect("redact legacy state");
+
+        for redacted in [&path, &state_backup_path(&path)] {
+            let contents = fs::read_to_string(redacted).expect("read redacted state");
+            assert!(!contents.contains("secret-token"));
+            assert!(!contents.contains("\"buffers\""));
         }
     }
 
