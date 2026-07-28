@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
 use crate::{
     config::WindowDefaults,
@@ -551,17 +551,8 @@ impl Session {
     pub fn set_viewport(&mut self, rows: u16, cols: u16) -> Result<()> {
         let rows = rows.max(1);
         let cols = cols.max(1);
-        let previous_area = self.pane_area();
         let next_area = self.pane_area_for(rows, cols);
-        if let Err(error) = self.resize_window_panes(self.active_window, next_area) {
-            if let Err(rollback_error) = self.resize_window_panes(self.active_window, previous_area)
-            {
-                return Err(error.context(format!(
-                    "failed to restore pane sizes after resize failure: {rollback_error}"
-                )));
-            }
-            return Err(error);
-        }
+        self.resize_window_panes(self.active_window, next_area)?;
         self.rows = rows;
         self.cols = cols;
         Ok(())
@@ -907,17 +898,17 @@ impl Session {
             .windows
             .get_mut(&window_id)
             .ok_or_else(|| anyhow!("unknown window"))?;
+        let previous_layout = window.layout.clone();
         if let Some(pane_id) = pane_id {
             if !window.panes.contains_key(&pane_id) {
                 return Err(anyhow!("unknown pane"));
             }
-            let previous_active = window.layout.active;
             window.layout.active = pane_id;
             if !window
                 .layout
                 .resize_active(convert_direction(direction), amount)
             {
-                window.layout.active = previous_active;
+                window.layout = previous_layout;
                 return Err(anyhow!("no resizable split in that direction"));
             }
         } else if !window
@@ -926,7 +917,17 @@ impl Session {
         {
             return Err(anyhow!("no resizable split in that direction"));
         }
-        self.sync_pane_sizes()
+        if window_id != self.active_window {
+            return Ok(());
+        }
+        if let Err(error) = self.sync_pane_sizes() {
+            self.windows
+                .get_mut(&window_id)
+                .expect("window was validated before resizing")
+                .layout = previous_layout;
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn select_window(&mut self, window_id: WindowId) -> Result<()> {
@@ -1129,9 +1130,45 @@ impl Session {
             .get(&window_id)
             .ok_or_else(|| anyhow!("unknown window {}", window_id.0))?;
         let rects = window.layout.pane_rects(area);
+        let mut resizes = Vec::with_capacity(window.panes.len());
         for (pane_id, pane) in &window.panes {
             let rect = rects.get(pane_id).copied().unwrap_or(area);
-            pane.process.resize(rect.height.max(1), rect.width.max(1))?;
+            let (rows, cols) = pane
+                .process
+                .screen_size()
+                .with_context(|| format!("failed to inspect pane {} before resize", pane_id.0))?;
+            resizes.push((
+                *pane_id,
+                pane,
+                (rows, cols),
+                (rect.height.max(1), rect.width.max(1)),
+            ));
+        }
+
+        let mut resized: Vec<(PaneId, &PaneRuntime, (u16, u16))> =
+            Vec::with_capacity(resizes.len());
+        for (pane_id, pane, previous, target) in resizes {
+            if let Err(error) = pane.process.resize(target.0, target.1) {
+                let rollback_failures = resized
+                    .into_iter()
+                    .rev()
+                    .filter_map(|(pane_id, pane, previous)| {
+                        pane.process
+                            .resize(previous.0, previous.1)
+                            .err()
+                            .map(|rollback_error| format!("pane {}: {rollback_error}", pane_id.0))
+                    })
+                    .collect::<Vec<_>>();
+                if rollback_failures.is_empty() {
+                    return Err(error.context(format!("failed to resize pane {}", pane_id.0)));
+                }
+                return Err(error.context(format!(
+                    "failed to resize pane {}; additionally failed to restore already resized panes: {}",
+                    pane_id.0,
+                    rollback_failures.join("; ")
+                )));
+            }
+            resized.push((pane_id, pane, previous));
         }
         Ok(())
     }
@@ -1365,6 +1402,72 @@ mod tests {
     }
 
     #[test]
+    fn resizing_an_inactive_window_does_not_contact_its_hidden_helpers() {
+        let helper_dir = tempdir();
+        let mut session = Session::new(
+            "work".into(),
+            None,
+            None,
+            vec!["sh".into()],
+            WindowId(1),
+            None,
+            10_000,
+            Numbering {
+                window_base: 0,
+                pane_base: 0,
+            },
+            WindowDefaults::default(),
+            helper_dir.path().to_path_buf(),
+        )
+        .expect("create session");
+        session
+            .new_window(WindowId(2), Some("hidden".into()), &["sh".into()])
+            .expect("create hidden window");
+        session
+            .split_active_pane(SplitAxis::Horizontal, &["sh".into()])
+            .expect("split hidden window");
+        session.select_window(WindowId(1)).expect("select visible window");
+        let original_layout = session
+            .windows
+            .get(&WindowId(2))
+            .expect("hidden window")
+            .layout
+            .clone();
+        let hidden_socket = session
+            .windows
+            .get(&WindowId(2))
+            .expect("hidden window")
+            .panes
+            .get(&PaneId(1))
+            .expect("hidden pane")
+            .process
+            .socket_path()
+            .to_path_buf();
+        let moved_socket = hidden_socket.with_extension("hidden");
+        fs::rename(&hidden_socket, &moved_socket).expect("hide helper socket");
+
+        session
+            .resize_active_pane(
+                Some(WindowId(2)),
+                None,
+                NavigationDirection::Up,
+                50,
+            )
+            .expect("hidden resize updates layout without contacting the helper");
+        assert_ne!(
+            session
+                .windows
+                .get(&WindowId(2))
+                .expect("hidden window")
+                .layout,
+            original_layout
+        );
+
+        fs::rename(&moved_socket, &hidden_socket).expect("restore helper socket");
+        session.kill().expect("clean up session");
+    }
+
+    #[test]
     fn failed_split_resize_rolls_back_the_new_helper_and_model_entry() {
         let helper_dir = tempdir();
         let mut session = Session::new(
@@ -1399,7 +1502,7 @@ mod tests {
             Ok(_) => panic!("resize must fail through the hidden root helper"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("failed to connect pane helper"));
+        assert!(format!("{error:#}").contains("failed to connect pane helper"));
         let window = session.active_window().expect("active window");
         assert_eq!(window.panes.len(), 1);
         assert_eq!(window.layout.panes(), vec![PaneId(0)]);
@@ -1412,6 +1515,79 @@ mod tests {
         );
 
         fs::rename(&hidden_socket, &socket).expect("restore root helper socket");
+        session.kill().expect("clean up session");
+    }
+
+    #[test]
+    fn failed_pane_resize_preserves_layout_and_existing_pane_sizes() {
+        let helper_dir = tempdir();
+        let mut session = Session::new(
+            "work".into(),
+            None,
+            None,
+            vec!["sh".into()],
+            WindowId(1),
+            None,
+            10_000,
+            Numbering {
+                window_base: 0,
+                pane_base: 0,
+            },
+            WindowDefaults::default(),
+            helper_dir.path().to_path_buf(),
+        )
+        .expect("create session");
+        session
+            .split_active_pane(SplitAxis::Horizontal, &["sh".into()])
+            .expect("split pane");
+        let original_layout = session
+            .active_window()
+            .expect("active window")
+            .layout
+            .clone();
+        let first_size = session
+            .active_window()
+            .expect("active window")
+            .panes
+            .get(&PaneId(0))
+            .expect("first pane")
+            .process
+            .screen_size()
+            .expect("query first pane size");
+        let second_socket = session
+            .active_window()
+            .expect("active window")
+            .panes
+            .get(&PaneId(1))
+            .expect("second pane")
+            .process
+            .socket_path()
+            .to_path_buf();
+        let hidden_socket = second_socket.with_extension("hidden");
+        fs::rename(&second_socket, &hidden_socket).expect("hide second helper socket");
+
+        let error = session
+            .resize_active_pane(None, None, NavigationDirection::Up, 50)
+            .expect_err("resize must fail through the hidden second helper");
+        assert!(
+            format!("{error:#}").contains("failed to inspect pane 1 before resize"),
+            "unexpected resize error: {error:#}"
+        );
+        let window = session.active_window().expect("active window");
+        assert_eq!(window.layout, original_layout, "layout must be restored");
+        assert_eq!(
+            window
+                .panes
+                .get(&PaneId(0))
+                .expect("first pane")
+                .process
+                .screen_size()
+                .expect("query first pane size"),
+            first_size,
+            "a failed peer probe must leave earlier panes untouched"
+        );
+
+        fs::rename(&hidden_socket, &second_socket).expect("restore second helper socket");
         session.kill().expect("clean up session");
     }
 
