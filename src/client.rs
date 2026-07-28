@@ -285,10 +285,10 @@ pub fn run(cli: AdmuxCli) -> Result<()> {
         },
         ClientCommand::SaveBuffer(args) => CommandRequest::SaveBuffer {
             buffer: args.buffer,
-            path: args.path,
+            path: resolve_client_path(args.path)?,
         },
         ClientCommand::LoadBuffer(args) => CommandRequest::LoadBuffer {
-            path: args.path,
+            path: resolve_client_path(args.path)?,
             buffer: args.buffer,
         },
         ClientCommand::Kill(args) => CommandRequest::KillSession {
@@ -377,6 +377,15 @@ fn normalize_new_args(mut args: crate::cli::NewArgs) -> Result<crate::cli::NewAr
     }
 
     Ok(args)
+}
+
+fn resolve_client_path(path: PathBuf) -> Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    Ok(std::env::current_dir()
+        .context("failed to resolve current directory")?
+        .join(path))
 }
 
 fn apply_attached_session(
@@ -1834,7 +1843,7 @@ fn execute_prompt_command(
                 paths,
                 CommandRequest::SaveBuffer {
                     buffer,
-                    path: path.into(),
+                    path: resolve_client_path(path.into())?,
                 },
             )?;
             Ok(Some(format_list_response(response)))
@@ -1843,7 +1852,7 @@ fn execute_prompt_command(
             let response = request_response(
                 paths,
                 CommandRequest::LoadBuffer {
-                    path: path.into(),
+                    path: resolve_client_path(path.into())?,
                     buffer,
                 },
             )?;
@@ -3082,6 +3091,21 @@ root = { command = ["sh"] }
                     .expect("current directory")
                     .join("relative-project")
             )
+        );
+    }
+
+    #[test]
+    fn buffer_file_paths_are_resolved_at_the_client() {
+        assert_eq!(
+            resolve_client_path(PathBuf::from("buffers/output.txt")).expect("resolve relative"),
+            std::env::current_dir()
+                .expect("current directory")
+                .join("buffers/output.txt")
+        );
+        let absolute = PathBuf::from("/tmp/admux-buffer.txt");
+        assert_eq!(
+            resolve_client_path(absolute.clone()).expect("preserve absolute"),
+            absolute
         );
     }
 
