@@ -743,11 +743,11 @@ fn resolve_cwd(path: Option<&PathBuf>, base: &Path) -> Result<PathBuf> {
 
 fn resolve_ratio(value: Option<f32>) -> Result<u16> {
     let value = value.unwrap_or(0.5);
-    if !(0.0 < value && value < 1.0) {
-        bail!("workspace split size must be between 0 and 1");
+    if !(0.1..=0.9).contains(&value) {
+        bail!("workspace split size must be between 0.1 and 0.9");
     }
     let ratio = (value * 1000.0).round() as u16;
-    Ok(ratio.clamp(100, 900))
+    Ok(ratio)
 }
 
 #[cfg(test)]
@@ -939,7 +939,29 @@ command = ["cargo", "test"]
         )
         .unwrap_err();
 
-        assert!(error.to_string().contains("between 0 and 1"));
+        assert!(error.to_string().contains("between 0.1 and 0.9"));
+    }
+
+    #[test]
+    fn rejects_ratios_that_would_be_silently_clamped() {
+        let error = load(
+            r#"
+version = 1
+
+[[windows]]
+name = "editor"
+root = { command = ["nvim"] }
+
+[[windows.splits]]
+target = 0
+direction = "vertical"
+size = 0.01
+command = ["cargo", "test"]
+"#,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("between 0.1 and 0.9"));
     }
 
     #[test]
