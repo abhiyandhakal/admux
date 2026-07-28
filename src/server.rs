@@ -16,15 +16,16 @@ const PRUNE_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_IPC_MESSAGE_BYTES: u64 = 1024 * 1024;
 const MAX_SESSION_NAME_BYTES: usize = 64;
 const MAX_WINDOW_NAME_BYTES: usize = 128;
+const CLIENT_VIEWPORT_LEASE: Duration = Duration::from_secs(5);
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
 use crate::{
     buffer::{BufferStore, MAX_BUFFER_BYTES},
     config::{Config, ResolvedConfig},
     ipc::{
-        BufferSummary, CURRENT_PROTOCOL_VERSION, CommandRequest, CommandResponse, CycleDirection,
-        NavigationDirection, ProtocolVersion, SessionSummary,
+        BufferSummary, CURRENT_PROTOCOL_VERSION, ClientViewport, CommandRequest, CommandResponse,
+        CycleDirection, NavigationDirection, ProtocolVersion, SessionSummary,
     },
     numbering::Numbering,
     pane::{PaneId, WindowId},
@@ -52,6 +53,14 @@ pub struct SessionStore {
     config_path: Option<std::path::PathBuf>,
     config: ResolvedConfig,
     last_prune: Option<Instant>,
+    client_viewports: BTreeMap<String, BTreeMap<String, ClientViewportLease>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ClientViewportLease {
+    rows: u16,
+    cols: u16,
+    last_seen: Instant,
 }
 
 impl Default for SessionStore {
@@ -71,6 +80,7 @@ impl Default for SessionStore {
                 .resolve()
                 .expect("default config should resolve"),
             last_prune: None,
+            client_viewports: BTreeMap::new(),
         }
     }
 }
@@ -266,7 +276,7 @@ impl SessionStore {
                 },
             },
             CommandRequest::SaveWorkspace { session } => self.save_workspace(session),
-            CommandRequest::Attach { session } => {
+            CommandRequest::Attach { session, viewport } => {
                 let Some(session_name) = self.resolve_session(session) else {
                     return CommandResponse::Error {
                         message: "no sessions available".into(),
@@ -279,10 +289,25 @@ impl SessionStore {
                     .unwrap_or(session_name);
                 if self.sessions.contains_key(&session_name) {
                     self.last_session = Some(session_name.clone());
+                    let render_area = match viewport {
+                        Some(viewport) => match self.update_client_viewport(&session_name, viewport) {
+                            Ok(area) => area,
+                            Err(error) => {
+                                return CommandResponse::Error {
+                                    message: error.to_string(),
+                                };
+                            }
+                        },
+                        None => self
+                            .sessions
+                            .get(&session_name)
+                            .expect("checked contains")
+                            .pane_area(),
+                    };
                     let session = self.sessions.get(&session_name).expect("checked contains");
                     let mut snapshot =
                         session
-                            .render_snapshot(session.pane_area())
+                            .render_snapshot(render_area)
                             ;
                     let (preview, formatted_preview, formatted_cursor) = snapshot
                         .as_ref()
@@ -851,6 +876,39 @@ impl SessionStore {
             changed = true;
         }
         changed
+    }
+
+    fn update_client_viewport(
+        &mut self,
+        session_name: &str,
+        viewport: ClientViewport,
+    ) -> Result<crate::pane::Rect> {
+        let now = Instant::now();
+        let rows = viewport.rows.max(1);
+        let cols = viewport.cols.max(1);
+        let leases = self
+            .client_viewports
+            .entry(session_name.to_string())
+            .or_default();
+        leases.retain(|_, lease| now.duration_since(lease.last_seen) <= CLIENT_VIEWPORT_LEASE);
+        leases.insert(
+            viewport.client_id,
+            ClientViewportLease {
+                rows,
+                cols,
+                last_seen: now,
+            },
+        );
+        let pty_rows = leases.values().map(|lease| lease.rows).max().unwrap_or(rows);
+        let pty_cols = leases.values().map(|lease| lease.cols).max().unwrap_or(cols);
+        let session = self
+            .sessions
+            .get_mut(session_name)
+            .ok_or_else(|| anyhow!("unknown session {session_name}"))?;
+        if session.rows != pty_rows || session.cols != pty_cols {
+            session.set_viewport(pty_rows, pty_cols)?;
+        }
+        Ok(session.pane_area_for_viewport(rows, cols))
     }
 
     fn prune_due(&self) -> bool {
@@ -2081,7 +2139,10 @@ mod tests {
         });
         let mut attached = None;
         for _ in 0..50 {
-            let response = store.handle(CommandRequest::Attach { session: None });
+            let response = store.handle(CommandRequest::Attach {
+                session: None,
+                viewport: None,
+            });
             if matches!(
                 response,
                 CommandResponse::Attached { ref preview, .. } if preview.contains("attached")
@@ -2126,6 +2187,58 @@ mod tests {
             .expect("session")
             .kill()
             .expect("clean up session");
+    }
+
+    #[test]
+    fn attached_clients_render_their_own_viewports_while_ptys_use_the_largest_lease() {
+        let mut store = SessionStore::default();
+        assert!(matches!(
+            store.handle(CommandRequest::NewSession {
+                name: Some("work".into()),
+                cwd: None,
+                command: vec!["sh".into()],
+                switch_from: None,
+            }),
+            CommandResponse::SessionCreated { .. }
+        ));
+
+        let attach = |store: &mut SessionStore, client_id: &str, rows, cols| {
+            match store.handle(CommandRequest::Attach {
+                session: Some("work".into()),
+                viewport: Some(ClientViewport {
+                    client_id: client_id.into(),
+                    rows,
+                    cols,
+                }),
+            }) {
+                CommandResponse::Attached {
+                    snapshot: Some(snapshot),
+                    ..
+                } => snapshot,
+                other => panic!("unexpected attach response: {other:?}"),
+            }
+        };
+
+        let small = attach(&mut store, "small", 24, 80);
+        assert_eq!(small.panes[0].rect.width, 80);
+        assert_eq!(small.panes[0].rect.height, 23);
+        let large = attach(&mut store, "large", 50, 160);
+        assert_eq!(large.panes[0].rect.width, 160);
+        assert_eq!(large.panes[0].rect.height, 49);
+        let small_again = attach(&mut store, "small", 24, 80);
+        assert_eq!(small_again.panes[0].rect.width, 80);
+        assert_eq!(small_again.panes[0].rect.height, 23);
+
+        let session = store.sessions.get("work").expect("live session");
+        assert_eq!((session.rows, session.cols), (50, 160));
+        let pane = session
+            .active_window()
+            .expect("active window")
+            .panes
+            .get(&PaneId(0))
+            .expect("root pane");
+        assert_eq!(pane.process.screen_size().expect("query PTY size"), (49, 160));
+        session.kill().expect("clean up session");
     }
 
     #[test]
@@ -2311,6 +2424,7 @@ mod tests {
 
         let attached = store.handle(CommandRequest::Attach {
             session: Some("work".into()),
+            viewport: None,
         });
         assert!(matches!(
             attached,
@@ -2364,6 +2478,7 @@ mod tests {
         assert!(matches!(
             restarted.handle(CommandRequest::Attach {
                 session: Some("work".into()),
+                viewport: None,
             }),
             CommandResponse::Attached { session, .. } if session == "work"
         ));

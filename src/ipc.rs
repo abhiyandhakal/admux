@@ -11,7 +11,14 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtocolVersion(pub u16);
 
-pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(5);
+pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(6);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientViewport {
+    pub client_id: String,
+    pub rows: u16,
+    pub cols: u16,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommandRequest {
@@ -34,6 +41,8 @@ pub enum CommandRequest {
     },
     Attach {
         session: Option<String>,
+        #[serde(default)]
+        viewport: Option<ClientViewport>,
     },
     PreviewSession {
         session: String,

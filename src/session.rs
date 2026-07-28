@@ -571,6 +571,10 @@ impl Session {
         self.pane_area_for(self.rows, self.cols)
     }
 
+    pub fn pane_area_for_viewport(&self, rows: u16, cols: u16) -> Rect {
+        self.pane_area_for(rows, cols)
+    }
+
     fn pane_area_for(&self, rows: u16, cols: u16) -> Rect {
         Rect {
             x: 0,

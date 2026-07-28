@@ -7,6 +7,7 @@ use std::{
     os::unix::net::UnixStream,
     path::PathBuf,
     process::{Command, Stdio},
+    sync::atomic::{AtomicU64, Ordering},
     thread,
     time::{Duration, Instant},
 };
@@ -39,7 +40,7 @@ use crate::{
     copy_mode::{CopyMode, Selection},
     input::{InputAction, InputMode, InputState},
     ipc::{
-        BufferSummary, CommandRequest, CommandResponse, CycleDirection, NavigationDirection,
+        BufferSummary, ClientViewport, CommandRequest, CommandResponse, CycleDirection, NavigationDirection,
         PaneCursor, PaneMouseKind, PaneRender, RenderSnapshot, SwitchSource,
     },
     layout::SplitAxis,
@@ -57,9 +58,18 @@ use crate::{
 const ATTACH_INPUT_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const SNAPSHOT_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
 const ALT_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(150);
+static INTERACTIVE_CLIENT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn snapshot_refresh_due(elapsed: Duration) -> bool {
     elapsed >= SNAPSHOT_REFRESH_INTERVAL
+}
+
+fn interactive_client_id() -> String {
+    format!(
+        "{}-{}",
+        std::process::id(),
+        INTERACTIVE_CLIENT_COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -306,6 +316,7 @@ pub fn run(cli: AdmuxCli) -> Result<()> {
         }
         ClientCommand::Attach(args) => CommandRequest::Attach {
             session: args.session,
+            viewport: None,
         },
         ClientCommand::Ls => CommandRequest::ListSessions,
         ClientCommand::ListWindows(args) => CommandRequest::ListWindows {
@@ -904,7 +915,15 @@ fn run_attach_loop(
     let mut status_message: Option<String> = None;
     let mut prompt_history = Vec::<String>::new();
     let mut overlay = OverlayState::None;
-    let mut snapshot = fetch_attach_snapshot(paths, &mut current_session, &mut last_size, 80, 24)?;
+    let client_id = interactive_client_id();
+    let mut snapshot = fetch_attach_snapshot(
+        paths,
+        &mut current_session,
+        &mut last_size,
+        80,
+        24,
+        Some(&client_id),
+    )?;
     let mut snapshot_dirty = false;
     let mut render_dirty = true;
     let mut last_snapshot_refresh = Instant::now();
@@ -916,25 +935,23 @@ fn run_attach_loop(
         let rows = height.max(1);
         let cols = width.max(1);
         if last_size != (rows, cols) {
-            let _ = request_response(
-                paths,
-                CommandRequest::Resize {
-                    session: current_session.clone(),
-                    rows,
-                    cols,
-                },
-            )?;
             last_size = (rows, cols);
             let updated =
-                fetch_attach_snapshot(paths, &mut current_session, &mut last_size, width, height)?;
+                fetch_attach_snapshot(paths, &mut current_session, &mut last_size, width, height, Some(&client_id))?;
             render_dirty |= updated != snapshot;
             render_dirty |= matches!(overlay, OverlayState::ChooseTree(_));
             snapshot = updated;
             snapshot_dirty = false;
             last_snapshot_refresh = Instant::now();
         } else if snapshot_dirty && snapshot_refresh_due(last_snapshot_refresh.elapsed()) {
-            let updated =
-                fetch_attach_snapshot(paths, &mut current_session, &mut last_size, width, height)?;
+            let updated = fetch_attach_snapshot(
+                paths,
+                &mut current_session,
+                &mut last_size,
+                width,
+                height,
+                Some(&client_id),
+            )?;
             render_dirty |= updated != snapshot;
             render_dirty |= matches!(overlay, OverlayState::ChooseTree(_));
             snapshot = updated;
@@ -1048,6 +1065,7 @@ fn run_attach_loop(
                     &mut last_size,
                     width,
                     height,
+                    Some(&client_id),
                 )?;
                 render_dirty |= updated != snapshot;
                 render_dirty |= matches!(overlay, OverlayState::ChooseTree(_));
@@ -1524,6 +1542,7 @@ fn run_attach_loop(
                     &mut last_size,
                     width,
                     height,
+                    Some(&client_id),
                 )?;
                 snapshot = updated;
                 snapshot_dirty = false;
@@ -1678,11 +1697,17 @@ fn fetch_attach_snapshot(
     last_size: &mut (u16, u16),
     width: u16,
     height: u16,
+    client_id: Option<&str>,
 ) -> Result<RenderSnapshot> {
     let response = request_response(
         paths,
         CommandRequest::Attach {
             session: Some(current_session.clone()),
+            viewport: client_id.map(|client_id| ClientViewport {
+                client_id: client_id.to_string(),
+                rows: height.max(1),
+                cols: width.max(1),
+            }),
         },
     )?;
     apply_attached_session(&response, current_session, last_size);
@@ -2016,6 +2041,7 @@ fn execute_prompt_command(
                 paths,
                 CommandRequest::Attach {
                     session: Some(target.clone()),
+                    viewport: None,
                 },
             )?;
             apply_prompt_session_switch(current_session, last_size, response)?;
@@ -2505,6 +2531,7 @@ fn handle_choose_tree_key(
                             paths,
                             CommandRequest::Attach {
                                 session: Some(session),
+                                viewport: None,
                             },
                         )? {
                             CommandResponse::Attached { session, .. } => {
