@@ -749,6 +749,18 @@ fn print_response(paths: &RuntimePaths, response: CommandResponse) -> Result<()>
                 }
             }
         }
+        CommandResponse::ChooseTreeList { sessions } => {
+            for session in sessions {
+                let stale = if session.stale { " (stale)" } else { "" };
+                println!("{}:{} windows{stale}", session.name, session.windows.len());
+                for entry in session.windows {
+                    println!("  {} {}", entry.window.index, entry.window.name);
+                    for pane in entry.panes {
+                        println!("    {} {}", pane.id, pane.title);
+                    }
+                }
+            }
+        }
         CommandResponse::WindowList { windows } => {
             for window in windows {
                 let marker = if window.active { "*" } else { " " };
@@ -2324,9 +2336,9 @@ fn build_choose_buffer(paths: &RuntimePaths) -> Result<ChooseBufferState> {
 
 fn rebuild_choose_tree(paths: &RuntimePaths, state: &mut ChooseTreeState) -> Result<()> {
     state.preview = None;
-    let sessions = match request_response(paths, CommandRequest::ListSessions)? {
-        CommandResponse::SessionList { sessions } => sessions,
-        other => return Err(anyhow!("unexpected session list response: {other:?}")),
+    let sessions = match request_response(paths, CommandRequest::ListChooseTree)? {
+        CommandResponse::ChooseTreeList { sessions } => sessions,
+        other => return Err(anyhow!("unexpected choose-tree response: {other:?}")),
     };
     let mut items = Vec::new();
     let mut lines = Vec::new();
@@ -2335,15 +2347,7 @@ fn rebuild_choose_tree(paths: &RuntimePaths, state: &mut ChooseTreeState) -> Res
         let session_name = session.name.clone();
         let expanded = state.expanded_sessions.contains(&session_name);
         items.push(ChooseItem::Session(session_name.clone()));
-        let window_count = match request_response(
-            paths,
-            CommandRequest::ListWindows {
-                session: session_name.clone(),
-            },
-        )? {
-            CommandResponse::WindowList { windows } => windows.len(),
-            _ => 0,
-        };
+        let window_count = session.windows.len();
         lines.push(TreeLine {
             depth: 0,
             label: if session_name == state.attached_session {
@@ -2364,16 +2368,8 @@ fn rebuild_choose_tree(paths: &RuntimePaths, state: &mut ChooseTreeState) -> Res
         if !expanded {
             continue;
         }
-        let windows = match request_response(
-            paths,
-            CommandRequest::ListWindows {
-                session: session_name.clone(),
-            },
-        )? {
-            CommandResponse::WindowList { windows } => windows,
-            _ => Vec::new(),
-        };
-        for window in windows {
+        for entry in session.windows {
+            let crate::ipc::ChooseTreeWindow { window, panes } = entry;
             let expanded_window = state
                 .expanded_windows
                 .contains(&(session_name.clone(), window.index));
@@ -2391,15 +2387,6 @@ fn rebuild_choose_tree(paths: &RuntimePaths, state: &mut ChooseTreeState) -> Res
             if !expanded_window {
                 continue;
             }
-            let panes = match request_response(
-                paths,
-                CommandRequest::ListPanes {
-                    target: format!("{session_name}:{}", window.index),
-                },
-            )? {
-                CommandResponse::PaneList { panes } => panes,
-                _ => Vec::new(),
-            };
             for pane in panes {
                 items.push(ChooseItem::Pane {
                     session: session_name.clone(),
@@ -2762,26 +2749,16 @@ fn toggle_choose_selected(tree: &mut ChooseTreeState) {
 }
 
 fn expand_all_choose_items(paths: &RuntimePaths, tree: &mut ChooseTreeState) -> Result<()> {
-    let sessions: Vec<String> = match request_response(paths, CommandRequest::ListSessions)? {
-        CommandResponse::SessionList { sessions } => {
-            sessions.into_iter().map(|session| session.name).collect()
-        }
-        other => return Err(anyhow!("unexpected session list response: {other:?}")),
+    let sessions = match request_response(paths, CommandRequest::ListChooseTree)? {
+        CommandResponse::ChooseTreeList { sessions } => sessions,
+        other => return Err(anyhow!("unexpected choose-tree response: {other:?}")),
     };
-    tree.expanded_sessions = sessions.iter().cloned().collect();
+    tree.expanded_sessions = sessions.iter().map(|session| session.name.clone()).collect();
     tree.expanded_windows.clear();
     for session in sessions {
-        let windows = match request_response(
-            paths,
-            CommandRequest::ListWindows {
-                session: session.clone(),
-            },
-        )? {
-            CommandResponse::WindowList { windows } => windows,
-            _ => Vec::new(),
-        };
-        for window in windows {
-            tree.expanded_windows.insert((session.clone(), window.index));
+        for entry in session.windows {
+            tree.expanded_windows
+                .insert((session.name.clone(), entry.window.index));
         }
     }
     Ok(())

@@ -11,7 +11,7 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtocolVersion(pub u16);
 
-pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(11);
+pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(12);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientViewport {
@@ -49,6 +49,7 @@ pub enum CommandRequest {
         target: Option<String>,
     },
     ListSessions,
+    ListChooseTree,
     ListWindows {
         session: String,
     },
@@ -218,6 +219,9 @@ pub enum CommandResponse {
     SessionList {
         sessions: Vec<SessionSummary>,
     },
+    ChooseTreeList {
+        sessions: Vec<ChooseTreeSession>,
+    },
     WindowList {
         windows: Vec<WindowSummary>,
     },
@@ -375,6 +379,20 @@ pub struct SessionSummary {
     pub name: String,
     #[serde(default)]
     pub stale: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChooseTreeSession {
+    pub name: String,
+    #[serde(default)]
+    pub stale: bool,
+    pub windows: Vec<ChooseTreeWindow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChooseTreeWindow {
+    pub window: WindowSummary,
+    pub panes: Vec<PaneSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

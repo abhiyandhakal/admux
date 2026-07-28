@@ -25,8 +25,9 @@ use crate::{
     buffer::{BufferStore, MAX_BUFFER_BYTES},
     config::{Config, ResolvedConfig},
     ipc::{
-        BufferSummary, CURRENT_PROTOCOL_VERSION, ClientViewport, CommandRequest, CommandResponse,
-        CycleDirection, NavigationDirection, ProtocolVersion, SessionSummary,
+        BufferSummary, CURRENT_PROTOCOL_VERSION, ChooseTreeSession, ChooseTreeWindow,
+        ClientViewport, CommandRequest, CommandResponse, CycleDirection, NavigationDirection,
+        PaneSummary, ProtocolVersion, SessionSummary,
     },
     numbering::Numbering,
     pane::{PaneId, WindowId},
@@ -379,6 +380,9 @@ impl SessionStore {
             CommandRequest::ListSessions => CommandResponse::SessionList {
                 sessions: self.list_session_summaries(),
             },
+            CommandRequest::ListChooseTree => CommandResponse::ChooseTreeList {
+                sessions: self.list_choose_tree(),
+            },
             CommandRequest::ListBuffers => CommandResponse::BufferList {
                 buffers: self.list_buffer_summaries(),
             },
@@ -469,29 +473,9 @@ impl SessionStore {
                 },
             },
             CommandRequest::ListWindows { session } => {
-                if let Some(session) = self.sessions.get(&session) {
+                if let Some(windows) = self.list_windows_for_session(&session) {
                     CommandResponse::WindowList {
-                        windows: session.list_windows(),
-                    }
-                } else if let Some(session) = self.persisted_sessions.get(&session) {
-                    CommandResponse::WindowList {
-                        windows: session
-                            .window_order
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(index, id)| {
-                                let window = session.windows.get(id)?;
-                                Some(crate::window::WindowSummary::new(
-                                    *id,
-                                    self.numbering()
-                                        .public_window_number(index)
-                                        .unwrap_or(index as u64),
-                                    window.name.clone(),
-                                    *id == session.active_window,
-                                    Some(*id) == session.last_window,
-                                ))
-                            })
-                            .collect(),
+                        windows,
                     }
                 } else {
                     CommandResponse::Error {
@@ -500,47 +484,10 @@ impl SessionStore {
                 }
             }
             CommandRequest::ListPanes { target } => match self.parse_target(&target) {
-                Ok(target) => match self.sessions.get(&target.session) {
-                    Some(session) => CommandResponse::PaneList {
-                        panes: session.list_panes(target.window),
-                    },
-                    None => match self.persisted_sessions.get(&target.session) {
-                        Some(session) => {
-                            let window_id = target.window.unwrap_or(session.active_window);
-                            let panes = session
-                                .windows
-                                .get(&window_id)
-                                .map(|window| {
-                                    window
-                                        .layout
-                                        .panes()
-                                        .into_iter()
-                                        .filter_map(|pane_id| {
-                                            let pane = window.panes.get(&pane_id)?;
-                                            Some(crate::ipc::PaneSummary {
-                                                id: self
-                                                    .numbering()
-                                                    .public_pane_number(pane.id)
-                                                    .unwrap_or(pane.id.0),
-                                                title: pane.title.clone(),
-                                                active: pane_id == window.layout.active,
-                                                window_id: self
-                                                    .numbering()
-                                                    .public_window_id(
-                                                        window.id,
-                                                        &session.window_order,
-                                                    )
-                                                    .unwrap_or(window.id.0),
-                                            })
-                                        })
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-                            CommandResponse::PaneList { panes }
-                        }
-                        None => CommandResponse::Error {
-                            message: format!("unknown session {}", target.session),
-                        },
+                Ok(target) => match self.list_panes_for_session(&target.session, target.window) {
+                    Some(panes) => CommandResponse::PaneList { panes },
+                    None => CommandResponse::Error {
+                        message: format!("unknown session {}", target.session),
                     },
                 },
                 Err(message) => CommandResponse::Error { message },
@@ -1030,6 +977,99 @@ impl SessionStore {
             .into_iter()
             .map(|(name, stale)| SessionSummary { name, stale })
             .collect()
+    }
+
+    fn list_choose_tree(&self) -> Vec<ChooseTreeSession> {
+        self.list_session_summaries()
+            .into_iter()
+            .map(|session| {
+                let windows = self
+                    .list_windows_for_session(&session.name)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|window| {
+                        let panes = self
+                            .list_panes_for_session(
+                                &session.name,
+                                Some(WindowId(window.id)),
+                            )
+                            .unwrap_or_default();
+                        ChooseTreeWindow { window, panes }
+                    })
+                    .collect();
+                ChooseTreeSession {
+                    name: session.name,
+                    stale: session.stale,
+                    windows,
+                }
+            })
+            .collect()
+    }
+
+    fn list_windows_for_session(&self, session_name: &str) -> Option<Vec<crate::window::WindowSummary>> {
+        if let Some(session) = self.sessions.get(session_name) {
+            return Some(session.list_windows());
+        }
+        let session = self.persisted_sessions.get(session_name)?;
+        Some(
+            session
+                .window_order
+                .iter()
+                .enumerate()
+                .filter_map(|(index, id)| {
+                    let window = session.windows.get(id)?;
+                    Some(crate::window::WindowSummary::new(
+                        *id,
+                        self.numbering()
+                            .public_window_number(index)
+                            .unwrap_or(index as u64),
+                        window.name.clone(),
+                        *id == session.active_window,
+                        Some(*id) == session.last_window,
+                    ))
+                })
+                .collect(),
+        )
+    }
+
+    fn list_panes_for_session(
+        &self,
+        session_name: &str,
+        window_id: Option<WindowId>,
+    ) -> Option<Vec<PaneSummary>> {
+        if let Some(session) = self.sessions.get(session_name) {
+            return Some(session.list_panes(window_id));
+        }
+        let session = self.persisted_sessions.get(session_name)?;
+        let window_id = window_id.unwrap_or(session.active_window);
+        Some(
+            session
+                .windows
+                .get(&window_id)
+                .map(|window| {
+                    window
+                        .layout
+                        .panes()
+                        .into_iter()
+                        .filter_map(|pane_id| {
+                            let pane = window.panes.get(&pane_id)?;
+                            Some(PaneSummary {
+                                id: self
+                                    .numbering()
+                                    .public_pane_number(pane.id)
+                                    .unwrap_or(pane.id.0),
+                                title: pane.title.clone(),
+                                active: pane_id == window.layout.active,
+                                window_id: self
+                                    .numbering()
+                                    .public_window_id(window.id, &session.window_order)
+                                    .unwrap_or(window.id.0),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        )
     }
 
     fn list_buffer_summaries(&self) -> Vec<BufferSummary> {
@@ -1963,6 +2003,41 @@ mod tests {
                 }]
             }
         );
+    }
+
+    #[test]
+    fn choose_tree_snapshot_contains_windows_and_panes_in_one_response() {
+        let helper_dir = tempdir();
+        let mut store = SessionStore::default();
+        store.helper_dir = helper_dir.path().join("helpers");
+        assert!(matches!(
+            store.handle(CommandRequest::NewSession {
+                name: Some("work".into()),
+                cwd: Some(helper_dir.path().to_path_buf()),
+                command: vec!["sleep".into(), "30".into()],
+                switch_from: None,
+            }),
+            CommandResponse::SessionCreated { .. }
+        ));
+
+        let tree = store.handle(CommandRequest::ListChooseTree);
+
+        assert!(matches!(
+            tree,
+            CommandResponse::ChooseTreeList { ref sessions }
+                if sessions.len() == 1
+                    && sessions[0].name == "work"
+                    && !sessions[0].stale
+                    && sessions[0].windows.len() == 1
+                    && sessions[0].windows[0].window.name == "sleep"
+                    && sessions[0].windows[0].panes.len() == 1
+        ), "actual tree: {tree:?}");
+        store
+            .sessions
+            .get("work")
+            .expect("created session")
+            .kill()
+            .expect("clean up session");
     }
 
     #[test]
