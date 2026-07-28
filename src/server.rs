@@ -1632,6 +1632,7 @@ mod tests {
             focused: false,
             helper_socket: None,
             mouse_reporting: true,
+            application_cursor: false,
             rows_plain: Vec::new(),
             rows_formatted: Vec::new(),
             cursor: None,

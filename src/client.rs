@@ -1001,7 +1001,10 @@ fn run_attach_loop(
                     },
                     OverlayState::None => {
                         let mode_before = state.mode;
-                        let action = state.handle_key(key);
+                        let application_cursor = focused_pane(&snapshot)
+                            .map(|pane| pane.application_cursor)
+                            .unwrap_or(false);
+                        let action = state.handle_key_with_application_cursor(key, application_cursor);
                         refresh_before_next_input = action_changes_input_target(&action);
                         if let Some(logger) = event_logger.as_deref_mut() {
                             logger.log_line(&format!(
@@ -2929,6 +2932,7 @@ fn fallback_snapshot(preview: String, width: u16, height: u16) -> RenderSnapshot
             focused: true,
             helper_socket: None,
             mouse_reporting: false,
+            application_cursor: false,
             rows_formatted: rows_plain.clone(),
             rows_plain,
             cursor: Some(PaneCursor { row: 0, col: 0 }),

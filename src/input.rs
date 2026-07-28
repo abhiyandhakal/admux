@@ -76,6 +76,14 @@ impl InputState {
     }
 
     pub fn handle_key(&mut self, event: KeyEvent) -> InputAction {
+        self.handle_key_with_application_cursor(event, false)
+    }
+
+    pub fn handle_key_with_application_cursor(
+        &mut self,
+        event: KeyEvent,
+        application_cursor: bool,
+    ) -> InputAction {
         match self.mode {
             InputMode::Normal => {
                 if config::key_event_matches(&self.keymap.prefix, event) {
@@ -84,7 +92,7 @@ impl InputState {
                 } else if let Some(action) = self.resolve(&self.keymap.normal, event) {
                     self.map_action(action)
                 } else {
-                    key_to_bytes(event)
+                    key_to_bytes(event, application_cursor)
                 }
             }
             InputMode::Leader => {
@@ -92,7 +100,7 @@ impl InputState {
                 if config::key_event_matches(&self.keymap.prefix, event) {
                     // Match tmux's prefix-prefix convention: the second prefix
                     // key is delivered to the foreground application.
-                    key_to_bytes(event)
+                    key_to_bytes(event, application_cursor)
                 } else if let Some(action) = self.resolve(&self.keymap.leader, event) {
                     match action {
                         Action::EnterCopyMode => {
@@ -183,7 +191,7 @@ impl InputState {
     }
 }
 
-fn key_to_bytes(event: KeyEvent) -> InputAction {
+fn key_to_bytes(event: KeyEvent, application_cursor: bool) -> InputAction {
     match event.code {
         KeyCode::Char(ch) if event.modifiers.contains(KeyModifiers::CONTROL) => {
             control_character_bytes(ch, event.modifiers)
@@ -198,10 +206,10 @@ fn key_to_bytes(event: KeyEvent) -> InputAction {
         KeyCode::Enter => InputAction::SendBytes(vec![b'\r']),
         KeyCode::Tab => InputAction::SendBytes(vec![b'\t']),
         KeyCode::Backspace => InputAction::SendBytes(vec![0x7f]),
-        KeyCode::Left => csi_cursor_key_bytes('D', event.modifiers),
-        KeyCode::Right => csi_cursor_key_bytes('C', event.modifiers),
-        KeyCode::Up => csi_cursor_key_bytes('A', event.modifiers),
-        KeyCode::Down => csi_cursor_key_bytes('B', event.modifiers),
+        KeyCode::Left => cursor_key_bytes('D', event.modifiers, application_cursor),
+        KeyCode::Right => cursor_key_bytes('C', event.modifiers, application_cursor),
+        KeyCode::Up => cursor_key_bytes('A', event.modifiers, application_cursor),
+        KeyCode::Down => cursor_key_bytes('B', event.modifiers, application_cursor),
         KeyCode::Home => csi_cursor_key_bytes('H', event.modifiers),
         KeyCode::End => csi_cursor_key_bytes('F', event.modifiers),
         KeyCode::Insert => csi_tilde_key_bytes(2, event.modifiers),
@@ -267,6 +275,17 @@ fn csi_cursor_key_bytes(final_byte: char, modifiers: KeyModifiers) -> InputActio
     InputAction::SendBytes(sequence.into_bytes())
 }
 
+fn cursor_key_bytes(
+    final_byte: char,
+    modifiers: KeyModifiers,
+    application_cursor: bool,
+) -> InputAction {
+    if application_cursor && xterm_modifier_parameter(modifiers).is_none() {
+        return InputAction::SendBytes(format!("\x1bO{final_byte}").into_bytes());
+    }
+    csi_cursor_key_bytes(final_byte, modifiers)
+}
+
 fn csi_tilde_key_bytes(code: u8, modifiers: KeyModifiers) -> InputAction {
     let sequence = match xterm_modifier_parameter(modifiers) {
         Some(modifier) => format!("\x1b[{code};{modifier}~"),
@@ -330,6 +349,25 @@ mod tests {
         assert_eq!(
             state.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             InputAction::SendBytes(vec![0x1b])
+        );
+    }
+
+    #[test]
+    fn application_cursor_mode_uses_ss3_for_unmodified_arrows() {
+        let mut state = configured_state("");
+        assert_eq!(
+            state.handle_key_with_application_cursor(
+                KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+                true,
+            ),
+            InputAction::SendBytes(b"\x1bOA".to_vec())
+        );
+        assert_eq!(
+            state.handle_key_with_application_cursor(
+                KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL),
+                true,
+            ),
+            InputAction::SendBytes(b"\x1b[1;5A".to_vec())
         );
     }
 

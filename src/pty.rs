@@ -57,6 +57,7 @@ pub struct PaneSnapshot {
     pub screen_rows: u16,
     pub screen_cols: u16,
     pub mouse_reporting: bool,
+    pub application_cursor: bool,
     pub alive: bool,
 }
 
@@ -165,6 +166,7 @@ struct PaneSnapshotWire {
     screen_rows: u16,
     screen_cols: u16,
     mouse_reporting: bool,
+    application_cursor: bool,
     alive: bool,
 }
 
@@ -188,6 +190,7 @@ impl From<PaneSnapshotWire> for PaneSnapshot {
             screen_rows: value.screen_rows,
             screen_cols: value.screen_cols,
             mouse_reporting: value.mouse_reporting,
+            application_cursor: value.application_cursor,
             alive: value.alive,
         }
     }
@@ -711,6 +714,7 @@ fn helper_snapshot(state: &Arc<HelperState>, width: u16, height: u16) -> Result<
     let (screen_rows, screen_cols) = screen.size();
     let (cursor_row, cursor_col) = screen.cursor_position();
     let mouse_reporting = screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None;
+    let application_cursor = screen.application_cursor();
     let alive = state
         .child
         .lock()
@@ -733,6 +737,7 @@ fn helper_snapshot(state: &Arc<HelperState>, width: u16, height: u16) -> Result<
         screen_rows,
         screen_cols,
         mouse_reporting,
+        application_cursor,
         alive,
     })
 }
@@ -1242,6 +1247,39 @@ mod tests {
         let preview = wait_for_preview(&pane, "after");
         assert!(preview.contains("after"));
         assert!(!preview.contains("beforeafter"));
+    }
+
+    #[test]
+    fn pane_snapshot_reports_application_cursor_mode() {
+        let dir = helper_dir();
+        let pane = PaneProcess::spawn(
+            &[
+                "sh".into(),
+                "-lc".into(),
+                "printf '\\033[?1h'; sleep 1".into(),
+            ],
+            None,
+            None,
+            None,
+            10_000,
+            dir.path(),
+            None,
+        )
+        .expect("spawn pane");
+
+        let mut application_cursor = false;
+        for _ in 0..50 {
+            application_cursor = pane
+                .render(80, 24)
+                .expect("render pane")
+                .application_cursor;
+            if application_cursor {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(application_cursor);
+        pane.kill().expect("clean up pane");
     }
 
     #[test]
