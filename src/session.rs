@@ -534,7 +534,16 @@ impl Session {
         axis: SplitAxis,
         command: &[String],
     ) -> Result<SplitResult> {
-        let cwd = self.cwd.clone();
+        let cwd = self
+            .active_window()
+            .and_then(|window| {
+                window
+                    .panes
+                    .get(&window.layout.active)
+                    .and_then(|pane| pane.cwd.clone())
+                    .or_else(|| window.cwd.clone())
+            })
+            .or_else(|| self.cwd.clone());
         self.split_pane_in_window(self.active_window, None, axis, 500, cwd, command)
     }
 
@@ -1189,6 +1198,52 @@ mod tests {
         let remaining = session.list_panes(Some(WindowId(1)));
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].id, 1);
+    }
+
+    #[test]
+    fn splitting_inherits_the_active_pane_cwd() {
+        let helper_dir = tempdir();
+        let session_cwd = helper_dir.path().join("session");
+        let pane_cwd = helper_dir.path().join("pane");
+        std::fs::create_dir_all(&session_cwd).expect("create session cwd");
+        std::fs::create_dir_all(&pane_cwd).expect("create pane cwd");
+        let mut session = Session::new(
+            "work".into(),
+            None,
+            Some(session_cwd),
+            vec!["sh".into()],
+            WindowId(1),
+            None,
+            10_000,
+            Numbering {
+                window_base: 0,
+                pane_base: 0,
+            },
+            WindowDefaults::default(),
+            helper_dir.path().to_path_buf(),
+        )
+        .expect("create session");
+        session
+            .windows
+            .get_mut(&WindowId(1))
+            .expect("root window")
+            .panes
+            .get_mut(&PaneId(0))
+            .expect("root pane")
+            .cwd = Some(pane_cwd.clone());
+
+        let split = session
+            .split_active_pane(SplitAxis::Vertical, &["sh".into()])
+            .expect("split pane");
+        let created = session
+            .windows
+            .get(&split.window_id)
+            .expect("window")
+            .panes
+            .get(&split.pane_id)
+            .expect("created pane");
+        assert_eq!(created.cwd.as_deref(), Some(pane_cwd.as_path()));
+        session.kill().expect("clean up session");
     }
 
     #[test]
