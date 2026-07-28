@@ -3,6 +3,7 @@ use std::{
     ffi::OsString,
     fs::OpenOptions,
     io::{self, IsTerminal, Read, Write},
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     os::unix::net::UnixStream,
     path::PathBuf,
     process::{Command, Stdio},
@@ -542,8 +543,9 @@ fn with_connection<T>(
                     Err(error) => {
                         return Err(error).with_context(|| {
                             format!(
-                                "failed to connect to admuxd at {} after autostart",
-                                paths.socket_path.display()
+                                "failed to connect to admuxd at {} after autostart; see {}",
+                                paths.socket_path.display(),
+                                daemon_start_log_path(paths).display(),
                             )
                         });
                     }
@@ -571,6 +573,27 @@ fn spawn_daemon(paths: &RuntimePaths) -> Result<()> {
     let socket = paths.socket_path.display().to_string();
     let state = paths.state_path.display().to_string();
     let config = paths.config_path.display().to_string();
+    let log_path = daemon_start_log_path(paths);
+    let log_dir = log_path.parent().ok_or_else(|| {
+        anyhow!("daemon startup log {} has no parent directory", log_path.display())
+    })?;
+    std::fs::create_dir_all(log_dir).with_context(|| {
+        format!(
+            "failed to create daemon startup log directory {}",
+            log_dir.display()
+        )
+    })?;
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(&log_path)
+        .with_context(|| format!("failed to open daemon startup log {}", log_path.display()))?;
+    log.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to restrict daemon startup log {}", log_path.display()))?;
+    let stderr_log = log
+        .try_clone()
+        .with_context(|| format!("failed to duplicate daemon startup log {}", log_path.display()))?;
     Command::new(daemon_path)
         .arg("serve")
         .arg("--socket")
@@ -580,11 +603,19 @@ fn spawn_daemon(paths: &RuntimePaths) -> Result<()> {
         .arg("--config")
         .arg(config)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(stderr_log))
         .spawn()
         .context("failed to spawn admuxd")?;
     Ok(())
+}
+
+fn daemon_start_log_path(paths: &RuntimePaths) -> PathBuf {
+    paths
+        .state_path
+        .parent()
+        .map(|parent| parent.join("admuxd-startup.log"))
+        .unwrap_or_else(|| PathBuf::from("admuxd-startup.log"))
 }
 
 fn resolve_daemon_binary() -> Result<std::path::PathBuf> {
@@ -3498,6 +3529,22 @@ root = { command = ["sh"] }
         assert!(!should_autostart_daemon(&std::io::Error::from(
             std::io::ErrorKind::InvalidInput,
         )));
+    }
+
+    #[test]
+    fn daemon_startup_log_lives_with_state_files() {
+        let dir = tempdir();
+        let paths = RuntimePaths {
+            socket_path: dir.path().join("runtime/socket"),
+            config_path: dir.path().join("config.toml"),
+            state_path: dir.path().join("state.json"),
+            aliases_path: dir.path().join("aliases.json"),
+        };
+
+        assert_eq!(
+            daemon_start_log_path(&paths),
+            dir.path().join("admuxd-startup.log")
+        );
     }
 
     #[test]
