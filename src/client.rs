@@ -1039,6 +1039,7 @@ fn run_attach_loop(
                             paths,
                             &snapshot,
                             &mut current_session,
+                            &mut last_size,
                             &mut state,
                             config,
                             &mut prompt,
@@ -1073,6 +1074,7 @@ fn run_attach_loop(
                             &mut tree,
                             key,
                             &mut current_session,
+                            &mut last_size,
                             &mut status_message,
                         )? {
                             overlay = OverlayState::ChooseTree(tree);
@@ -1705,6 +1707,7 @@ fn handle_prompt_key(
     paths: &RuntimePaths,
     snapshot: &RenderSnapshot,
     current_session: &mut String,
+    last_size: &mut (u16, u16),
     input_state: &mut InputState,
     config: &mut ResolvedConfig,
     prompt: &mut PromptState,
@@ -1735,7 +1738,13 @@ fn handle_prompt_key(
                                 }
                             }
                         } else {
-                            match execute_prompt_command(paths, snapshot, current_session, &command) {
+                            match execute_prompt_command(
+                                paths,
+                                snapshot,
+                                current_session,
+                                last_size,
+                                &command,
+                            ) {
                                 Ok(result) => {
                                     history.push(command);
                                     *status_message = result;
@@ -1747,7 +1756,13 @@ fn handle_prompt_key(
                             }
                         }
                     }
-                    Err(_) => match execute_prompt_command(paths, snapshot, current_session, &command) {
+                    Err(_) => match execute_prompt_command(
+                        paths,
+                        snapshot,
+                        current_session,
+                        last_size,
+                        &command,
+                    ) {
                         Ok(result) => {
                             history.push(command);
                             *status_message = result;
@@ -1887,6 +1902,7 @@ fn execute_prompt_command(
     paths: &RuntimePaths,
     snapshot: &RenderSnapshot,
     current_session: &mut String,
+    last_size: &mut (u16, u16),
     input: &str,
 ) -> Result<Option<String>> {
     match parse_command(input).map_err(anyhow::Error::msg)? {
@@ -1963,7 +1979,7 @@ fn execute_prompt_command(
                     session: Some(target.clone()),
                 },
             )?;
-            apply_prompt_session_switch(current_session, response)?;
+            apply_prompt_session_switch(current_session, last_size, response)?;
             Ok(None)
         }
         InteractiveCommand::ListSessions => {
@@ -2084,15 +2100,23 @@ fn ensure_command_succeeded(response: CommandResponse) -> Result<CommandResponse
 
 fn apply_prompt_session_switch(
     current_session: &mut String,
+    last_size: &mut (u16, u16),
     response: CommandResponse,
 ) -> Result<()> {
     match response {
         CommandResponse::Attached { session, .. } => {
-            *current_session = session;
+            switch_client_session(current_session, last_size, session);
             Ok(())
         }
         CommandResponse::Error { message } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected attach response: {other:?}")),
+    }
+}
+
+fn switch_client_session(current_session: &mut String, last_size: &mut (u16, u16), session: String) {
+    if *current_session != session {
+        *current_session = session;
+        *last_size = (0, 0);
     }
 }
 
@@ -2372,6 +2396,7 @@ fn handle_choose_tree_key(
     tree: &mut ChooseTreeState,
     key: crossterm::event::KeyEvent,
     current_session: &mut String,
+    last_size: &mut (u16, u16),
     status_message: &mut Option<String>,
 ) -> Result<bool> {
     if let Some(query) = tree.search_input.as_mut() {
@@ -2444,7 +2469,7 @@ fn handle_choose_tree_key(
                             },
                         )? {
                             CommandResponse::Attached { session, .. } => {
-                                *current_session = session;
+                                switch_client_session(current_session, last_size, session);
                                 tree.attached_session = current_session.clone();
                             }
                             CommandResponse::Error { message } => {
@@ -2472,7 +2497,7 @@ fn handle_choose_tree_key(
                         if !chooser_command_succeeded(response, status_message) {
                             return Ok(true);
                         }
-                        *current_session = session;
+                        switch_client_session(current_session, last_size, session);
                         tree.attached_session = current_session.clone();
                     }
                     ChooseItem::Pane {
@@ -2499,7 +2524,7 @@ fn handle_choose_tree_key(
                         if !chooser_command_succeeded(response, status_message) {
                             return Ok(true);
                         }
-                        *current_session = session;
+                        switch_client_session(current_session, last_size, session);
                         tree.attached_session = current_session.clone();
                     }
                 }
@@ -4023,14 +4048,37 @@ root = { command = ["sh"] }
     #[test]
     fn rejected_prompt_session_switch_keeps_the_current_session() {
         let mut current_session = String::from("work");
+        let mut last_size = (24, 80);
         assert!(apply_prompt_session_switch(
             &mut current_session,
+            &mut last_size,
             CommandResponse::Error {
                 message: "unknown session missing".into(),
             },
         )
         .is_err());
         assert_eq!(current_session, "work");
+        assert_eq!(last_size, (24, 80));
+    }
+
+    #[test]
+    fn prompt_session_switch_resets_viewport_for_the_new_session() {
+        let mut current_session = String::from("work");
+        let mut last_size = (24, 80);
+        apply_prompt_session_switch(
+            &mut current_session,
+            &mut last_size,
+            CommandResponse::Attached {
+                session: "logs".into(),
+                preview: String::new(),
+                formatted_preview: String::new(),
+                formatted_cursor: String::new(),
+                snapshot: None,
+            },
+        )
+        .expect("switch session");
+        assert_eq!(current_session, "logs");
+        assert_eq!(last_size, (0, 0));
     }
 
     #[test]
@@ -4058,6 +4106,7 @@ root = { command = ["sh"] }
             history_index: None,
         };
         let mut session = "work".into();
+        let mut last_size = (24, 80);
         let mut config = Config::default().resolve().expect("default config");
         let mut input_state = InputState::new(config.keys.clone(), config.behavior.resize_step);
         let mut history = Vec::new();
@@ -4067,6 +4116,7 @@ root = { command = ["sh"] }
             &paths,
             &snapshot,
             &mut session,
+            &mut last_size,
             &mut input_state,
             &mut config,
             &mut prompt,
