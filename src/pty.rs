@@ -820,13 +820,13 @@ fn helper_resize(state: &Arc<HelperState>, rows: u16, cols: u16) -> Result<()> {
         .terminal
         .lock()
         .expect("pane helper terminal lock poisoned");
-    if rows < current_rows || cols < current_cols {
-        terminal.parser.screen_mut().set_size(rows, cols);
-    } else {
+    if rows > current_rows || cols > current_cols {
         let history = terminal.history.clone();
         let mut parser = vt100::Parser::new(rows, cols, terminal.scrollback_lines);
         parser.process(&history);
         terminal.parser = parser;
+    } else {
+        terminal.parser.screen_mut().set_size(rows, cols);
     }
     Ok(())
 }
@@ -1405,6 +1405,35 @@ mod tests {
         let preview = pane.preview();
         assert!(preview.contains("three"));
         assert!(preview.contains("seven"));
+    }
+
+    #[test]
+    fn pane_process_replays_history_when_one_resize_axis_expands() {
+        let dir = helper_dir();
+        let pane = PaneProcess::spawn(
+            &[
+                "sh".into(),
+                "-lc".into(),
+                "printf 'one two three four five six seven eight nine ten'; sleep 1".into(),
+            ],
+            None,
+            None,
+            None,
+            10_000,
+            dir.path(),
+            None,
+        )
+        .expect("spawn pane");
+
+        let _ = wait_for_preview(&pane, "one two");
+        pane.resize(20, 10).expect("shrink pane width");
+        pane.resize(10, 80)
+            .expect("expand width while shrinking height");
+
+        assert!(
+            pane.preview().contains("one two three four five six seven"),
+            "an expanding axis must replay history even when the other shrinks"
+        );
     }
 
     #[test]
