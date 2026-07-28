@@ -128,6 +128,7 @@ struct ResizeDrag {
     direction: NavigationDirection,
     last_row: u16,
     last_col: u16,
+    span: u16,
 }
 
 struct EventLogger {
@@ -2668,6 +2669,7 @@ fn handle_mouse_event(
                     direction,
                     last_row: mouse.row,
                     last_col: mouse.column,
+                    span: resize_drag_span(snapshot, direction),
                 });
             } else if let Some((pane, row, col)) =
                 pane_content_hit(snapshot, mouse.row, mouse.column)
@@ -2727,7 +2729,7 @@ fn handle_mouse_event(
                         CommandRequest::ResizePane {
                             target,
                             direction,
-                            amount: delta.saturating_mul(config.behavior.resize_step.max(1)),
+                            amount: mouse_resize_amount(delta, resize.span),
                         },
                     )?;
                     resize.last_row = mouse.row;
@@ -2907,6 +2909,29 @@ fn resize_drag_request(
         }
         NavigationDirection::Left | NavigationDirection::Up => None,
     }
+}
+
+fn resize_drag_span(snapshot: &RenderSnapshot, direction: NavigationDirection) -> u16 {
+    let span = match direction {
+        NavigationDirection::Left | NavigationDirection::Right => snapshot
+            .panes
+            .iter()
+            .map(|pane| pane.rect.right())
+            .max(),
+        NavigationDirection::Up | NavigationDirection::Down => snapshot
+            .panes
+            .iter()
+            .map(|pane| pane.rect.bottom())
+            .max(),
+    }
+    .unwrap_or(1);
+    span.max(1)
+}
+
+fn mouse_resize_amount(delta_cells: u16, span: u16) -> u16 {
+    let span = u32::from(span.max(1));
+    let amount = (u32::from(delta_cells) * 1000).div_ceil(span);
+    u16::try_from(amount.clamp(1, 100)).expect("clamped mouse resize amount fits u16")
 }
 
 fn fallback_snapshot(preview: String, width: u16, height: u16) -> RenderSnapshot {
@@ -3809,6 +3834,7 @@ root = { command = ["sh"] }
             direction: NavigationDirection::Right,
             last_row: 0,
             last_col: 10,
+            span: 80,
         };
 
         let request = resize_drag_request(
@@ -3831,6 +3857,7 @@ root = { command = ["sh"] }
             direction: NavigationDirection::Right,
             last_row: 0,
             last_col: 10,
+            span: 80,
         };
 
         let request = resize_drag_request(
@@ -3844,5 +3871,13 @@ root = { command = ["sh"] }
         );
 
         assert_eq!(request, Some((NavigationDirection::Left, 3)));
+    }
+
+    #[test]
+    fn mouse_resize_amount_scales_with_terminal_span() {
+        assert_eq!(mouse_resize_amount(1, 80), 13);
+        assert_eq!(mouse_resize_amount(1, 200), 5);
+        assert_eq!(mouse_resize_amount(100, 80), 100);
+        assert_eq!(mouse_resize_amount(0, 80), 1);
     }
 }
