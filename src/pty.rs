@@ -40,6 +40,15 @@ struct HelperState {
     child: Mutex<Box<dyn Child + Send>>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReplayBoundaryState {
+    Ground,
+    Escape,
+    Csi,
+    String,
+    StringEscape,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PtyState {
     Detached,
@@ -622,10 +631,7 @@ fn start_helper_state(args: &PaneHelperArgs) -> Result<HelperState> {
                 Ok(size) => {
                     if let Ok(mut terminal) = terminal_clone.lock() {
                         terminal.history.extend_from_slice(&buf[..size]);
-                        if terminal.history.len() > HISTORY_LIMIT {
-                            let drop_len = terminal.history.len() - HISTORY_LIMIT;
-                            terminal.history.drain(..drop_len);
-                        }
+                        truncate_history_at_safe_boundary(&mut terminal.history, HISTORY_LIMIT);
                         terminal.parser.process(&buf[..size]);
                     }
                 }
@@ -640,6 +646,53 @@ fn start_helper_state(args: &PaneHelperArgs) -> Result<HelperState> {
         master: Mutex::new(pair.master),
         child: Mutex::new(child),
     })
+}
+
+fn truncate_history_at_safe_boundary(history: &mut Vec<u8>, limit: usize) {
+    if history.len() <= limit {
+        return;
+    }
+
+    let minimum_drop = history.len() - limit;
+    let mut state = ReplayBoundaryState::Ground;
+    for (index, byte) in history.iter().copied().enumerate() {
+        state = match state {
+            ReplayBoundaryState::Ground if byte == 0x1b => ReplayBoundaryState::Escape,
+            ReplayBoundaryState::Ground => ReplayBoundaryState::Ground,
+            ReplayBoundaryState::Escape if byte == b'[' => ReplayBoundaryState::Csi,
+            ReplayBoundaryState::Escape if matches!(byte, b']' | b'P' | b'^' | b'_') => {
+                ReplayBoundaryState::String
+            }
+            ReplayBoundaryState::Escape => ReplayBoundaryState::Ground,
+            ReplayBoundaryState::Csi if (0x40..=0x7e).contains(&byte) => {
+                ReplayBoundaryState::Ground
+            }
+            ReplayBoundaryState::Csi => ReplayBoundaryState::Csi,
+            ReplayBoundaryState::String if byte == 0x07 => ReplayBoundaryState::Ground,
+            ReplayBoundaryState::String if byte == 0x1b => ReplayBoundaryState::StringEscape,
+            ReplayBoundaryState::String => ReplayBoundaryState::String,
+            ReplayBoundaryState::StringEscape if byte == b'\\' => ReplayBoundaryState::Ground,
+            ReplayBoundaryState::StringEscape if byte == 0x1b => ReplayBoundaryState::StringEscape,
+            ReplayBoundaryState::StringEscape => ReplayBoundaryState::String,
+        };
+
+        let next = index + 1;
+        let starts_utf8_boundary = history
+            .get(next)
+            .is_none_or(|next_byte| !(0x80..=0xbf).contains(next_byte));
+        if next >= minimum_drop
+            && state == ReplayBoundaryState::Ground
+            && starts_utf8_boundary
+        {
+            history.drain(..next);
+            return;
+        }
+    }
+
+    // The retained history never reached a replay-safe boundary (for example,
+    // a single unterminated OSC payload). Discard it rather than replaying a
+    // partial control sequence into a fresh parser.
+    history.clear();
 }
 
 fn handle_helper_request(state: &Arc<HelperState>, request: PaneRequest) -> PaneResponse {
@@ -1291,6 +1344,28 @@ mod tests {
 
         assert!(error.to_string().contains("failed to spawn pane command"));
         assert!(!socket.exists(), "failed helper startup must remove its socket");
+    }
+
+    #[test]
+    fn history_truncation_never_starts_inside_utf8_or_csi() {
+        let mut history = b"12345678\xc3\xa9abcdef\x1b[38;2;255;0;0mgreen".to_vec();
+
+        truncate_history_at_safe_boundary(&mut history, 12);
+
+        assert!(std::str::from_utf8(&history).is_ok());
+        assert!(
+            !history.starts_with(b"\x1b[") && history.starts_with(b"green"),
+            "history should resume after the completed CSI sequence"
+        );
+    }
+
+    #[test]
+    fn history_truncation_discards_unterminated_control_strings() {
+        let mut history = b"prefix\x1b]0;unterminated-title".to_vec();
+
+        truncate_history_at_safe_boundary(&mut history, 5);
+
+        assert!(history.is_empty());
     }
 
     fn wait_for_preview(pane: &PaneProcess, needle: &str) -> String {
