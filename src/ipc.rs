@@ -254,6 +254,12 @@ pub enum PaneMouseKind {
     LeftDown,
     LeftDrag,
     LeftUp,
+    MiddleDown,
+    MiddleDrag,
+    MiddleUp,
+    RightDown,
+    RightDrag,
+    RightUp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

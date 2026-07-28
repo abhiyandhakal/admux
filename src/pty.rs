@@ -187,6 +187,12 @@ pub enum HelperMouseEventKind {
     LeftDown,
     LeftDrag,
     LeftUp,
+    MiddleDown,
+    MiddleDrag,
+    MiddleUp,
+    RightDown,
+    RightDrag,
+    RightUp,
 }
 
 impl From<PaneSnapshotWire> for PaneSnapshot {
@@ -950,6 +956,12 @@ fn helper_mouse_event(
         HelperMouseEventKind::LeftDown => (0, 'M'),
         HelperMouseEventKind::LeftDrag => (32, 'M'),
         HelperMouseEventKind::LeftUp => (0, 'm'),
+        HelperMouseEventKind::MiddleDown => (1, 'M'),
+        HelperMouseEventKind::MiddleDrag => (33, 'M'),
+        HelperMouseEventKind::MiddleUp => (1, 'm'),
+        HelperMouseEventKind::RightDown => (2, 'M'),
+        HelperMouseEventKind::RightDrag => (34, 'M'),
+        HelperMouseEventKind::RightUp => (2, 'm'),
     };
     let sgr = format!("\x1b[<{};{};{}{}", code, col + 1, row + 1, suffix);
     let mut writer = state

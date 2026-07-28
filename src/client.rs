@@ -134,6 +134,51 @@ struct ResizeDrag {
 #[derive(Debug, Clone, Copy)]
 struct MouseCapture {
     pane_id: u64,
+    button: MouseButton,
+}
+
+fn helper_mouse_kinds(
+    button: MouseButton,
+) -> Option<(HelperMouseEventKind, HelperMouseEventKind, HelperMouseEventKind)> {
+    match button {
+        MouseButton::Left => Some((
+            HelperMouseEventKind::LeftDown,
+            HelperMouseEventKind::LeftDrag,
+            HelperMouseEventKind::LeftUp,
+        )),
+        MouseButton::Middle => Some((
+            HelperMouseEventKind::MiddleDown,
+            HelperMouseEventKind::MiddleDrag,
+            HelperMouseEventKind::MiddleUp,
+        )),
+        MouseButton::Right => Some((
+            HelperMouseEventKind::RightDown,
+            HelperMouseEventKind::RightDrag,
+            HelperMouseEventKind::RightUp,
+        )),
+    }
+}
+
+fn pane_mouse_kinds(
+    button: MouseButton,
+) -> Option<(PaneMouseKind, PaneMouseKind, PaneMouseKind)> {
+    match button {
+        MouseButton::Left => Some((
+            PaneMouseKind::LeftDown,
+            PaneMouseKind::LeftDrag,
+            PaneMouseKind::LeftUp,
+        )),
+        MouseButton::Middle => Some((
+            PaneMouseKind::MiddleDown,
+            PaneMouseKind::MiddleDrag,
+            PaneMouseKind::MiddleUp,
+        )),
+        MouseButton::Right => Some((
+            PaneMouseKind::RightDown,
+            PaneMouseKind::RightDrag,
+            PaneMouseKind::RightUp,
+        )),
+    }
 }
 
 struct EventLogger {
@@ -2713,6 +2758,7 @@ fn handle_mouse_event(
                     })?;
                     *mouse_capture = Some(MouseCapture {
                         pane_id: pane.pane_id,
+                        button: MouseButton::Left,
                     });
                     *selection_anchor = None;
                     *active_selection = None;
@@ -2732,6 +2778,44 @@ fn handle_mouse_event(
                 }
             }
         }
+        MouseEventKind::Down(button @ (MouseButton::Middle | MouseButton::Right)) => {
+            if let Some((pane, row, col)) = pane_content_hit(snapshot, mouse.row, mouse.column)
+                && pane.mouse_reporting
+            {
+                if config.mouse.focus_on_click {
+                    let _ = request_response(
+                        paths,
+                        CommandRequest::SelectPane {
+                            target: Some(format!(
+                                "{session}:{}.{}",
+                                snapshot.active_window_id, pane.pane_id
+                            )),
+                            direction: None,
+                        },
+                    )?;
+                }
+                let (helper_down, _, _) = helper_mouse_kinds(button).expect("supported mouse button");
+                let (pane_down, _, _) = pane_mouse_kinds(button).expect("supported mouse button");
+                send_pane_mouse(snapshot, pane.pane_id, row, col, helper_down)
+                    .or_else(|_| {
+                        request_response(
+                            paths,
+                            CommandRequest::MousePane {
+                                session: session.to_string(),
+                                pane_id: pane.pane_id,
+                                row,
+                                col,
+                                kind: pane_down,
+                            },
+                        )
+                        .map(|_| ())
+                    })?;
+                *mouse_capture = Some(MouseCapture {
+                    pane_id: pane.pane_id,
+                    button,
+                });
+            }
+        }
         MouseEventKind::Drag(MouseButton::Left) => {
             if let Some(resize) = resize_drag.as_mut() {
                 if let Some((direction, delta)) = resize_drag_request(*resize, mouse) {
@@ -2749,6 +2833,7 @@ fn handle_mouse_event(
                     resize.last_col = mouse.column;
                 }
             } else if let Some(capture) = *mouse_capture
+                && capture.button == MouseButton::Left
                 && let Some((row, col)) = captured_pane_mouse_position(snapshot, capture, mouse)
             {
                 send_pane_mouse(
@@ -2803,7 +2888,8 @@ fn handle_mouse_event(
         }
         MouseEventKind::Up(MouseButton::Left) => {
             *resize_drag = None;
-            if let Some(capture) = mouse_capture.take()
+            if mouse_capture.is_some_and(|capture| capture.button == MouseButton::Left)
+                && let Some(capture) = mouse_capture.take()
                 && let Some((row, col)) = captured_pane_mouse_position(snapshot, capture, mouse)
             {
                 send_pane_mouse(snapshot, capture.pane_id, row, col, HelperMouseEventKind::LeftUp)
@@ -2847,6 +2933,53 @@ fn handle_mouse_event(
             }
             *active_selection = None;
             return Ok(true);
+        }
+        MouseEventKind::Drag(button @ (MouseButton::Middle | MouseButton::Right)) => {
+            if let Some(capture) = *mouse_capture
+                && capture.button == button
+                && let Some((row, col)) = captured_pane_mouse_position(snapshot, capture, mouse)
+            {
+                let (_, helper_drag, _) = helper_mouse_kinds(button).expect("supported mouse button");
+                let (_, pane_drag, _) = pane_mouse_kinds(button).expect("supported mouse button");
+                send_pane_mouse(snapshot, capture.pane_id, row, col, helper_drag)
+                    .or_else(|_| {
+                        request_response(
+                            paths,
+                            CommandRequest::MousePane {
+                                session: session.to_string(),
+                                pane_id: capture.pane_id,
+                                row,
+                                col,
+                                kind: pane_drag,
+                            },
+                        )
+                        .map(|_| ())
+                    })?;
+            }
+        }
+        MouseEventKind::Up(button @ (MouseButton::Middle | MouseButton::Right)) => {
+            if mouse_capture.is_some_and(|capture| capture.button == button)
+                && let Some(capture) = mouse_capture.take()
+                && let Some((row, col)) = captured_pane_mouse_position(snapshot, capture, mouse)
+            {
+                let (_, _, helper_up) = helper_mouse_kinds(button).expect("supported mouse button");
+                let (_, _, pane_up) = pane_mouse_kinds(button).expect("supported mouse button");
+                send_pane_mouse(snapshot, capture.pane_id, row, col, helper_up)
+                    .or_else(|_| {
+                        request_response(
+                            paths,
+                            CommandRequest::MousePane {
+                                session: session.to_string(),
+                                pane_id: capture.pane_id,
+                                row,
+                                col,
+                                kind: pane_up,
+                            },
+                        )
+                        .map(|_| ())
+                    })?;
+                return Ok(false);
+            }
         }
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
             if !config.mouse.wheel_scroll {
@@ -3945,7 +4078,10 @@ root = { command = ["sh"] }
             width: 20,
             height: 8,
         };
-        let capture = MouseCapture { pane_id: 1 };
+        let capture = MouseCapture {
+            pane_id: 1,
+            button: MouseButton::Left,
+        };
         let mouse = MouseEvent {
             kind: MouseEventKind::Up(MouseButton::Left),
             column: 79,
@@ -3956,6 +4092,26 @@ root = { command = ["sh"] }
         assert_eq!(
             captured_pane_mouse_position(&snapshot, capture, mouse),
             Some((0, 19))
+        );
+    }
+
+    #[test]
+    fn application_mouse_button_mappings_include_middle_and_right() {
+        assert_eq!(
+            helper_mouse_kinds(MouseButton::Middle),
+            Some((
+                HelperMouseEventKind::MiddleDown,
+                HelperMouseEventKind::MiddleDrag,
+                HelperMouseEventKind::MiddleUp,
+            ))
+        );
+        assert_eq!(
+            pane_mouse_kinds(MouseButton::Right),
+            Some((
+                PaneMouseKind::RightDown,
+                PaneMouseKind::RightDrag,
+                PaneMouseKind::RightUp,
+            ))
         );
     }
 }
