@@ -326,6 +326,16 @@ impl PaneProcess {
         &self.socket_path
     }
 
+    /// Sends bytes through one helper connection without a separate protocol
+    /// probe. This is intended for the interactive forwarding hot path; a
+    /// failed send is retried through the daemon by the caller.
+    pub fn send_bytes_to(socket_path: &Path, bytes: &[u8]) -> Result<()> {
+        Self {
+            socket_path: socket_path.to_path_buf(),
+        }
+        .send_bytes(bytes)
+    }
+
     pub fn render(&self, width: u16, height: u16) -> Result<PaneSnapshot> {
         match self.request(PaneRequest::Snapshot { width, height })? {
             PaneResponse::Snapshot(snapshot) => Ok(snapshot.into()),

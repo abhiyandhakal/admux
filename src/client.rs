@@ -3356,8 +3356,7 @@ fn send_input_bytes(
 
     if let Some(pane) = focused_pane(snapshot)
         && let Some(socket) = pane.helper_socket.clone()
-        && let Ok(process) = PaneProcess::connect(socket)
-        && process.send_bytes(bytes).is_ok()
+        && PaneProcess::send_bytes_to(&socket, bytes).is_ok()
     {
         return Ok(());
     }
@@ -4148,25 +4147,13 @@ root = { command = ["sh"] }
         let helper_socket = dir.path().join("helper");
         let helper_listener = UnixListener::bind(&helper_socket).expect("bind helper socket");
         let helper = std::thread::spawn(move || {
-            let (mut stream, _) = helper_listener.accept().expect("accept handshake request");
+            let (mut stream, _) = helper_listener.accept().expect("accept direct send request");
             let mut input = Vec::new();
-            stream.read_to_end(&mut input).expect("read handshake request");
-            assert_eq!(
-                serde_json::from_slice::<serde_json::Value>(&input).expect("decode handshake request"),
-                serde_json::json!({"Hello":{"version":1}}),
-            );
-            stream
-                .write_all(br#"{"HelloAck":{"version":1}}"#)
-                .expect("write handshake response");
-            drop(stream);
-
-            let (mut stream, _) = helper_listener.accept().expect("accept send request");
-            let mut input = Vec::new();
-            stream.read_to_end(&mut input).expect("read send request");
-            assert!(serde_json::from_slice::<serde_json::Value>(&input)
-                .expect("decode send request")
-                .get("SendBytes")
-                .is_some());
+            stream.read_to_end(&mut input).expect("read direct send request");
+            let request = serde_json::from_slice::<serde_json::Value>(&input)
+                .expect("decode direct send request");
+            assert!(request.get("SendBytes").is_some());
+            assert!(request.get("Hello").is_none());
             // Dropping this response stream forces the direct-send failure that must fall back.
         });
         let mut snapshot = fallback_snapshot(String::new(), 80, 24);
