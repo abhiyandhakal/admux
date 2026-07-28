@@ -146,12 +146,19 @@ pub fn render_choose_tree<W: Write>(
     let body_height = size.height.saturating_sub(1);
     let body_start = body_start_row(ui);
     let list_height = body_height.min(
-        u16::try_from(lines.len().saturating_add(1))
+        u16::try_from(lines.len())
             .unwrap_or(u16::MAX)
             .min(8),
     );
+    let selected = lines.iter().position(|line| line.selected).unwrap_or(0);
+    let viewport_start = chooser_viewport_start(selected, lines.len(), usize::from(list_height));
 
-    for (index, line) in lines.iter().take(usize::from(list_height)).enumerate() {
+    for (index, line) in lines
+        .iter()
+        .skip(viewport_start)
+        .take(usize::from(list_height))
+        .enumerate()
+    {
         let row = body_start + u16::try_from(index).expect("list height bounds index");
         let prefix = if line.has_children {
             if line.expanded { "-" } else { "+" }
@@ -278,12 +285,18 @@ pub fn render_buffer_chooser<W: Write>(
     let body_height = size.height.saturating_sub(1);
     let body_start = body_start_row(ui);
     let list_height = body_height.min(
-        u16::try_from(buffers.len().saturating_add(1))
+        u16::try_from(buffers.len())
             .unwrap_or(u16::MAX)
             .min(8),
     );
+    let viewport_start = chooser_viewport_start(selected, buffers.len(), usize::from(list_height));
 
-    for (index, buffer) in buffers.iter().take(usize::from(list_height)).enumerate() {
+    for (index, buffer) in buffers
+        .iter()
+        .skip(viewport_start)
+        .take(usize::from(list_height))
+        .enumerate()
+    {
         let row = body_start + u16::try_from(index).expect("list height bounds index");
         let content = format!("{} ({}) {}", buffer.name, buffer.bytes, buffer.preview);
         queue!(out, MoveTo(0, row))?;
@@ -1133,6 +1146,15 @@ fn render_prompt_line(buffer: &str, completions: &[String], selected: usize, wid
     fit_width(&line, width)
 }
 
+fn chooser_viewport_start(selected: usize, item_count: usize, visible: usize) -> usize {
+    if visible == 0 || item_count <= visible {
+        return 0;
+    }
+    selected
+        .saturating_sub(visible / 2)
+        .min(item_count.saturating_sub(visible))
+}
+
 fn fit_width(value: &str, width: u16) -> String {
     let safe = terminal_safe(value);
     let mut fitted: String = safe.chars().take(width as usize).collect();
@@ -1207,6 +1229,13 @@ mod tests {
     use crate::pane::PaneId;
     use crate::pane::Rect;
     use crate::window::WindowSummary;
+
+    #[test]
+    fn chooser_viewport_keeps_selection_visible_past_eight_items() {
+        assert_eq!(chooser_viewport_start(0, 12, 8), 0);
+        assert_eq!(chooser_viewport_start(8, 12, 8), 4);
+        assert_eq!(chooser_viewport_start(11, 12, 8), 4);
+    }
 
     fn sample_snapshot() -> RenderSnapshot {
         RenderSnapshot {
