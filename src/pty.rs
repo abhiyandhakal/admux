@@ -7,9 +7,9 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs,
+    fs::{self, OpenOptions},
     io::{Read, Write},
-    os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
+    os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -269,22 +269,30 @@ impl PaneProcess {
             command: command.to_vec(),
             restore_seed,
         };
-        let payload = serde_json::to_string(&args).context("failed to encode helper args")?;
+        let args_path = write_helper_args_file(helper_dir, &args)?;
 
-        let mut child = Command::new(helper_bin)
-            .arg(payload)
+        let child = Command::new(helper_bin)
+            .arg("--args-file")
+            .arg(&args_path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             // Keep startup failures visible for manually supervised daemons;
             // otherwise a helper failure surfaces only as a socket timeout.
             .stderr(Stdio::inherit())
-            .spawn()
-            .context("failed to spawn admux-pane helper")?;
+            .spawn();
+        let mut child = match child {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = fs::remove_file(&args_path);
+                return Err(error).context("failed to spawn admux-pane helper");
+            }
+        };
 
         if let Err(error) = wait_for_socket(&socket_path) {
             let _ = child.kill();
             let _ = child.wait();
             let _ = fs::remove_file(&socket_path);
+            let _ = fs::remove_file(&args_path);
             return Err(error);
         }
         Ok(Self { socket_path })
@@ -467,6 +475,33 @@ impl PaneProcess {
             other => bail!("pane helper returned invalid handshake response: {other:?}"),
         }
     }
+}
+
+fn write_helper_args_file(helper_dir: &Path, args: &PaneHelperArgs) -> Result<PathBuf> {
+    let path = helper_dir.join(unique_helper_args_name());
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("failed to create pane helper args file {}", path.display()))?;
+        file.write_all(
+            &serde_json::to_vec(args).context("failed to encode pane helper args")?,
+        )
+        .with_context(|| format!("failed to write pane helper args file {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync pane helper args file {}", path.display()))?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).with_context(|| {
+            format!("failed to restrict pane helper args file permissions {}", path.display())
+        })?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_file(&path);
+        return Err(error);
+    }
+    Ok(path)
 }
 
 pub fn run_helper(args: PaneHelperArgs) -> Result<()> {
@@ -1315,6 +1350,10 @@ fn unique_helper_name() -> String {
     format!("pane-{pid}-{now}-{counter}.sock")
 }
 
+fn unique_helper_args_name() -> String {
+    unique_helper_name().replace(".sock", ".args")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1582,6 +1621,30 @@ mod tests {
         .expect("spawn pane");
 
         assert!(wait_for_preview(&pane, "hello from pane").contains("hello from pane"));
+    }
+
+    #[test]
+    fn pane_process_accepts_restore_data_larger_than_a_command_argument() {
+        let dir = helper_dir();
+        let pane = PaneProcess::spawn(
+            &["sh".into(), "-lc".into(), "sleep 1".into()],
+            None,
+            None,
+            None,
+            10_000,
+            dir.path(),
+            Some(PaneRestoreSeed {
+                rows: 24,
+                cols: 80,
+                // Linux rejects a single argv element above MAX_ARG_STRLEN
+                // (normally 128 KiB); startup data must not use argv.
+                vt: "x".repeat(256 * 1024),
+            }),
+        )
+        .expect("spawn pane with large restore seed");
+
+        assert_eq!(pane.screen_size().expect("query pane size"), (24, 80));
+        pane.kill().expect("clean up pane");
     }
 
     #[test]
