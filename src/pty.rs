@@ -1197,6 +1197,12 @@ fn helper_history_selection_text(
         return String::new();
     }
 
+    parser.screen_mut().set_scrollback(usize::MAX);
+    let max_from_bottom = u32::try_from(parser.screen().scrollback()).unwrap_or(u32::MAX);
+    parser.screen_mut().set_scrollback(original_scrollback);
+    let start_from_bottom = start_from_bottom.min(max_from_bottom);
+    let end_from_bottom = end_from_bottom.min(max_from_bottom);
+
     let mut text = String::new();
     for from_bottom in (end_from_bottom..=start_from_bottom).rev() {
         parser.screen_mut().set_scrollback(from_bottom as usize);
@@ -1611,6 +1617,35 @@ mod tests {
         let selection = helper_history_selection_text(&mut parser, 2, 0, 0, cols - 1);
 
         assert_eq!(selection, expected_rows.join("\n"));
+        assert_eq!(parser.screen().scrollback(), original_scrollback);
+    }
+
+    #[test]
+    fn history_selection_clamps_untrusted_positions_to_retained_scrollback() {
+        let mut parser = vt100::Parser::new(2, 20, 20);
+        parser.process(b"first\r\nsecond\r\nthird\r\nfourth");
+        parser.screen_mut().set_scrollback(1);
+        let original_scrollback = parser.screen().scrollback();
+        let (_, cols) = parser.screen().size();
+        parser.screen_mut().set_scrollback(usize::MAX);
+        let oldest = parser.screen().scrollback();
+        let expected = parser
+            .screen()
+            .rows(0, cols)
+            .last()
+            .expect("bottom visible row");
+        parser.screen_mut().set_scrollback(original_scrollback);
+
+        let selection = helper_history_selection_text(
+            &mut parser,
+            u32::MAX,
+            0,
+            u32::MAX,
+            cols - 1,
+        );
+
+        assert!(oldest > 0);
+        assert_eq!(selection, expected);
         assert_eq!(parser.screen().scrollback(), original_scrollback);
     }
 
