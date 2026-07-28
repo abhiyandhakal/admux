@@ -935,7 +935,16 @@ mod tests {
 
     fn wait_for_preview(session: &Session, needle: &str) {
         for _ in 0..50 {
-            if session.active_pane_preview().contains(needle) {
+            let pane = session
+                .active_window()
+                .and_then(|window| window.panes.get(&window.layout.active))
+                .expect("active pane");
+            let preview = pane
+                .process
+                .render(80, 24)
+                .expect("render active pane")
+                .preview;
+            if preview.contains(needle) {
                 return;
             }
             thread::sleep(Duration::from_millis(20));

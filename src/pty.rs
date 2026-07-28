@@ -322,46 +322,11 @@ impl PaneProcess {
         }
     }
 
-    pub fn preview(&self) -> String {
-        self.render_with_current_size()
-            .map(|snapshot| snapshot.preview)
-            .unwrap_or_default()
-    }
-
-    pub fn formatted_preview(&self) -> String {
-        self.render_with_current_size()
-            .map(|snapshot| snapshot.formatted_preview)
-            .unwrap_or_default()
-    }
-
-    pub fn formatted_cursor(&self) -> String {
-        self.render_with_current_size()
-            .map(|snapshot| snapshot.formatted_cursor)
-            .unwrap_or_default()
-    }
-
-    pub fn visible_rows(&self, width: u16, height: u16) -> Vec<String> {
-        self.render(width, height)
-            .map(|snapshot| snapshot.rows_plain)
-            .unwrap_or_default()
-    }
-
-    pub fn visible_rows_formatted(&self, width: u16, height: u16) -> Vec<String> {
-        self.render(width, height)
-            .map(|snapshot| snapshot.rows_formatted)
-            .unwrap_or_default()
-    }
-
-    pub fn cursor_position(&self) -> (u16, u16) {
-        self.render_with_current_size()
-            .map(|snapshot| (snapshot.cursor_row, snapshot.cursor_col))
-            .unwrap_or((0, 0))
-    }
-
-    pub fn screen_size(&self) -> (u16, u16) {
-        match self.request(PaneRequest::ScreenSize) {
-            Ok(PaneResponse::ScreenSize { rows, cols }) => (rows, cols),
-            _ => (24, 80),
+    pub fn screen_size(&self) -> Result<(u16, u16)> {
+        match self.request(PaneRequest::ScreenSize)? {
+            PaneResponse::ScreenSize { rows, cols } => Ok((rows, cols)),
+            PaneResponse::Error { message } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected pane screen-size response: {other:?}")),
         }
     }
 
@@ -468,11 +433,6 @@ impl PaneProcess {
             self.request(PaneRequest::IsAlive),
             Ok(PaneResponse::IsAlive { alive: true })
         )
-    }
-
-    fn render_with_current_size(&self) -> Result<PaneSnapshot> {
-        let (rows, cols) = self.screen_size();
-        self.render(cols.max(1), rows.max(1))
     }
 
     fn request(&self, request: PaneRequest) -> Result<PaneResponse> {
@@ -1477,6 +1437,57 @@ mod tests {
     }
 
     #[test]
+    fn screen_size_reports_helper_transport_or_protocol_failures() {
+        let dir = helper_dir();
+        let socket = dir.path().join("helper");
+        let listener = UnixListener::bind(&socket).expect("bind helper socket");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept handshake");
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).expect("read handshake");
+            assert_eq!(
+                serde_json::from_slice::<PaneRequest>(&request).expect("decode handshake"),
+                PaneRequest::Hello {
+                    version: HELPER_PROTOCOL_VERSION
+                }
+            );
+            stream
+                .write_all(
+                    &serde_json::to_vec(&PaneResponse::HelloAck {
+                        version: HELPER_PROTOCOL_VERSION,
+                    })
+                    .expect("encode handshake response"),
+                )
+                .expect("write handshake response");
+            drop(stream);
+
+            let (mut stream, _) = listener.accept().expect("accept screen-size request");
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).expect("read screen-size request");
+            assert_eq!(
+                serde_json::from_slice::<PaneRequest>(&request).expect("decode screen-size request"),
+                PaneRequest::ScreenSize
+            );
+            stream
+                .write_all(
+                    &serde_json::to_vec(&PaneResponse::Error {
+                        message: "helper unavailable".into(),
+                    })
+                    .expect("encode error response"),
+                )
+                .expect("write error response");
+            drop(stream);
+        });
+
+        let pane = PaneProcess::connect(socket).expect("connect compatible helper");
+        let error = pane
+            .screen_size()
+            .expect_err("helper error must not become a default size");
+        assert!(error.to_string().contains("helper unavailable"));
+        server.join().expect("server thread");
+    }
+
+    #[test]
     fn invalid_persistent_snapshot_wire_is_an_error_not_a_panic() {
         let invalid_base64 = PanePersistentSnapshotWire {
             rows: 24,
@@ -1538,15 +1549,22 @@ mod tests {
         assert!(history.is_empty());
     }
 
+    fn pane_preview(pane: &PaneProcess) -> String {
+        let (rows, cols) = pane.screen_size().expect("query pane screen size");
+        pane.render(cols.max(1), rows.max(1))
+            .expect("render pane")
+            .preview
+    }
+
     fn wait_for_preview(pane: &PaneProcess, needle: &str) -> String {
         for _ in 0..50 {
-            let preview = pane.preview();
+            let preview = pane_preview(pane);
             if preview.contains(needle) {
                 return preview;
             }
             thread::sleep(Duration::from_millis(20));
         }
-        pane.preview()
+        pane_preview(pane)
     }
 
     #[test]
@@ -1642,12 +1660,12 @@ mod tests {
 
         let _ = wait_for_preview(&pane, "one two");
         pane.resize(24, 10).expect("resize pane");
-        let shrunk = pane.preview();
+        let shrunk = pane_preview(&pane);
         assert!(shrunk.contains("one two"));
 
         pane.resize(24, 80).expect("resize pane");
 
-        let preview = pane.preview();
+        let preview = pane_preview(&pane);
         assert!(preview.contains("three"));
         assert!(preview.contains("seven"));
     }
@@ -1676,7 +1694,7 @@ mod tests {
             .expect("expand width while shrinking height");
 
         assert!(
-            pane.preview().contains("one two three four five six seven"),
+            pane_preview(&pane).contains("one two three four five six seven"),
             "an expanding axis must replay history even when the other shrinks"
         );
     }

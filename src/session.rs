@@ -13,7 +13,7 @@ use crate::{
     },
     layout::{Direction, LayoutTree, SplitAxis},
     numbering::Numbering,
-    pane::{PaneId, PaneSnapshot, Rect, WindowId},
+    pane::{PaneId, Rect, WindowId},
     persistence::PersistedSession,
     pty::{PanePersistentSnapshot, PaneProcess, PaneRestoreSeed},
     window::WindowSummary,
@@ -274,27 +274,6 @@ impl Session {
         self.windows.get_mut(&self.active_window)
     }
 
-    pub fn active_pane_preview(&self) -> String {
-        self.active_window()
-            .and_then(|window| window.active_pane())
-            .map(|pane| pane.process.preview())
-            .unwrap_or_default()
-    }
-
-    pub fn active_pane_formatted_preview(&self) -> String {
-        self.active_window()
-            .and_then(|window| window.active_pane())
-            .map(|pane| pane.process.formatted_preview())
-            .unwrap_or_default()
-    }
-
-    pub fn active_pane_formatted_cursor(&self) -> String {
-        self.active_window()
-            .and_then(|window| window.active_pane())
-            .map(|pane| pane.process.formatted_cursor())
-            .unwrap_or_default()
-    }
-
     pub fn active_pane_selection_text(
         &self,
         pane_id: Option<PaneId>,
@@ -312,16 +291,6 @@ impl Session {
             .ok_or_else(|| anyhow!("active pane is unavailable"))?;
         pane.process
             .selection_text(start_row, start_col, end_row, end_col)
-    }
-
-    pub fn active_pane_snapshot(&self) -> Option<PaneSnapshot> {
-        self.active_window()
-            .and_then(|window| window.active_pane())
-            .map(|pane| PaneSnapshot {
-                id: pane.id,
-                title: pane.title.clone(),
-                preview: pane.process.preview(),
-            })
     }
 
     pub fn render_snapshot(&self, size: Rect) -> Option<RenderSnapshot> {
@@ -1169,10 +1138,6 @@ impl WindowRuntime {
         })
     }
 
-    fn active_pane(&self) -> Option<&PaneRuntime> {
-        self.panes.get(&self.layout.active)
-    }
-
     fn prune_dead(&mut self) {
         let dead: Vec<_> = self
             .panes
@@ -1271,7 +1236,7 @@ mod tests {
 
         let window = session.windows.get(&created.window_id).expect("window");
         let pane = window.panes.get(&created.pane_id).expect("pane");
-        let (rows, cols) = pane.process.screen_size();
+        let (rows, cols) = pane.process.screen_size().expect("query pane size");
 
         assert_eq!(rows, 29);
         assert_eq!(cols, 120);
@@ -1321,7 +1286,10 @@ mod tests {
             .panes
             .get(&PaneId(0))
             .expect("visible pane");
-        assert_eq!(visible.process.screen_size(), (39, 120));
+        assert_eq!(
+            visible.process.screen_size().expect("query visible pane size"),
+            (39, 120)
+        );
 
         fs::rename(&hidden_path, &hidden_socket).expect("restore helper socket");
         session.kill().expect("clean up session");
