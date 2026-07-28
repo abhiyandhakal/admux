@@ -599,9 +599,11 @@ fn render_bottom_bar<W: Write>(
             }
             render_status_line(session, snapshot, message, ui, size.width)
         }
-        BottomBar::CopyMode => vec![StatusSegment::message(
-            "[copy-mode] h/j/k/l move  0/$ line  g/G top/bottom  PgUp/PgDn scroll  Space select  y copy  q quit",
-        )],
+        BottomBar::CopyMode => vec![StatusSegment::message(if ui.copy_mode.show_hints {
+            "[copy-mode] h/j/k/l move  0/$ line  g/G top/bottom  PgUp/PgDn scroll  Space select  y copy  q quit"
+        } else {
+            "[copy-mode]"
+        })],
         BottomBar::Prompt {
             buffer,
             completions,
@@ -1420,6 +1422,30 @@ mod tests {
 
         assert!(rendered.contains("\u{1b}[?25l"));
         assert!(!rendered.contains("\u{1b}[?25h"));
+    }
+
+    #[test]
+    fn copy_mode_hints_follow_the_ui_configuration() {
+        let mut ui = sample_ui();
+        ui.copy_mode.show_hints = false;
+        let mut buf = Vec::new();
+        render_session(
+            &mut buf,
+            "work",
+            &sample_snapshot(),
+            BottomBar::CopyMode,
+            None,
+            &ui,
+            TerminalSize {
+                width: 100,
+                height: 6,
+            },
+        )
+        .expect("render copy mode");
+        let rendered = String::from_utf8_lossy(&buf);
+
+        assert!(rendered.contains("[copy-mode]"));
+        assert!(!rendered.contains("h/j/k/l move"));
     }
 
     #[test]
