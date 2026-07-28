@@ -131,6 +131,11 @@ struct ResizeDrag {
     span: u16,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct MouseCapture {
+    pane_id: u64,
+}
+
 struct EventLogger {
     out: std::fs::File,
 }
@@ -794,6 +799,7 @@ fn run_attach_loop(
     let mut active_selection: Option<PaneSelection> = None;
     let mut copy_mode: Option<CopyMode> = None;
     let mut resize_drag: Option<ResizeDrag> = None;
+    let mut mouse_capture: Option<MouseCapture> = None;
     let mut status_message: Option<String> = None;
     let mut prompt_history = Vec::<String>::new();
     let mut overlay = OverlayState::None;
@@ -1352,6 +1358,7 @@ fn run_attach_loop(
                         &mut selection_anchor,
                         &mut active_selection,
                         &mut resize_drag,
+                        &mut mouse_capture,
                         &mut status_message,
                     )?;
                     if local_repaint {
@@ -2647,6 +2654,7 @@ fn handle_mouse_event(
     selection_anchor: &mut Option<SelectionAnchor>,
     active_selection: &mut Option<PaneSelection>,
     resize_drag: &mut Option<ResizeDrag>,
+    mouse_capture: &mut Option<MouseCapture>,
     status_message: &mut Option<String>,
 ) -> Result<bool> {
     let ui = &config.ui;
@@ -2701,6 +2709,9 @@ fn handle_mouse_event(
                         )
                         .map(|_| ())
                     })?;
+                    *mouse_capture = Some(MouseCapture {
+                        pane_id: pane.pane_id,
+                    });
                     *selection_anchor = None;
                     *active_selection = None;
                     return Ok(false);
@@ -2735,6 +2746,29 @@ fn handle_mouse_event(
                     resize.last_row = mouse.row;
                     resize.last_col = mouse.column;
                 }
+            } else if let Some(capture) = *mouse_capture
+                && let Some((row, col)) = captured_pane_mouse_position(snapshot, capture, mouse)
+            {
+                send_pane_mouse(
+                    snapshot,
+                    capture.pane_id,
+                    row,
+                    col,
+                    HelperMouseEventKind::LeftDrag,
+                )
+                .or_else(|_| {
+                    request_response(
+                        paths,
+                        CommandRequest::MousePane {
+                            session: session.to_string(),
+                            pane_id: capture.pane_id,
+                            row,
+                            col,
+                            kind: PaneMouseKind::LeftDrag,
+                        },
+                    )
+                    .map(|_| ())
+                })?;
             } else if let Some((pane, row, col)) =
                 pane_content_hit(snapshot, mouse.row, mouse.column)
                 && pane.mouse_reporting
@@ -2767,16 +2801,16 @@ fn handle_mouse_event(
         }
         MouseEventKind::Up(MouseButton::Left) => {
             *resize_drag = None;
-            if let Some((pane, row, col)) = pane_content_hit(snapshot, mouse.row, mouse.column)
-                && pane.mouse_reporting
+            if let Some(capture) = mouse_capture.take()
+                && let Some((row, col)) = captured_pane_mouse_position(snapshot, capture, mouse)
             {
-                send_pane_mouse(snapshot, pane.pane_id, row, col, HelperMouseEventKind::LeftUp)
+                send_pane_mouse(snapshot, capture.pane_id, row, col, HelperMouseEventKind::LeftUp)
                     .or_else(|_| {
                         request_response(
                             paths,
                             CommandRequest::MousePane {
                                 session: session.to_string(),
-                                pane_id: pane.pane_id,
+                                pane_id: capture.pane_id,
                                 row,
                                 col,
                                 kind: PaneMouseKind::LeftUp,
@@ -2851,6 +2885,25 @@ fn pane_content_hit(
             None
         }
     })
+}
+
+fn captured_pane_mouse_position(
+    snapshot: &RenderSnapshot,
+    capture: MouseCapture,
+    mouse: MouseEvent,
+) -> Option<(u16, u16)> {
+    let pane = snapshot
+        .panes
+        .iter()
+        .find(|pane| pane.pane_id == capture.pane_id)?;
+    let max_row = pane.rect.y.saturating_add(pane.rect.height.saturating_sub(1));
+    let max_col = pane.rect.x.saturating_add(pane.rect.width.saturating_sub(1));
+    let row = mouse.row.clamp(pane.rect.y, max_row).saturating_sub(pane.rect.y);
+    let col = mouse
+        .column
+        .clamp(pane.rect.x, max_col)
+        .saturating_sub(pane.rect.x);
+    Some((row, col))
 }
 
 fn separator_hit(
@@ -3879,5 +3932,28 @@ root = { command = ["sh"] }
         assert_eq!(mouse_resize_amount(1, 200), 5);
         assert_eq!(mouse_resize_amount(100, 80), 100);
         assert_eq!(mouse_resize_amount(0, 80), 1);
+    }
+
+    #[test]
+    fn mouse_capture_clamps_drag_and_release_to_the_pressed_pane() {
+        let mut snapshot = fallback_snapshot(String::new(), 80, 24);
+        snapshot.panes[0].rect = Rect {
+            x: 10,
+            y: 5,
+            width: 20,
+            height: 8,
+        };
+        let capture = MouseCapture { pane_id: 1 };
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 79,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert_eq!(
+            captured_pane_mouse_position(&snapshot, capture, mouse),
+            Some((0, 19))
+        );
     }
 }
