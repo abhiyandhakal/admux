@@ -37,6 +37,9 @@ ADMUX_STATE=/path/to/state.json
 ```toml
 [ui]
 status_position = "bottom"
+# "tmux-plus" is the default multi-zone bar; "minimal" shows only the
+# current session and optional active-pane segment.
+status_style = "tmux-plus"
 
 [ui.status]
 show_sessions = true
@@ -80,6 +83,7 @@ leader = "Ctrl-b"
 ## Notes
 
 - `admux reload-config` reloads UI/keybinding behavior plus future creation defaults
+- `ui.status_style` accepts `tmux-plus` (default) or `minimal`
 - duplicate key bindings and invalid key names fail explicitly
 - legacy aliases still load where compatibility is supported
 - already-running pane processes are not retroactively respawned on config reload

@@ -178,6 +178,7 @@ pub enum StatusPosition {
 pub enum StatusStyle {
     #[default]
     TmuxPlus,
+    Minimal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -223,6 +224,7 @@ pub struct ResolvedConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedUiConfig {
     pub status_position: StatusPosition,
+    pub status_style: StatusStyle,
     pub show_pane_labels: bool,
     pub status_show_pane: bool,
     pub status: StatusConfig,
@@ -635,6 +637,7 @@ impl Config {
         Ok(ResolvedConfig {
             ui: ResolvedUiConfig {
                 status_position: self.ui.status_position,
+                status_style: self.ui.status_style,
                 show_pane_labels: self.ui.show_pane_labels,
                 status_show_pane: self.ui.status_show_pane,
                 status,
@@ -1031,6 +1034,19 @@ mod tests {
         .expect("config");
         let resolved = config.resolve().expect("resolve config");
         assert!(!resolved.ui.status_show_pane);
+    }
+
+    #[test]
+    fn minimal_status_style_is_preserved_in_resolved_ui_config() {
+        let config = Config::from_toml(
+            r#"
+                [ui]
+                status_style = "minimal"
+            "#,
+        )
+        .expect("config");
+        let resolved = config.resolve().expect("resolve config");
+        assert_eq!(resolved.ui.status_style, StatusStyle::Minimal);
     }
 
     #[test]

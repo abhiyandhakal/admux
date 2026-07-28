@@ -10,7 +10,7 @@ use crossterm::{
 };
 
 use crate::{
-    config::{DividerCharset, OverlayConfig, ResolvedUiConfig, StatusPosition, StyleConfig},
+    config::{DividerCharset, OverlayConfig, ResolvedUiConfig, StatusPosition, StatusStyle, StyleConfig},
     copy_mode::Selection,
     ipc::{BufferSummary, PaneRender, RenderSnapshot},
     pane::Rect,
@@ -629,7 +629,8 @@ fn render_bottom_bar<W: Write>(
     let row = status_row(ui, size);
     let content = match bottom_bar {
         BottomBar::Status { message } => {
-            if message.is_none()
+            if matches!(ui.status_style, StatusStyle::TmuxPlus)
+                && message.is_none()
                 && let Some(zones) = build_tmux_status_zones(session, snapshot, ui, size.width)
             {
                 render_status_zones(out, row, &zones, size.width)?;
@@ -792,13 +793,40 @@ fn render_status_line(
         return vec![StatusSegment::message(fit_width(message, width))];
     }
 
-    let Some(zones) = build_tmux_status_zones(session, snapshot, ui, width) else {
-        return Vec::new();
-    };
-    let mut result = zones.left;
-    result.extend(zones.center);
-    result.extend(zones.right);
-    result
+    match ui.status_style {
+        StatusStyle::TmuxPlus => {
+            let Some(zones) = build_tmux_status_zones(session, snapshot, ui, width) else {
+                return Vec::new();
+            };
+            let mut result = zones.left;
+            result.extend(zones.center);
+            result.extend(zones.right);
+            result
+        }
+        StatusStyle::Minimal => build_minimal_status(session, snapshot, ui),
+    }
+}
+
+fn build_minimal_status(
+    session: &str,
+    snapshot: &RenderSnapshot,
+    ui: &ResolvedUiConfig,
+) -> Vec<StatusSegment> {
+    let mut segments = vec![StatusSegment::session(format!("[{session}] "))];
+    if ui.status_show_pane {
+        if let Some(pane) = snapshot
+            .panes
+            .iter()
+            .find(|pane| pane.pane_id == snapshot.active_pane_id)
+        {
+            segments.push(StatusSegment::plain(format!(
+                " pane:{}:{} ",
+                pane.pane_id,
+                terminal_safe(&pane.title)
+            )));
+        }
+    }
+    segments
 }
 
 fn render_window_segment(window: &crate::window::WindowSummary) -> StatusSegment {
@@ -1424,6 +1452,7 @@ mod tests {
     fn sample_ui() -> ResolvedUiConfig {
         ResolvedUiConfig {
             status_position: StatusPosition::Bottom,
+            status_style: StatusStyle::TmuxPlus,
             show_pane_labels: true,
             status_show_pane: true,
             status: StatusConfig::default(),
@@ -1810,6 +1839,24 @@ mod tests {
             .map(|segment| segment.text)
             .collect::<String>();
         assert!(!hidden.contains("pane:1:shell"));
+    }
+
+    #[test]
+    fn minimal_status_style_omits_window_and_host_zones() {
+        let mut ui = sample_ui();
+        ui.status_style = StatusStyle::Minimal;
+        let zones = build_tmux_status_zones("work", &sample_snapshot(), &ui, 80)
+            .expect("tmux-style zones remain constructible");
+        assert!(!zones.center.is_empty());
+
+        let segments = render_status_line("work", &sample_snapshot(), None, &ui, 80);
+        let text = segments
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<String>();
+        assert!(text.contains("[work]"));
+        assert!(text.contains("pane:1:shell"));
+        assert!(!text.contains("1:shell*"));
     }
 
     #[test]
