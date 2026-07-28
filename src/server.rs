@@ -165,6 +165,9 @@ impl SessionStore {
                 store.config.defaults.window.clone(),
                 store.helper_dir.clone(),
             ) {
+                store
+                    .persisted_sessions
+                    .insert(name.clone(), PersistedSession::from_live(&session));
                 store.sessions.insert(name, session);
             } else {
                 store.persisted_sessions.remove(&name);

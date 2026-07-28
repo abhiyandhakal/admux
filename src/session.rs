@@ -168,25 +168,52 @@ impl Session {
                 .get(window_id)
                 .ok_or_else(|| anyhow!("missing persisted window {}", window_id.0))?;
             let mut panes = BTreeMap::new();
+            let mut layout = persisted_window.layout.clone();
             for pane_id in persisted_window.layout.panes() {
-                let persisted_pane = persisted_window
-                    .panes
-                    .get(&pane_id)
-                    .ok_or_else(|| anyhow!("missing persisted pane {}", pane_id.0))?;
-                let socket_path = persisted_pane
-                    .socket_path
-                    .clone()
-                    .ok_or_else(|| anyhow!("persisted pane {} has no helper socket", pane_id.0))?;
-                panes.insert(
-                    pane_id,
-                    PaneRuntime {
-                        id: pane_id,
-                        title: persisted_pane.title.clone(),
-                        cwd: persisted_pane.cwd.clone(),
-                        command: persisted_pane.command.clone(),
-                        process: PaneProcess::connect(socket_path)?,
-                    },
+                let Some(persisted_pane) = persisted_window.panes.get(&pane_id) else {
+                    continue;
+                };
+                let Some(socket_path) = persisted_pane.socket_path.clone() else {
+                    eprintln!(
+                        "admuxd: could not recover pane {} in session {}: no helper socket",
+                        pane_id.0, persisted.name
+                    );
+                    continue;
+                };
+                match PaneProcess::connect(socket_path) {
+                    Ok(process) => {
+                        panes.insert(
+                            pane_id,
+                            PaneRuntime {
+                                id: pane_id,
+                                title: persisted_pane.title.clone(),
+                                cwd: persisted_pane.cwd.clone(),
+                                command: persisted_pane.command.clone(),
+                                process,
+                            },
+                        );
+                    }
+                    Err(error) => eprintln!(
+                        "admuxd: could not recover pane {} in session {}: {error:#}",
+                        pane_id.0, persisted.name
+                    ),
+                }
+            }
+            for pane_id in persisted_window.layout.panes() {
+                if !panes.contains_key(&pane_id) {
+                    if layout.panes().len() == 1 {
+                        panes.clear();
+                        break;
+                    }
+                    let _ = layout.remove_pane(pane_id);
+                }
+            }
+            if panes.is_empty() {
+                eprintln!(
+                    "admuxd: could not recover window {} in session {}: no live panes",
+                    window_id.0, persisted.name
                 );
+                continue;
             }
             windows.insert(
                 *window_id,
@@ -194,12 +221,29 @@ impl Session {
                     id: persisted_window.id,
                     name: persisted_window.name.clone(),
                     cwd: persisted_window.cwd.clone(),
-                    layout: persisted_window.layout.clone(),
+                    layout,
                     next_pane_id: persisted_window.next_pane_id,
                     panes,
                 },
             );
         }
+
+        let window_order: Vec<_> = persisted
+            .window_order
+            .iter()
+            .copied()
+            .filter(|window_id| windows.contains_key(window_id))
+            .collect();
+        let active_window = if windows.contains_key(&persisted.active_window) {
+            persisted.active_window
+        } else {
+            *window_order
+                .first()
+                .ok_or_else(|| anyhow!("persisted session {} has no recoverable panes", persisted.name))?
+        };
+        let last_window = persisted
+            .last_window
+            .filter(|window_id| windows.contains_key(window_id) && *window_id != active_window);
 
         let mut session = Self {
             name: persisted.name.clone(),
@@ -209,9 +253,9 @@ impl Session {
             rows: persisted.rows,
             cols: persisted.cols,
             windows,
-            window_order: persisted.window_order.clone(),
-            active_window: persisted.active_window,
-            last_window: persisted.last_window,
+            window_order,
+            active_window,
+            last_window,
             default_shell,
             scrollback_lines,
             numbering,
@@ -1207,6 +1251,62 @@ mod tests {
         assert_eq!(session.active_window, original_window);
         assert!(preview.panes.iter().all(|pane| pane.focused));
         session.kill().expect("clean up session");
+    }
+
+    #[test]
+    fn recovery_salvages_live_panes_when_a_sibling_helper_is_missing() {
+        let helper_dir = tempdir();
+        let original = Session::new(
+            "work".into(),
+            None,
+            None,
+            vec!["sh".into()],
+            WindowId(1),
+            None,
+            10_000,
+            Numbering {
+                window_base: 0,
+                pane_base: 0,
+            },
+            WindowDefaults::default(),
+            helper_dir.path().to_path_buf(),
+        )
+        .expect("create session");
+        let mut persisted = PersistedSession::from_live(&original);
+        let window = persisted
+            .windows
+            .get_mut(&WindowId(1))
+            .expect("persisted window");
+        window.layout.split_active(SplitAxis::Vertical, PaneId(1));
+        window.next_pane_id = 2;
+        window.panes.insert(
+            PaneId(1),
+            crate::persistence::PersistedPane {
+                id: PaneId(1),
+                title: "missing".into(),
+                cwd: None,
+                command: vec!["sh".into()],
+                socket_path: Some(helper_dir.path().join("missing-helper.sock")),
+            },
+        );
+
+        let recovered = Session::from_persisted(
+            &persisted,
+            None,
+            10_000,
+            Numbering {
+                window_base: 0,
+                pane_base: 0,
+            },
+            WindowDefaults::default(),
+            helper_dir.path().to_path_buf(),
+        )
+        .expect("recover live sibling");
+
+        let window = recovered.windows.get(&WindowId(1)).expect("recovered window");
+        assert_eq!(window.panes.len(), 1);
+        assert_eq!(window.layout.panes(), vec![PaneId(0)]);
+        recovered.kill().expect("clean up helper");
     }
 
     #[test]
