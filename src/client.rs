@@ -1725,7 +1725,7 @@ fn execute_prompt_command(
 ) -> Result<Option<String>> {
     match parse_command(input).map_err(anyhow::Error::msg)? {
         InteractiveCommand::SplitWindow { horizontal } => {
-            let _ = request_response(
+            ensure_command_succeeded(request_response(
                 paths,
                 CommandRequest::SplitPane {
                     target: current_session.clone(),
@@ -1736,57 +1736,57 @@ fn execute_prompt_command(
                     },
                     command: Vec::new(),
                 },
-            )?;
+            )?)?;
             Ok(None)
         }
         InteractiveCommand::NewWindow => {
-            let _ = request_response(
+            ensure_command_succeeded(request_response(
                 paths,
                 CommandRequest::NewWindow {
                     session: current_session.clone(),
                     name: None,
                     command: Vec::new(),
                 },
-            )?;
+            )?)?;
             Ok(None)
         }
         InteractiveCommand::SelectWindow { target } => {
             let target = resolve_window_target(snapshot, current_session, &target);
-            let _ = request_response(paths, CommandRequest::SelectWindow { target })?;
+            ensure_command_succeeded(request_response(paths, CommandRequest::SelectWindow { target })?)?;
             Ok(None)
         }
         InteractiveCommand::NextWindow => {
-            let _ = request_response(
+            ensure_command_succeeded(request_response(
                 paths,
                 CommandRequest::CycleWindow {
                     session: current_session.clone(),
                     direction: CycleDirection::Next,
                 },
-            )?;
+            )?)?;
             Ok(None)
         }
         InteractiveCommand::PreviousWindow => {
-            let _ = request_response(
+            ensure_command_succeeded(request_response(
                 paths,
                 CommandRequest::CycleWindow {
                     session: current_session.clone(),
                     direction: CycleDirection::Prev,
                 },
-            )?;
+            )?)?;
             Ok(None)
         }
         InteractiveCommand::KillPane => {
-            let _ = request_response(
+            ensure_command_succeeded(request_response(
                 paths,
                 CommandRequest::KillPane {
                     target: current_session.clone(),
                 },
-            )?;
+            )?)?;
             Ok(None)
         }
         InteractiveCommand::KillWindow => {
             let target = format!("{}:{}", current_session, snapshot.active_window_id);
-            let _ = request_response(paths, CommandRequest::KillWindow { target })?;
+            ensure_command_succeeded(request_response(paths, CommandRequest::KillWindow { target })?)?;
             Ok(None)
         }
         InteractiveCommand::AttachSession { target }
@@ -1801,78 +1801,78 @@ fn execute_prompt_command(
             Ok(None)
         }
         InteractiveCommand::ListSessions => {
-            let response = request_response(paths, CommandRequest::ListSessions)?;
+            let response = ensure_command_succeeded(request_response(paths, CommandRequest::ListSessions)?)?;
             Ok(Some(format_list_response(response)))
         }
         InteractiveCommand::ListWindows => {
-            let response = request_response(
+            let response = ensure_command_succeeded(request_response(
                 paths,
                 CommandRequest::ListWindows {
                     session: current_session.clone(),
                 },
-            )?;
+            )?)?;
             Ok(Some(format_list_response(response)))
         }
         InteractiveCommand::ListPanes => {
-            let response = request_response(
+            let response = ensure_command_succeeded(request_response(
                 paths,
                 CommandRequest::ListPanes {
                     target: current_session.clone(),
                 },
-            )?;
+            )?)?;
             Ok(Some(format_list_response(response)))
         }
         InteractiveCommand::ListBuffers => {
-            let response = request_response(paths, CommandRequest::ListBuffers)?;
+            let response = ensure_command_succeeded(request_response(paths, CommandRequest::ListBuffers)?)?;
             Ok(Some(format_list_response(response)))
         }
         InteractiveCommand::ShowBuffer { buffer } => {
-            let response = request_response(paths, CommandRequest::ShowBuffer { buffer })?;
+            let response = ensure_command_succeeded(request_response(paths, CommandRequest::ShowBuffer { buffer })?)?;
             Ok(Some(format_list_response(response)))
         }
         InteractiveCommand::DeleteBuffer { buffer } => {
-            let response = request_response(paths, CommandRequest::DeleteBuffer { buffer })?;
+            let response = ensure_command_succeeded(request_response(paths, CommandRequest::DeleteBuffer { buffer })?)?;
             Ok(Some(format_list_response(response)))
         }
         InteractiveCommand::PasteBuffer { buffer, target } => {
-            let response = request_response(
+            let response = ensure_command_succeeded(request_response(
                 paths,
                 CommandRequest::PasteBuffer {
                     target: target.unwrap_or_else(|| current_session.clone()),
                     buffer,
                 },
-            )?;
+            )?)?;
             Ok(Some(format_list_response(response)))
         }
         InteractiveCommand::SetBuffer { buffer, data } => {
-            let response = request_response(
+            let response = ensure_command_succeeded(request_response(
                 paths,
                 CommandRequest::SetBuffer {
                     buffer,
                     data,
                     append: false,
                 },
-            )?;
+            )?)?;
             Ok(Some(format_list_response(response)))
         }
         InteractiveCommand::SaveBuffer { buffer, path } => {
-            let response = request_response(
+            let response = ensure_command_succeeded(request_response(
                 paths,
                 CommandRequest::SaveBuffer {
                     buffer,
                     path: resolve_client_path(path.into())?,
                 },
-            )?;
+            )?)?;
             Ok(Some(format_list_response(response)))
         }
         InteractiveCommand::LoadBuffer { buffer, path } => {
-            let response = request_response(
+            let response = ensure_command_succeeded(request_response(
                 paths,
                 CommandRequest::LoadBuffer {
                     path: resolve_client_path(path.into())?,
                     buffer,
                 },
-            )?;
+            )?)?;
             Ok(Some(format_list_response(response)))
         }
         InteractiveCommand::ChooseBuffer => Ok(Some("use Ctrl-b =".into())),
@@ -1880,32 +1880,39 @@ fn execute_prompt_command(
         InteractiveCommand::DetachClient => Ok(Some("use Ctrl-b d".into())),
         InteractiveCommand::RenameWindow { name } => {
             let target = format!("{}:{}", current_session, snapshot.active_window_id);
-            let _ = request_response(paths, CommandRequest::RenameWindow { target, name })?;
+            ensure_command_succeeded(request_response(paths, CommandRequest::RenameWindow { target, name })?)?;
             Ok(None)
         }
         InteractiveCommand::SaveSession => {
-            let response = request_response(
+            let response = ensure_command_succeeded(request_response(
                 paths,
                 CommandRequest::SaveWorkspace {
                     session: Some(current_session.clone()),
                 },
-            )?;
+            )?)?;
             Ok(Some(format_list_response(response)))
         }
         InteractiveCommand::SendKeys { keys } => {
-            let _ = request_response(
+            ensure_command_succeeded(request_response(
                 paths,
                 CommandRequest::SendKeys {
                     target: current_session.clone(),
                     keys,
                 },
-            )?;
+            )?)?;
             Ok(None)
         }
         InteractiveCommand::ReloadConfig => {
-            let _ = request_response(paths, CommandRequest::ReloadConfig)?;
+            ensure_command_succeeded(request_response(paths, CommandRequest::ReloadConfig)?)?;
             Ok(Some("config reloaded".into()))
         }
+    }
+}
+
+fn ensure_command_succeeded(response: CommandResponse) -> Result<CommandResponse> {
+    match response {
+        CommandResponse::Error { message } => Err(anyhow!(message)),
+        response => Ok(response),
     }
 }
 
@@ -3067,6 +3074,15 @@ root = { command = ["sh"] }
         cycle_prompt_completion(&mut prompt);
         assert_eq!(prompt.buffer, "send-keys");
         assert_eq!(prompt.selected, 0);
+    }
+
+    #[test]
+    fn prompt_command_error_responses_are_failures() {
+        let error = ensure_command_succeeded(CommandResponse::Error {
+            message: "unknown pane".into(),
+        })
+        .expect_err("daemon error must not look successful");
+        assert!(error.to_string().contains("unknown pane"));
     }
 
     #[test]
