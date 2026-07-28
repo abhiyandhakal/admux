@@ -145,13 +145,14 @@ pub fn render_choose_tree<W: Write>(
 
     let body_height = size.height.saturating_sub(1);
     let body_start = body_start_row(ui);
-    let list_height = body_height.min((lines.len() as u16).saturating_add(1).min(8));
+    let list_height = body_height.min(
+        u16::try_from(lines.len().saturating_add(1))
+            .unwrap_or(u16::MAX)
+            .min(8),
+    );
 
-    for (index, line) in lines.iter().enumerate() {
-        if index as u16 >= list_height {
-            break;
-        }
-        let row = body_start + index as u16;
+    for (index, line) in lines.iter().take(usize::from(list_height)).enumerate() {
+        let row = body_start + u16::try_from(index).expect("list height bounds index");
         let prefix = if line.has_children {
             if line.expanded { "-" } else { "+" }
         } else {
@@ -177,7 +178,14 @@ pub fn render_choose_tree<W: Write>(
         Print(fit_width(
             &format!(
                 " {preview_title} {}",
-                "-".repeat(size.width.saturating_sub(preview_title.len() as u16 + 2) as usize)
+                "-".repeat(
+                    size.width
+                        .saturating_sub(
+                            u16::try_from(preview_title.len())
+                                .unwrap_or(u16::MAX)
+                                .saturating_add(2),
+                        ) as usize,
+                )
             ),
             size.width,
         ))
@@ -224,14 +232,14 @@ pub fn render_help_overlay<W: Write>(
     let body_height = size.height.saturating_sub(1);
     let body_start = body_start_row(ui);
 
-    for (index, line) in lines.iter().enumerate() {
-        if index as u16 >= body_height {
-            break;
-        }
+    for (index, line) in lines.iter().take(usize::from(body_height)).enumerate() {
         queue_style(out, &ui.theme.help)?;
         queue!(
             out,
-            MoveTo(0, body_start + index as u16),
+            MoveTo(
+                0,
+                body_start + u16::try_from(index).expect("body height bounds index"),
+            ),
             Print(fit_width(line, size.width))
         )?;
         reset_style(out)?;
@@ -269,13 +277,14 @@ pub fn render_buffer_chooser<W: Write>(
     )?;
     let body_height = size.height.saturating_sub(1);
     let body_start = body_start_row(ui);
-    let list_height = body_height.min((buffers.len() as u16).saturating_add(1).min(8));
+    let list_height = body_height.min(
+        u16::try_from(buffers.len().saturating_add(1))
+            .unwrap_or(u16::MAX)
+            .min(8),
+    );
 
-    for (index, buffer) in buffers.iter().enumerate() {
-        if index as u16 >= list_height {
-            break;
-        }
-        let row = body_start + index as u16;
+    for (index, buffer) in buffers.iter().take(usize::from(list_height)).enumerate() {
+        let row = body_start + u16::try_from(index).expect("list height bounds index");
         let content = format!("{} ({}) {}", buffer.name, buffer.bytes, buffer.preview);
         queue!(out, MoveTo(0, row))?;
         if index == selected {
@@ -302,11 +311,15 @@ pub fn render_buffer_chooser<W: Write>(
         ))
     )?;
     reset_style(out)?;
-    for (offset, line) in preview.lines().enumerate() {
-        let row = body_start + list_height.saturating_add(1) + offset as u16;
-        if row >= body_start + body_height {
-            break;
-        }
+    let preview_height = body_height.saturating_sub(list_height.saturating_add(1));
+    for (offset, line) in preview
+        .lines()
+        .take(usize::from(preview_height))
+        .enumerate()
+    {
+        let row = body_start
+            + list_height.saturating_add(1)
+            + u16::try_from(offset).expect("preview height bounds offset");
         queue_style(out, &ui.theme.help)?;
         queue!(out, MoveTo(0, row), Print(fit_width(line, size.width)))?;
         reset_style(out)?;
@@ -331,13 +344,21 @@ fn render_pane<W: Write>(
     pane: &PaneRender,
     ui: &ResolvedUiConfig,
 ) -> std::io::Result<()> {
-    for (offset, row) in pane.rows_formatted.iter().enumerate() {
-        if offset as u16 >= pane.rect.height {
-            break;
-        }
+    for (offset, row) in pane
+        .rows_formatted
+        .iter()
+        .take(usize::from(pane.rect.height))
+        .enumerate()
+    {
         queue!(
             out,
-            MoveTo(pane.rect.x, offset_row(pane.rect.y + offset as u16, ui))
+            MoveTo(
+                pane.rect.x,
+                offset_row(
+                    pane.rect.y + u16::try_from(offset).expect("pane height bounds offset"),
+                    ui,
+                )
+            )
         )?;
         out.write_all(row.as_bytes())?;
         out.write_all(b"\x1b[0m")?;
@@ -434,12 +455,16 @@ fn render_preview_snapshot<W: Write>(
             .rows_plain
             .iter()
             .zip(pane.rows_formatted.iter())
+            .take(usize::from(content.height))
             .enumerate()
         {
-            if offset as u16 >= content.height {
-                break;
-            }
-            queue!(out, MoveTo(content.x, content.y + offset as u16))?;
+            queue!(
+                out,
+                MoveTo(
+                    content.x,
+                    content.y + u16::try_from(offset).expect("content height bounds offset"),
+                )
+            )?;
             if plain_row.chars().count() <= content.width as usize {
                 out.write_all(formatted_row.as_bytes())?;
             } else {
