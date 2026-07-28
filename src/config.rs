@@ -727,7 +727,15 @@ pub fn parse_key_pattern(value: &str) -> Result<KeyPattern> {
         "delete" | "del" => KeyPatternCode::Delete,
         "pageup" | "page-up" => KeyPatternCode::PageUp,
         "pagedown" | "page-down" => KeyPatternCode::PageDown,
-        _ if key.chars().count() == 1 => KeyPatternCode::Char(key.chars().next().unwrap()),
+        _ if key.chars().count() == 1 => {
+            let character = key.chars().next().expect("single-character key is present");
+            if character.is_ascii_uppercase() {
+                modifiers.shift = true;
+                KeyPatternCode::Char(character.to_ascii_lowercase())
+            } else {
+                KeyPatternCode::Char(character)
+            }
+        }
         _ => return Err(anyhow!("unknown key '{key}'")),
     };
     Ok(KeyPattern { code, modifiers })
@@ -743,7 +751,14 @@ pub fn key_event_matches(pattern: &KeyPattern, event: KeyEvent) -> bool {
     if pattern.modifiers.alt != event.modifiers.contains(KeyModifiers::ALT) {
         return false;
     }
-    if matches!(pattern.code, KeyPatternCode::Char(_)) {
+    if let KeyPatternCode::Char(character) = pattern.code {
+        // Terminal libraries generally report alphabetic shifted keys as an
+        // uppercase character plus SHIFT. Punctuation has no comparable
+        // canonical form, so preserve the historical permissive behavior
+        // unless the user explicitly requested Shift.
+        if character.is_ascii_alphabetic() || pattern.modifiers.shift {
+            return pattern.modifiers.shift == event.modifiers.contains(KeyModifiers::SHIFT);
+        }
         return true;
     }
     pattern.modifiers.shift == event.modifiers.contains(KeyModifiers::SHIFT)
@@ -751,7 +766,7 @@ pub fn key_event_matches(pattern: &KeyPattern, event: KeyEvent) -> bool {
 
 fn key_event_code(event: &KeyEvent) -> KeyPatternCode {
     match event.code {
-        KeyCode::Char(ch) => KeyPatternCode::Char(ch),
+        KeyCode::Char(ch) => KeyPatternCode::Char(ch.to_ascii_lowercase()),
         KeyCode::Enter => KeyPatternCode::Enter,
         KeyCode::Esc => KeyPatternCode::Esc,
         KeyCode::Tab => KeyPatternCode::Tab,
@@ -1167,6 +1182,30 @@ mod tests {
         assert!(key_event_matches(
             &pattern,
             KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)
+        ));
+    }
+
+    #[test]
+    fn character_bindings_match_shift_consistently() {
+        let lower = parse_key_pattern("h").expect("lowercase binding");
+        let shifted = parse_key_pattern("Shift-h").expect("explicit shift binding");
+        let uppercase = parse_key_pattern("H").expect("uppercase shorthand binding");
+        let shifted_event = KeyEvent::new(KeyCode::Char('H'), KeyModifiers::SHIFT);
+        let lower_event = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE);
+
+        assert!(key_event_matches(&lower, lower_event));
+        assert!(!key_event_matches(&lower, shifted_event));
+        assert!(key_event_matches(&shifted, shifted_event));
+        assert!(key_event_matches(&uppercase, shifted_event));
+        assert!(!key_event_matches(&shifted, lower_event));
+    }
+
+    #[test]
+    fn punctuation_bindings_keep_their_existing_shift_tolerance() {
+        let dollar = parse_key_pattern("$").expect("dollar binding");
+        assert!(key_event_matches(
+            &dollar,
+            KeyEvent::new(KeyCode::Char('$'), KeyModifiers::SHIFT)
         ));
     }
 
