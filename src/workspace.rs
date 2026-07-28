@@ -71,6 +71,13 @@ pub struct WorkspaceSnapshot {
 }
 
 const MANIFEST_DIGEST_ALGORITHM: &str = "sha256";
+const MAX_SNAPSHOT_FILE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_SNAPSHOT_VT_BYTES: usize = 1024 * 1024;
+const MAX_SNAPSHOT_COMMAND_ARGS: usize = 256;
+const MAX_SNAPSHOT_COMMAND_ARG_BYTES: usize = 16 * 1024;
+const MAX_SNAPSHOT_TITLE_BYTES: usize = 1024;
+const MAX_SNAPSHOT_ROWS: u16 = 1_000;
+const MAX_SNAPSHOT_COLS: u16 = 1_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceWindowSnapshot {
@@ -244,7 +251,11 @@ pub fn load_workspace_with_snapshot(
     let mut workspace = resolve_workspace(manifest_path.clone(), manifest_dir, manifest, numbering)?;
     workspace.manifest_digest = manifest_digest.clone();
     if load_snapshot {
-        workspace.snapshot = load_snapshot_sidecar(&manifest_path, &manifest_digest)?;
+        let snapshot = load_snapshot_sidecar(&manifest_path, &manifest_digest)?;
+        if let Some(snapshot) = snapshot {
+            validate_snapshot(&snapshot, &workspace.spec, numbering)?;
+            workspace.snapshot = Some(snapshot);
+        }
     }
     Ok(workspace)
 }
@@ -702,6 +713,16 @@ fn load_snapshot_sidecar(manifest_path: &Path, digest: &str) -> Result<Option<Wo
     if !snapshot_path.exists() {
         return Ok(None);
     }
+    let length = fs::metadata(&snapshot_path)
+        .with_context(|| format!("failed to inspect {}", snapshot_path.display()))?
+        .len();
+    if length > MAX_SNAPSHOT_FILE_BYTES {
+        bail!(
+            "workspace snapshot {} exceeds the {} byte limit",
+            snapshot_path.display(),
+            MAX_SNAPSHOT_FILE_BYTES
+        );
+    }
     let raw = fs::read_to_string(&snapshot_path)
         .with_context(|| format!("failed to read {}", snapshot_path.display()))?;
     let snapshot: WorkspaceSnapshot = serde_json::from_str(&raw)
@@ -716,6 +737,111 @@ fn load_snapshot_sidecar(manifest_path: &Path, digest: &str) -> Result<Option<Wo
         return Ok(None);
     }
     Ok(Some(snapshot))
+}
+
+fn validate_snapshot(
+    snapshot: &WorkspaceSnapshot,
+    spec: &WorkspaceSpec,
+    numbering: Numbering,
+) -> Result<()> {
+    let expected_windows = spec
+        .windows
+        .iter()
+        .enumerate()
+        .map(|(index, window)| {
+            let window_index = numbering.public_window_number(index)? as usize;
+            let pane_ids = (0..=window.splits.len())
+                .map(|pane| numbering.public_pane_number(PaneId(pane as u64)))
+                .collect::<Result<Vec<_>>>()?;
+            Ok((window_index, pane_ids))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+
+    if snapshot.windows.len() != expected_windows.len() {
+        bail!(
+            "workspace snapshot has {} windows but manifest has {}",
+            snapshot.windows.len(),
+            expected_windows.len()
+        );
+    }
+    if !expected_windows.contains_key(&snapshot.active_window) {
+        bail!(
+            "workspace snapshot active window {} is not in the manifest",
+            snapshot.active_window
+        );
+    }
+
+    let mut seen_windows = BTreeMap::new();
+    for window in &snapshot.windows {
+        let expected_panes = expected_windows.get(&window.window_index).ok_or_else(|| {
+            anyhow!(
+                "workspace snapshot window {} is not in the manifest",
+                window.window_index
+            )
+        })?;
+        if seen_windows.insert(window.window_index, ()).is_some() {
+            bail!("workspace snapshot repeats window {}", window.window_index);
+        }
+        if window.panes.len() != expected_panes.len() {
+            bail!(
+                "workspace snapshot window {} has {} panes but manifest has {}",
+                window.window_index,
+                window.panes.len(),
+                expected_panes.len()
+            );
+        }
+
+        let mut seen_panes = BTreeMap::new();
+        for pane in &window.panes {
+            if !expected_panes.contains(&pane.pane_id) {
+                bail!(
+                    "workspace snapshot pane {} is not in manifest window {}",
+                    pane.pane_id,
+                    window.window_index
+                );
+            }
+            if seen_panes.insert(pane.pane_id, ()).is_some() {
+                bail!(
+                    "workspace snapshot repeats pane {} in window {}",
+                    pane.pane_id,
+                    window.window_index
+                );
+            }
+            validate_snapshot_pane(pane)?;
+        }
+        if !seen_panes.contains_key(&window.active_pane) {
+            bail!(
+                "workspace snapshot active pane {} is not in window {}",
+                window.active_pane,
+                window.window_index
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_snapshot_pane(pane: &WorkspacePaneSnapshot) -> Result<()> {
+    if pane.rows == 0 || pane.rows > MAX_SNAPSHOT_ROWS || pane.cols == 0 || pane.cols > MAX_SNAPSHOT_COLS {
+        bail!(
+            "workspace snapshot pane {} has invalid dimensions {}x{}",
+            pane.pane_id,
+            pane.cols,
+            pane.rows
+        );
+    }
+    if pane.vt.len() > MAX_SNAPSHOT_VT_BYTES {
+        bail!("workspace snapshot pane {} VT data is too large", pane.pane_id);
+    }
+    if pane.title.len() > MAX_SNAPSHOT_TITLE_BYTES {
+        bail!("workspace snapshot pane {} title is too large", pane.pane_id);
+    }
+    if pane.command.is_empty()
+        || pane.command.len() > MAX_SNAPSHOT_COMMAND_ARGS
+        || pane.command.iter().any(|arg| arg.len() > MAX_SNAPSHOT_COMMAND_ARG_BYTES)
+    {
+        bail!("workspace snapshot pane {} command is invalid", pane.pane_id);
+    }
+    Ok(())
 }
 
 pub fn workspace_state_dir(manifest_path: &Path) -> PathBuf {
@@ -1042,7 +1168,7 @@ command = ["cargo", "test"]
 
         assert!(snapshot_path.exists(), "snapshot sidecar should exist");
         assert!(gitignore_path.exists(), "workspace .gitignore should exist");
-        let snapshot_json: serde_json::Value = serde_json::from_str(
+        let mut snapshot_json: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(&snapshot_path).expect("read snapshot"),
         )
         .expect("decode snapshot");
@@ -1063,6 +1189,22 @@ command = ["cargo", "test"]
         assert_eq!(snapshot.session_name, "workspace");
         assert_eq!(snapshot.windows.len(), 1);
         assert!(snapshot.windows[0].panes[0].vt.contains("saved-pane"));
+
+        snapshot_json["windows"][0]["panes"][0]["rows"] = serde_json::json!(0);
+        fs::write(
+            &snapshot_path,
+            serde_json::to_vec(&snapshot_json).expect("encode invalid snapshot"),
+        )
+        .expect("write invalid snapshot");
+        let invalid = load_workspace(
+            &manifest_path,
+            Numbering {
+                window_base: 0,
+                pane_base: 0,
+            },
+        )
+        .expect_err("invalid snapshot should be rejected before restore");
+        assert!(invalid.to_string().contains("invalid dimensions"));
 
         let _ = session.kill();
     }
