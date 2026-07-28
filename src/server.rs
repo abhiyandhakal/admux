@@ -1071,23 +1071,11 @@ impl SessionStore {
                 message: error.to_string(),
             };
         }
-        if rebuild && let Some(existing) = self.workspace_mappings.get(&manifest_key).cloned() {
-            if let Some(session) = self.sessions.get(&existing)
-                && let Err(error) = session.kill()
-            {
-                return CommandResponse::Error {
-                    message: format!("failed to shut down existing workspace session {existing}: {error}"),
-                };
-            }
-            self.sessions.remove(&existing);
-            self.persisted_sessions.remove(&existing);
-            self.remove_workspace_mappings_for_session(&existing);
-        }
-
         if let Some(existing) = self.workspace_mappings.get(&manifest_key).cloned()
             && self.sessions.get(&existing).is_some_and(|session| {
                 session.workspace_manifest.as_deref() == Some(manifest_key.as_str())
             })
+            && !rebuild
         {
             self.last_session = Some(existing.clone());
             return CommandResponse::WorkspaceReady {
@@ -1096,9 +1084,12 @@ impl SessionStore {
             };
         }
 
-        if self.sessions.contains_key(&session_name)
+        let replacing = rebuild
+            .then(|| self.workspace_mappings.get(&manifest_key).cloned())
+            .flatten();
+        if (self.sessions.contains_key(&session_name)
             || self.persisted_sessions.contains_key(&session_name)
-        {
+        ) && replacing.as_deref() != Some(session_name.as_str()) {
             return CommandResponse::Error {
                 message: format!(
                     "session {session_name} already exists; set [workspace].name to a unique value or use --rebuild"
@@ -1106,8 +1097,30 @@ impl SessionStore {
             };
         }
 
+        let next_window_id = self.next_window_id;
         match self.create_workspace_session(&workspace, !rebuild) {
-            Ok(()) => {
+            Ok(session) => {
+                if let Some(existing) = replacing {
+                    if let Some(previous) = self.sessions.get(&existing)
+                        && let Err(error) = previous.kill()
+                    {
+                        let cleanup = session.kill();
+                        return CommandResponse::Error {
+                            message: match cleanup {
+                                Ok(()) => format!(
+                                    "failed to shut down existing workspace session {existing}: {error}"
+                                ),
+                                Err(cleanup_error) => format!(
+                                    "failed to shut down existing workspace session {existing}: {error}; additionally failed to clean up replacement: {cleanup_error}"
+                                ),
+                            },
+                        };
+                    }
+                    self.sessions.remove(&existing);
+                    self.persisted_sessions.remove(&existing);
+                    self.remove_workspace_mappings_for_session(&existing);
+                }
+                self.sessions.insert(session.name.clone(), session);
                 self.workspace_mappings
                     .insert(manifest_key.clone(), session_name.clone());
                 self.last_session = Some(session_name.clone());
@@ -1127,9 +1140,12 @@ impl SessionStore {
                     created: true,
                 }
             }
-            Err(error) => CommandResponse::Error {
-                message: error.to_string(),
-            },
+            Err(error) => {
+                self.next_window_id = next_window_id;
+                CommandResponse::Error {
+                    message: error.to_string(),
+                }
+            }
         }
     }
 
@@ -1137,7 +1153,7 @@ impl SessionStore {
         &mut self,
         workspace: &WorkspaceLoad,
         use_snapshot: bool,
-    ) -> Result<()> {
+    ) -> Result<Session> {
         let first_window_id = self.next_window();
         let first_window =
             workspace.spec.windows.first().ok_or_else(|| {
@@ -1173,48 +1189,71 @@ impl SessionStore {
             root_seed,
         )?;
         session.cwd = Some(workspace.spec.cwd.clone());
-        session.rename_active_window(first_window.name.clone())?;
-        self.apply_workspace_window(&mut session, first_window_id, first_window, workspace, 0)?;
-
-        for (window_index, window) in workspace.spec.windows.iter().enumerate().skip(1) {
-            let window_id = self.next_window();
-            let root_seed = use_snapshot
-                .then(|| {
-                    let window_public = self.numbering().public_window_number(window_index).ok()?;
-                    workspace
-                        .snapshot
-                        .as_ref()
-                        .and_then(|snapshot| {
-                            snapshot.pane(window_public as usize, self.config.behavior.pane_base)
-                        })
-                        .map(|pane| crate::pty::PaneRestoreSeed {
-                            rows: pane.rows,
-                            cols: pane.cols,
-                            vt: pane.vt.clone(),
-                        })
-                })
-                .flatten();
-            session.new_window_with_cwd_and_restore(
-                window_id,
-                Some(window.name.clone()),
-                Some(window.cwd.clone()),
-                &window.root.command,
-                root_seed,
+        let construction = (|| {
+            session.rename_active_window(first_window.name.clone())?;
+            self.apply_workspace_window(
+                &mut session,
+                first_window_id,
+                first_window,
+                workspace,
+                0,
+                use_snapshot,
             )?;
-            session.select_window(window_id)?;
-            self.apply_workspace_window(&mut session, window_id, window, workspace, window_index)?;
-        }
 
-        if let Some(window_id) = session
-            .window_order
-            .get(workspace.spec.active_window)
-            .copied()
-        {
-            session.select_window(window_id)?;
-        }
+            for (window_index, window) in workspace.spec.windows.iter().enumerate().skip(1) {
+                let window_id = self.next_window();
+                let root_seed = use_snapshot
+                    .then(|| {
+                        let window_public = self.numbering().public_window_number(window_index).ok()?;
+                        workspace
+                            .snapshot
+                            .as_ref()
+                            .and_then(|snapshot| {
+                                snapshot.pane(window_public as usize, self.config.behavior.pane_base)
+                            })
+                            .map(|pane| crate::pty::PaneRestoreSeed {
+                                rows: pane.rows,
+                                cols: pane.cols,
+                                vt: pane.vt.clone(),
+                            })
+                    })
+                    .flatten();
+                session.new_window_with_cwd_and_restore(
+                    window_id,
+                    Some(window.name.clone()),
+                    Some(window.cwd.clone()),
+                    &window.root.command,
+                    root_seed,
+                )?;
+                session.select_window(window_id)?;
+                self.apply_workspace_window(
+                    &mut session,
+                    window_id,
+                    window,
+                    workspace,
+                    window_index,
+                    use_snapshot,
+                )?;
+            }
 
-        self.sessions.insert(session.name.clone(), session);
-        Ok(())
+            if let Some(window_id) = session
+                .window_order
+                .get(workspace.spec.active_window)
+                .copied()
+            {
+                session.select_window(window_id)?;
+            }
+            Ok(())
+        })();
+        match construction {
+            Ok(()) => Ok(session),
+            Err(error) => match session.kill() {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(error.context(format!(
+                    "additionally failed to clean up partial workspace session: {cleanup_error}"
+                ))),
+            },
+        }
     }
 
     fn apply_workspace_window(
@@ -1224,6 +1263,7 @@ impl SessionStore {
         window: &crate::workspace::WorkspaceWindowSpec,
         workspace: &WorkspaceLoad,
         window_index: usize,
+        use_snapshot: bool,
     ) -> Result<()> {
         session.select_window(window_id)?;
         for (split_index, split) in window.splits.iter().enumerate() {
@@ -1232,17 +1272,21 @@ impl SessionStore {
                 .numbering()
                 .public_pane_number(PaneId((split_index + 1) as u64))
                 .ok();
-            let restore_seed = workspace
-                .snapshot
-                .as_ref()
-                .and_then(|snapshot| {
-                    snapshot.pane(window_public? as usize, pane_public?)
-                })
-                .map(|pane| crate::pty::PaneRestoreSeed {
-                    rows: pane.rows,
-                    cols: pane.cols,
-                    vt: pane.vt.clone(),
-                });
+            let restore_seed = if use_snapshot {
+                workspace
+                    .snapshot
+                    .as_ref()
+                    .and_then(|snapshot| {
+                        snapshot.pane(window_public? as usize, pane_public?)
+                    })
+                    .map(|pane| crate::pty::PaneRestoreSeed {
+                        rows: pane.rows,
+                        cols: pane.cols,
+                        vt: pane.vt.clone(),
+                    })
+            } else {
+                None
+            };
             session.split_pane_in_window_with_restore(
                 window_id,
                 Some(PaneId(split.target)),
@@ -1253,19 +1297,22 @@ impl SessionStore {
                 restore_seed,
             )?;
         }
-        let active_pane = workspace
-            .snapshot
-            .as_ref()
-            .and_then(|snapshot| {
-                self.numbering()
-                    .public_window_number(window_index)
-                    .ok()
-                    .and_then(|window_public| snapshot.active_pane(window_public as usize))
-            })
-            .map(|public| self.numbering().parse_public_pane_number(public))
-            .transpose()?
-            .map(|pane| pane)
-            .unwrap_or(PaneId(window.active_pane));
+        let active_pane = if use_snapshot {
+            workspace
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| {
+                    self.numbering()
+                        .public_window_number(window_index)
+                        .ok()
+                        .and_then(|window_public| snapshot.active_pane(window_public as usize))
+                })
+                .map(|public| self.numbering().parse_public_pane_number(public))
+                .transpose()?
+        } else {
+            None
+        }
+        .unwrap_or(PaneId(window.active_pane));
         session.select_pane(Some(window_id), active_pane)?;
         Ok(())
     }
@@ -1579,6 +1626,76 @@ mod tests {
         fs::write(&path, vec![b'x'; MAX_BUFFER_BYTES + 1]).expect("write oversized buffer");
         let error = read_buffer_file(&path).expect_err("reject oversized file");
         assert!(error.to_string().contains("byte limit"));
+    }
+
+    #[test]
+    fn failed_rebuild_keeps_the_existing_workspace_session() {
+        let helper_dir = tempdir();
+        let mut store = SessionStore::default();
+        store.helper_dir = helper_dir.path().join("helpers");
+        let manifest_key = helper_dir.path().join("admux.toml").display().to_string();
+        let created = store.handle(CommandRequest::NewSession {
+            name: Some("work".into()),
+            cwd: Some(helper_dir.path().to_path_buf()),
+            command: vec!["sh".into()],
+            switch_from: None,
+        });
+        assert!(matches!(created, CommandResponse::SessionCreated { .. }));
+        store
+            .sessions
+            .get_mut("work")
+            .expect("existing session")
+            .workspace_manifest = Some(manifest_key.clone());
+        store
+            .workspace_mappings
+            .insert(manifest_key.clone(), "work".into());
+
+        let workspace = WorkspaceLoad {
+            manifest_key: manifest_key.clone(),
+            manifest_digest: "test".into(),
+            spec: crate::workspace::WorkspaceSpec {
+                manifest_path: helper_dir.path().join("admux.toml"),
+                manifest_dir: helper_dir.path().to_path_buf(),
+                name: "work".into(),
+                cwd: helper_dir.path().to_path_buf(),
+                active_window: 0,
+                windows: vec![crate::workspace::WorkspaceWindowSpec {
+                    name: "editor".into(),
+                    cwd: helper_dir.path().to_path_buf(),
+                    active_pane: 0,
+                    root: crate::workspace::WorkspacePaneSpec {
+                        cwd: helper_dir.path().to_path_buf(),
+                        command: vec!["sh".into()],
+                    },
+                    splits: vec![crate::workspace::WorkspaceSplitSpec {
+                        target: 99,
+                        direction: SplitAxis::Vertical,
+                        ratio: 500,
+                        pane: crate::workspace::WorkspacePaneSpec {
+                            cwd: helper_dir.path().to_path_buf(),
+                            command: vec!["sh".into()],
+                        },
+                    }],
+                }],
+            },
+            snapshot: None,
+        };
+
+        assert!(matches!(
+            store.up_workspace(workspace, true, None),
+            CommandResponse::Error { .. }
+        ));
+        assert!(store.sessions.contains_key("work"));
+        assert_eq!(
+            store.workspace_mappings.get(&manifest_key),
+            Some(&"work".to_string())
+        );
+        store
+            .sessions
+            .get("work")
+            .expect("preserved session")
+            .kill()
+            .expect("clean up session");
     }
 
     #[test]
