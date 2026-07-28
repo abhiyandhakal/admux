@@ -88,12 +88,14 @@ struct ChooseTreeState {
     attached_session: String,
     search_input: Option<String>,
     last_search: Option<String>,
+    preview: Option<(usize, String, RenderSnapshot)>,
 }
 
 #[derive(Debug, Clone)]
 struct ChooseBufferState {
     buffers: Vec<BufferSummary>,
     selected: usize,
+    preview: Option<(usize, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -907,7 +909,7 @@ fn run_attach_loop(
             }
         }
 
-        match &overlay {
+        match &mut overlay {
             OverlayState::None => {
                 render_session(
                     stdout,
@@ -2128,6 +2130,7 @@ fn build_choose_tree(paths: &RuntimePaths, current_session: &str) -> Result<Choo
         attached_session: current_session.to_string(),
         search_input: None,
         last_search: None,
+        preview: None,
     };
     rebuild_choose_tree(paths, &mut state)?;
     Ok(state)
@@ -2141,10 +2144,12 @@ fn build_choose_buffer(paths: &RuntimePaths) -> Result<ChooseBufferState> {
     Ok(ChooseBufferState {
         buffers,
         selected: 0,
+        preview: None,
     })
 }
 
 fn rebuild_choose_tree(paths: &RuntimePaths, state: &mut ChooseTreeState) -> Result<()> {
+    state.preview = None;
     let sessions = match request_response(paths, CommandRequest::ListSessions)? {
         CommandResponse::SessionList { sessions } => sessions,
         other => return Err(anyhow!("unexpected session list response: {other:?}")),
@@ -2253,8 +2258,13 @@ fn rebuild_choose_tree(paths: &RuntimePaths, state: &mut ChooseTreeState) -> Res
 
 fn chooser_preview(
     paths: &RuntimePaths,
-    tree: &ChooseTreeState,
+    tree: &mut ChooseTreeState,
 ) -> Result<(String, RenderSnapshot)> {
+    if let Some((selected, title, snapshot)) = &tree.preview
+        && *selected == tree.selected
+    {
+        return Ok((title.clone(), snapshot.clone()));
+    }
     let Some(item) = tree.items.get(tree.selected) else {
         return Ok((
             "no sessions".into(),
@@ -2286,10 +2296,16 @@ fn chooser_preview(
         CommandResponse::Error { message } => return Err(anyhow!(message)),
         other => return Err(anyhow!("unexpected session preview response: {other:?}")),
     };
+    tree.preview = Some((tree.selected, session.clone(), snapshot.clone()));
     Ok((session, snapshot))
 }
 
-fn buffer_preview(paths: &RuntimePaths, chooser: &ChooseBufferState) -> Result<String> {
+fn buffer_preview(paths: &RuntimePaths, chooser: &mut ChooseBufferState) -> Result<String> {
+    if let Some((selected, preview)) = &chooser.preview
+        && *selected == chooser.selected
+    {
+        return Ok(preview.clone());
+    }
     let Some(buffer) = chooser.buffers.get(chooser.selected) else {
         return Ok(String::new());
     };
@@ -2299,7 +2315,10 @@ fn buffer_preview(paths: &RuntimePaths, chooser: &ChooseBufferState) -> Result<S
             buffer: Some(buffer.name.clone()),
         },
     )? {
-        CommandResponse::BufferShown { data, .. } => Ok(data),
+        CommandResponse::BufferShown { data, .. } => {
+            chooser.preview = Some((chooser.selected, data.clone()));
+            Ok(data)
+        }
         other => Err(anyhow!("unexpected buffer preview response: {other:?}")),
     }
 }
@@ -3732,6 +3751,7 @@ root = { command = ["sh"] }
             attached_session: "work".into(),
             search_input: None,
             last_search: None,
+            preview: None,
         };
 
         apply_choose_tree_search(&mut tree, "logs", true);
@@ -3784,6 +3804,7 @@ root = { command = ["sh"] }
             attached_session: "work".into(),
             search_input: None,
             last_search: Some("editor".into()),
+            preview: None,
         };
 
         repeat_choose_tree_search(&mut tree, false);
@@ -3803,6 +3824,7 @@ root = { command = ["sh"] }
             attached_session: "work".into(),
             search_input: None,
             last_search: None,
+            preview: None,
         };
 
         collapse_all_choose_items(&mut tree);
