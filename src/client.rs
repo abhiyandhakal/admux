@@ -708,16 +708,51 @@ fn handle_interactive_response(
     }
 }
 
+struct TerminalRestore {
+    mouse_capture_enabled: bool,
+}
+
+impl TerminalRestore {
+    fn after_raw_mode_enabled() -> Self {
+        Self {
+            mouse_capture_enabled: false,
+        }
+    }
+
+    fn enable_mouse_capture(&mut self, stdout: &mut io::Stdout) -> Result<()> {
+        execute!(*stdout, EnableMouseCapture).context("failed to enable mouse capture")?;
+        self.mouse_capture_enabled = true;
+        Ok(())
+    }
+}
+
+impl Drop for TerminalRestore {
+    fn drop(&mut self) {
+        let mut stdout = io::stdout();
+        if self.mouse_capture_enabled {
+            let _ = execute!(stdout, DisableMouseCapture);
+        }
+        let _ = execute!(
+            stdout,
+            DisableBracketedPaste,
+            PopKeyboardEnhancementFlags,
+            Show,
+            LeaveAlternateScreen
+        );
+        let _ = terminal::disable_raw_mode();
+    }
+}
+
 fn attach_interactive(paths: &RuntimePaths, session: &str) -> Result<()> {
     let mut config = load_config(paths)?;
     let mut stdout = io::stdout();
     let mut event_logger = EventLogger::from_env(paths)?;
     terminal::enable_raw_mode().context("failed to enable raw mode")?;
+    let mut terminal_restore = TerminalRestore::after_raw_mode_enabled();
     execute!(
         stdout,
         EnterAlternateScreen,
         Hide,
-        EnableMouseCapture,
         EnableBracketedPaste,
         PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
@@ -726,29 +761,21 @@ fn attach_interactive(paths: &RuntimePaths, session: &str) -> Result<()> {
         )
     )
     .context("failed to enter alternate screen")?;
+    if config.mouse.enabled {
+        terminal_restore.enable_mouse_capture(&mut stdout)?;
+    }
 
     if let Some(logger) = event_logger.as_mut() {
         logger.log_line("attach session start")?;
     }
 
-    let result = run_attach_loop(
+    run_attach_loop(
         paths,
         session.to_string(),
         &mut config,
         &mut stdout,
         event_logger.as_mut(),
-    );
-
-    let _ = execute!(
-        stdout,
-        DisableBracketedPaste,
-        DisableMouseCapture,
-        PopKeyboardEnhancementFlags,
-        Show,
-        LeaveAlternateScreen
-    );
-    let _ = terminal::disable_raw_mode();
-    result
+    )
 }
 
 fn run_attach_loop(
