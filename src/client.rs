@@ -255,6 +255,8 @@ pub fn run(cli: AdmuxCli) -> Result<()> {
             };
             if nested_switch.is_none() {
                 print_response(&paths, response)?;
+            } else {
+                ensure_command_succeeded(response)?;
             }
             if !args.detach && interactive_terminal_available() && nested_switch.is_none()
             {
@@ -288,6 +290,8 @@ pub fn run(cli: AdmuxCli) -> Result<()> {
             };
             if nested_switch.is_none() {
                 print_response(&paths, response)?;
+            } else {
+                ensure_command_succeeded(response)?;
             }
 
             if !args.detach && interactive_terminal_available() && nested_switch.is_none()
