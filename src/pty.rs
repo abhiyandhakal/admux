@@ -21,7 +21,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const HISTORY_LIMIT: usize = 2 * 1024 * 1024;
+const MIN_REPLAY_HISTORY_COLUMNS: u16 = 80;
+const REPLAY_HISTORY_BYTES_PER_CELL: usize = 16;
+const MAX_REPLAY_HISTORY_BYTES: usize = 64 * 1024 * 1024;
 const IPC_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_IPC_MESSAGE_BYTES: u64 = 1024 * 1024;
 const HELPER_PROTOCOL_VERSION: u16 = 1;
@@ -651,7 +653,9 @@ fn start_helper_state(args: &PaneHelperArgs) -> Result<HelperState> {
                 Ok(size) => {
                     if let Ok(mut terminal) = terminal_clone.lock() {
                         terminal.history.extend_from_slice(&buf[..size]);
-                        truncate_history_at_safe_boundary(&mut terminal.history, HISTORY_LIMIT);
+                        let (_, cols) = terminal.parser.screen().size();
+                        let history_limit = replay_history_limit(terminal.scrollback_lines, cols);
+                        truncate_history_at_safe_boundary(&mut terminal.history, history_limit);
                         terminal.parser.process(&buf[..size]);
                     }
                 }
@@ -666,6 +670,13 @@ fn start_helper_state(args: &PaneHelperArgs) -> Result<HelperState> {
         master: Mutex::new(pair.master),
         child: Mutex::new(child),
     })
+}
+
+fn replay_history_limit(scrollback_lines: usize, cols: u16) -> usize {
+    scrollback_lines
+        .saturating_mul(usize::from(cols.max(MIN_REPLAY_HISTORY_COLUMNS)))
+        .saturating_mul(REPLAY_HISTORY_BYTES_PER_CELL)
+        .min(MAX_REPLAY_HISTORY_BYTES)
 }
 
 fn truncate_history_at_safe_boundary(history: &mut Vec<u8>, limit: usize) {
@@ -1588,6 +1599,17 @@ mod tests {
         assert!(history.is_empty());
     }
 
+    #[test]
+    fn replay_history_limit_tracks_scrollback_instead_of_a_fixed_two_mebibytes() {
+        let default_limit = replay_history_limit(10_000, 80);
+        assert!(default_limit > 2 * 1024 * 1024);
+        assert_eq!(default_limit, 12_800_000);
+        assert_eq!(
+            replay_history_limit(usize::MAX, u16::MAX),
+            MAX_REPLAY_HISTORY_BYTES
+        );
+    }
+
     fn pane_preview(pane: &PaneProcess) -> String {
         let (rows, cols) = pane.screen_size().expect("query pane screen size");
         pane.render(cols.max(1), rows.max(1))
@@ -1760,6 +1782,37 @@ mod tests {
             pane_preview(&pane).contains("one two three four five six seven"),
             "an expanding axis must replay history even when the other shrinks"
         );
+    }
+
+    #[test]
+    fn pane_resize_retains_scrollback_beyond_the_legacy_history_cap() {
+        let dir = helper_dir();
+        let pane = PaneProcess::spawn(
+            &[
+                "sh".into(),
+                "-lc".into(),
+                "i=0; while [ \"$i\" -lt 30000 ]; do printf '%099d\\n' \"$i\"; i=$((i + 1)); done; sleep 1".into(),
+            ],
+            None,
+            None,
+            None,
+            30_000,
+            dir.path(),
+            None,
+        )
+        .expect("spawn pane");
+
+        let last_line = format!("{:099}", 29_999);
+        let _ = wait_for_preview(&pane, &last_line);
+        pane.resize(24, 100).expect("expand pane width");
+        pane.scroll_scrollback_by(-30_000)
+            .expect("scroll to the oldest retained output");
+
+        assert!(
+            pane_preview(&pane).contains(&format!("{:099}", 0)),
+            "resize replay must retain lines beyond the former 2 MiB raw-history cap"
+        );
+        pane.kill().expect("clean up pane");
     }
 
     #[test]

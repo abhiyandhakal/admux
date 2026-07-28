@@ -6,6 +6,11 @@ use crossterm::{
 use serde::{Deserialize, Deserializer, Serialize};
 use std::{collections::BTreeMap, fs, path::Path};
 
+const MAX_SCROLLBACK_LINES: usize = 50_000;
+const MAX_WORKSPACE_SNAPSHOT_LINES: usize = 10_000;
+const MAX_RESIZE_STEP: u16 = 1_000;
+const MAX_COPY_PAGE_SIZE: u16 = 10_000;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -582,11 +587,33 @@ impl Config {
     }
 
     pub fn resolve(&self) -> Result<ResolvedConfig> {
+        if self.behavior.scrollback_lines == 0 {
+            bail!("behavior.scrollback_lines must be greater than zero");
+        }
+        if self.behavior.scrollback_lines > MAX_SCROLLBACK_LINES {
+            bail!("behavior.scrollback_lines must not exceed {MAX_SCROLLBACK_LINES}");
+        }
         if self.behavior.resize_step == 0 {
             bail!("behavior.resize_step must be greater than zero");
         }
-        if self.behavior.copy_page_size == Some(0) {
-            bail!("behavior.copy_page_size must be greater than zero when set");
+        if self.behavior.resize_step > MAX_RESIZE_STEP {
+            bail!("behavior.resize_step must not exceed {MAX_RESIZE_STEP}");
+        }
+        if let Some(copy_page_size) = self.behavior.copy_page_size {
+            if copy_page_size == 0 {
+                bail!("behavior.copy_page_size must be greater than zero when set");
+            }
+            if copy_page_size > MAX_COPY_PAGE_SIZE {
+                bail!("behavior.copy_page_size must not exceed {MAX_COPY_PAGE_SIZE}");
+            }
+        }
+        if self.behavior.workspace_snapshot_lines == 0 {
+            bail!("behavior.workspace_snapshot_lines must be greater than zero");
+        }
+        if self.behavior.workspace_snapshot_lines > MAX_WORKSPACE_SNAPSHOT_LINES {
+            bail!(
+                "behavior.workspace_snapshot_lines must not exceed {MAX_WORKSPACE_SNAPSHOT_LINES}"
+            );
         }
         let status = resolve_status_config(&self.ui);
         let key_config = resolve_key_config(
@@ -1023,10 +1050,19 @@ mod tests {
     }
 
     #[test]
-    fn rejects_zero_behavior_sizes() {
+    fn rejects_invalid_behavior_sizes() {
         for input in [
+            "[behavior]\nscrollback_lines = 0",
             "[behavior]\nresize_step = 0",
             "[behavior]\ncopy_page_size = 0",
+            "[behavior]\nworkspace_snapshot_lines = 0",
+            &format!("[behavior]\nscrollback_lines = {}", MAX_SCROLLBACK_LINES + 1),
+            &format!("[behavior]\nresize_step = {}", MAX_RESIZE_STEP + 1),
+            &format!("[behavior]\ncopy_page_size = {}", MAX_COPY_PAGE_SIZE + 1),
+            &format!(
+                "[behavior]\nworkspace_snapshot_lines = {}",
+                MAX_WORKSPACE_SNAPSHOT_LINES + 1
+            ),
         ] {
             assert!(Config::from_toml(input)
                 .expect("parse config")
