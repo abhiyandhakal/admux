@@ -1,12 +1,11 @@
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::BTreeSet,
     ffi::OsString,
     fs::OpenOptions,
     io::{self, IsTerminal, Read, Write},
     os::unix::net::UnixStream,
     path::PathBuf,
     process::{Command, Stdio},
-    sync::{Mutex, OnceLock},
     thread,
     time::{Duration, Instant},
 };
@@ -55,11 +54,6 @@ use crate::{
 
 const ATTACH_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const ALT_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(150);
-
-fn validated_sockets() -> &'static Mutex<HashSet<PathBuf>> {
-    static VALIDATED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
-    VALIDATED.get_or_init(|| Mutex::new(HashSet::new()))
-}
 
 #[derive(Debug, Clone)]
 struct PromptState {
@@ -402,31 +396,14 @@ fn apply_attached_session(
 }
 
 pub fn request_response(paths: &RuntimePaths, request: CommandRequest) -> Result<CommandResponse> {
-    {
-        let validated = validated_sockets()
-            .lock()
-            .expect("validated sockets lock poisoned");
-        if !validated.contains(&paths.socket_path) {
-            drop(validated);
-            ensure_protocol(paths)?;
-            validated_sockets()
-                .lock()
-                .expect("validated sockets lock poisoned")
-                .insert(paths.socket_path.clone());
-        }
-    }
-    let response = with_connection(paths, |stream| {
+    // Every request opens a new Unix socket connection. Handshake that
+    // connection instead of caching by pathname: a daemon can be replaced at
+    // the same path between requests.
+    ensure_protocol(paths)?;
+    with_connection(paths, |stream| {
         write_message(stream, &request)?;
         read_message(stream)
-    });
-    if response.is_err() {
-        validated_sockets()
-            .lock()
-            .expect("validated sockets lock poisoned")
-            .remove(&paths.socket_path);
-    }
-    let response = response?;
-    Ok(response)
+    })
 }
 
 fn ensure_protocol(paths: &RuntimePaths) -> Result<()> {
@@ -3040,6 +3017,52 @@ root = { command = ["sh"] }
         let rendered = format!("{error:#}");
         assert!(rendered.contains("protocol mismatch"));
         assert!(rendered.contains("restart admuxd"));
+    }
+
+    #[test]
+    fn every_request_revalidates_the_daemon_protocol() {
+        let dir = tempdir();
+        let socket_path = dir.path().join("socket");
+        let paths = RuntimePaths {
+            socket_path: socket_path.clone(),
+            config_path: dir.path().join("config.toml"),
+            state_path: dir.path().join("state.json"),
+            aliases_path: dir.path().join("aliases.json"),
+        };
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).expect("bind");
+        let server = std::thread::spawn(move || {
+            for request_index in 0..2 {
+                for hello in [true, false] {
+                    let (mut stream, _) = listener.accept().expect("accept");
+                    let mut input = Vec::new();
+                    stream.read_to_end(&mut input).expect("read request");
+                    let request: CommandRequest = serde_json::from_slice(&input).expect("decode request");
+                    assert_eq!(hello, matches!(request, CommandRequest::Hello { .. }));
+                    let response = if hello {
+                        CommandResponse::HelloAck {
+                            version: crate::ipc::CURRENT_PROTOCOL_VERSION,
+                        }
+                    } else {
+                        assert_eq!(request, CommandRequest::ListSessions);
+                        CommandResponse::SessionList { sessions: Vec::new() }
+                    };
+                    stream
+                        .write_all(&serde_json::to_vec(&response).expect("encode response"))
+                        .expect("write response");
+                }
+                assert!(request_index < 2);
+            }
+        });
+
+        assert!(matches!(
+            request_response(&paths, CommandRequest::ListSessions).expect("first request"),
+            CommandResponse::SessionList { .. }
+        ));
+        assert!(matches!(
+            request_response(&paths, CommandRequest::ListSessions).expect("second request"),
+            CommandResponse::SessionList { .. }
+        ));
+        server.join().expect("server thread");
     }
 
     #[test]
