@@ -73,8 +73,6 @@ pub struct WorkspaceSnapshot {
 const MANIFEST_DIGEST_ALGORITHM: &str = "sha256";
 const MAX_SNAPSHOT_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_SNAPSHOT_VT_BYTES: usize = 1024 * 1024;
-const MAX_SNAPSHOT_COMMAND_ARGS: usize = 256;
-const MAX_SNAPSHOT_COMMAND_ARG_BYTES: usize = 16 * 1024;
 const MAX_SNAPSHOT_TITLE_BYTES: usize = 1024;
 const MAX_SNAPSHOT_ROWS: u16 = 1_000;
 const MAX_SNAPSHOT_COLS: u16 = 1_000;
@@ -91,7 +89,6 @@ pub struct WorkspacePaneSnapshot {
     pub pane_id: u64,
     pub title: String,
     pub cwd: PathBuf,
-    pub command: Vec<String>,
     pub rows: u16,
     pub cols: u16,
     pub vt: String,
@@ -275,7 +272,7 @@ pub fn save_workspace(session: &Session, snapshot_lines: usize) -> Result<PathBu
     })?;
     let path = session_dir.join("admux.toml");
     let mut snapshot = export_snapshot(session, &path, "", snapshot_lines)?;
-    let manifest = export_workspace(session, Some(&snapshot))?;
+    let manifest = export_workspace(session)?;
     let raw = toml::to_string_pretty(&manifest).context("failed to encode workspace manifest")?;
     fs::write(&path, raw)
         .with_context(|| format!("failed to write workspace manifest {}", path.display()))?;
@@ -395,10 +392,7 @@ fn resolve_workspace(
     })
 }
 
-fn export_workspace(
-    session: &Session,
-    snapshot: Option<&WorkspaceSnapshot>,
-) -> Result<WorkspaceManifestOut> {
+fn export_workspace(session: &Session) -> Result<WorkspaceManifestOut> {
     let session_cwd = session.cwd.clone().ok_or_else(|| {
         anyhow!(
             "session {} does not have a workspace directory",
@@ -418,8 +412,7 @@ fn export_workspace(
     let windows = session
         .window_order
         .iter()
-        .enumerate()
-        .map(|(index, window_id)| {
+        .map(|window_id| {
             let window = session
                 .windows
                 .get(window_id)
@@ -428,7 +421,6 @@ fn export_workspace(
                 window,
                 &session_cwd,
                 session.numbering,
-                snapshot.and_then(|snap| snap.windows.get(index)),
             )
         })
         .collect::<Result<Vec<_>>>()?;
@@ -448,7 +440,6 @@ fn export_window(
     window: &WindowRuntime,
     session_cwd: &Path,
     numbering: Numbering,
-    snapshot: Option<&WorkspaceWindowSnapshot>,
 ) -> Result<WindowSpecOut> {
     let window_base = window.cwd.as_deref().unwrap_or(session_cwd);
     let pane_map = manifest_pane_map(window, numbering);
@@ -459,12 +450,6 @@ fn export_window(
             .get(&root_pane_id)
             .ok_or_else(|| anyhow!("missing root pane {}", root_pane_id.0))?,
         window_base,
-        snapshot.and_then(|snapshot| {
-            snapshot
-                .panes
-                .iter()
-                .find(|pane| pane.pane_id == numbering.pane_base)
-        }),
     )?;
     let mut splits = Vec::new();
     collect_splits(
@@ -473,7 +458,6 @@ fn export_window(
         window_base,
         numbering,
         &pane_map,
-        snapshot,
         &mut splits,
     )?;
     Ok(WindowSpecOut {
@@ -493,7 +477,6 @@ fn collect_splits(
     window_base: &Path,
     numbering: Numbering,
     pane_map: &BTreeMap<PaneId, u64>,
-    snapshot: Option<&WorkspaceWindowSnapshot>,
     splits: &mut Vec<SplitSpecOut>,
 ) -> Result<PaneId> {
     match node {
@@ -524,18 +507,10 @@ fn collect_splits(
                     Some((*ratio as f32) / 1000.0)
                 },
                 cwd: relativize(pane.cwd.as_deref().unwrap_or(window_base), window_base),
-                command: snapshot
-                    .and_then(|snapshot| {
-                        snapshot
-                            .panes
-                            .iter()
-                            .find(|saved| saved.pane_id == *pane_map.get(&new_pane).unwrap_or(&0))
-                    })
-                    .map(|saved| saved.command.clone())
-                    .unwrap_or_else(|| pane.command.clone()),
+                command: pane.command.clone(),
             });
-            collect_splits(first, window, window_base, numbering, pane_map, snapshot, splits)?;
-            collect_splits(second, window, window_base, numbering, pane_map, snapshot, splits)?;
+            collect_splits(first, window, window_base, numbering, pane_map, splits)?;
+            collect_splits(second, window, window_base, numbering, pane_map, splits)?;
             Ok(target)
         }
     }
@@ -565,14 +540,8 @@ fn assign_manifest_pane_ids(node: &LayoutNode, map: &mut BTreeMap<PaneId, u64>, 
     }
 }
 
-fn export_pane(
-    pane: &PaneRuntime,
-    base: &Path,
-    snapshot: Option<&WorkspacePaneSnapshot>,
-) -> Result<PaneSpecOut> {
-    let command = snapshot
-        .map(|snapshot| snapshot.command.clone())
-        .unwrap_or_else(|| pane.command.clone());
+fn export_pane(pane: &PaneRuntime, base: &Path) -> Result<PaneSpecOut> {
+    let command = pane.command.clone();
     if command.is_empty() {
         bail!("pane {} does not have a stored command", pane.id.0);
     }
@@ -668,11 +637,6 @@ fn export_snapshot(
                     .or_else(|| window.cwd.clone())
                     .or_else(|| session.cwd.clone())
                     .ok_or_else(|| anyhow!("pane {} does not have a cwd", pane.id.0))?,
-                command: if persistent.command.is_empty() {
-                    pane.command.clone()
-                } else {
-                    persistent.command
-                },
                 rows: persistent.rows,
                 cols: persistent.cols,
                 vt: persistent.vt,
@@ -834,12 +798,6 @@ fn validate_snapshot_pane(pane: &WorkspacePaneSnapshot) -> Result<()> {
     }
     if pane.title.len() > MAX_SNAPSHOT_TITLE_BYTES {
         bail!("workspace snapshot pane {} title is too large", pane.pane_id);
-    }
-    if pane.command.is_empty()
-        || pane.command.len() > MAX_SNAPSHOT_COMMAND_ARGS
-        || pane.command.iter().any(|arg| arg.len() > MAX_SNAPSHOT_COMMAND_ARG_BYTES)
-    {
-        bail!("workspace snapshot pane {} command is invalid", pane.pane_id);
     }
     Ok(())
 }
@@ -1265,7 +1223,7 @@ root = { command = ["sh"] }
     }
 
     #[test]
-    fn save_prefers_current_foreground_command_in_manifest() {
+    fn save_preserves_declared_command_without_foreground_arguments() {
         let dir = tempdir();
         let session_dir = dir.path().join("project");
         fs::create_dir_all(&session_dir).expect("session dir");
@@ -1289,8 +1247,14 @@ root = { command = ["sh"] }
         let manifest_path = save_workspace(&session, 500).expect("save workspace");
         let raw = fs::read_to_string(manifest_path).expect("read manifest");
         assert!(
-            raw.contains("sleep"),
-            "saved manifest should use foreground command"
+            raw.contains("\"exec sleep 1\""),
+            "saved manifest should retain the declared command"
+        );
+        assert!(
+            !fs::read_to_string(workspace_snapshot_path(&session_dir.join("admux.toml")))
+                .expect("read snapshot")
+                .contains("command"),
+            "snapshot should not persist helper-reported commands"
         );
 
         let _ = session.kill();
