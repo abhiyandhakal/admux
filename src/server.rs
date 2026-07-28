@@ -8,10 +8,11 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const IPC_TIMEOUT: Duration = Duration::from_secs(5);
+const PRUNE_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_IPC_MESSAGE_BYTES: u64 = 1024 * 1024;
 const MAX_SESSION_NAME_BYTES: usize = 64;
 const MAX_WINDOW_NAME_BYTES: usize = 128;
@@ -50,6 +51,7 @@ pub struct SessionStore {
     next_window_id: u64,
     config_path: Option<std::path::PathBuf>,
     config: ResolvedConfig,
+    last_prune: Option<Instant>,
 }
 
 impl Default for SessionStore {
@@ -68,6 +70,7 @@ impl Default for SessionStore {
             config: Config::default()
                 .resolve()
                 .expect("default config should resolve"),
+            last_prune: None,
         }
     }
 }
@@ -184,7 +187,12 @@ impl SessionStore {
     pub fn handle(&mut self, request: CommandRequest) -> CommandResponse {
         let persist_requested = request_changes_persisted_state(&request);
         let previous_last_session = self.last_session.clone();
-        let pruned = self.prune_dead_sessions();
+        let pruned = if self.prune_due() {
+            self.last_prune = Some(Instant::now());
+            self.prune_dead_sessions()
+        } else {
+            false
+        };
 
         let response = match request {
             CommandRequest::Hello { version } => self.handle_hello(version),
@@ -832,6 +840,11 @@ impl SessionStore {
             changed = true;
         }
         changed
+    }
+
+    fn prune_due(&self) -> bool {
+        self.last_prune
+            .is_none_or(|last_prune| last_prune.elapsed() >= PRUNE_INTERVAL)
     }
 
     fn handle_hello(&self, version: ProtocolVersion) -> CommandResponse {
@@ -2005,6 +2018,16 @@ mod tests {
                 name: "buffer0001".into(),
             }
         );
+    }
+
+    #[test]
+    fn global_liveness_pruning_is_rate_limited() {
+        let mut store = SessionStore::default();
+        assert!(store.prune_due());
+        store.last_prune = Some(Instant::now());
+        assert!(!store.prune_due());
+        store.last_prune = Some(Instant::now() - PRUNE_INTERVAL);
+        assert!(store.prune_due());
     }
 
     #[test]
