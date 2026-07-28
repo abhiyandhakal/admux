@@ -8,14 +8,15 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, OpenOptions},
-    io::{Read, Write},
+    io::{self, Read, Write},
     os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        mpsc,
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -26,6 +27,7 @@ const REPLAY_HISTORY_BYTES_PER_CELL: usize = 16;
 const MAX_REPLAY_HISTORY_BYTES: usize = 64 * 1024 * 1024;
 const IPC_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_IPC_MESSAGE_BYTES: u64 = 1024 * 1024;
+const MAX_HELPER_CLIENTS: usize = 64;
 const HELPER_PROTOCOL_VERSION: u16 = 1;
 static HELPER_NAME_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -539,34 +541,71 @@ pub fn run_helper(args: PaneHelperArgs) -> Result<()> {
         }
     };
 
-    for stream in listener.incoming() {
-        let Ok(mut stream) = stream else {
-            continue;
-        };
-        if let Err(error) = configure_ipc_stream(&stream) {
-            eprintln!("admux-pane: failed to configure client stream: {error:#}");
-            continue;
-        }
-        let request = match read_helper_request(&mut stream) {
-            Ok(request) => request,
-            Err(error) => {
-                eprintln!("admux-pane: rejected client request: {error:#}");
-                continue;
-            }
-        };
-        let shutdown_requested = matches!(request, PaneRequest::Shutdown);
-        let response = handle_helper_request(&state, request);
-        if let Err(error) = write_helper_response(&mut stream, &response) {
-            eprintln!("admux-pane: failed to write client response: {error:#}");
-            continue;
-        }
-        if shutdown_requested && matches!(response, PaneResponse::Ok) {
+    listener
+        .set_nonblocking(true)
+        .context("failed to make pane helper listener nonblocking")?;
+    let active_clients = Arc::new(AtomicUsize::new(0));
+    let (shutdown_sender, shutdown_receiver) = mpsc::channel();
+
+    loop {
+        if shutdown_receiver.try_recv().is_ok() {
             break;
+        }
+
+        match listener.accept() {
+            Ok((stream, _)) => {
+                if active_clients.fetch_add(1, Ordering::AcqRel) >= MAX_HELPER_CLIENTS {
+                    active_clients.fetch_sub(1, Ordering::AcqRel);
+                    eprintln!(
+                        "admux-pane: rejecting client because {MAX_HELPER_CLIENTS} helper requests are already active"
+                    );
+                    continue;
+                }
+
+                let state = Arc::clone(&state);
+                let active_clients = Arc::clone(&active_clients);
+                let shutdown_sender = shutdown_sender.clone();
+                thread::spawn(move || {
+                    let shutdown = serve_helper_connection(stream, &state);
+                    active_clients.fetch_sub(1, Ordering::AcqRel);
+                    if shutdown {
+                        let _ = shutdown_sender.send(());
+                    }
+                });
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => {
+                eprintln!("admux-pane: failed to accept client connection: {error:#}");
+                thread::sleep(Duration::from_millis(5));
+            }
         }
     }
 
     let _ = fs::remove_file(&args.socket);
     Ok(())
+}
+
+fn serve_helper_connection(mut stream: UnixStream, state: &Arc<HelperState>) -> bool {
+    if let Err(error) = configure_ipc_stream(&stream) {
+        eprintln!("admux-pane: failed to configure client stream: {error:#}");
+        return false;
+    }
+    let request = match read_helper_request(&mut stream) {
+        Ok(request) => request,
+        Err(error) => {
+            eprintln!("admux-pane: rejected client request: {error:#}");
+            return false;
+        }
+    };
+    let shutdown_requested = matches!(request, PaneRequest::Shutdown);
+    let response = handle_helper_request(state, request);
+    if let Err(error) = write_helper_response(&mut stream, &response) {
+        eprintln!("admux-pane: failed to write client response: {error:#}");
+        return false;
+    }
+    shutdown_requested && matches!(response, PaneResponse::Ok)
 }
 
 fn ensure_private_helper_directory(path: &Path) -> Result<()> {
@@ -1535,6 +1574,36 @@ mod tests {
             .expect_err("helper error must not become a default size");
         assert!(error.to_string().contains("helper unavailable"));
         server.join().expect("server thread");
+    }
+
+    #[test]
+    fn stalled_helper_client_does_not_block_other_requests() {
+        let dir = helper_dir();
+        let pane = PaneProcess::spawn(
+            &["sh".into(), "-lc".into(), "sleep 2".into()],
+            None,
+            None,
+            None,
+            10_000,
+            dir.path(),
+            None,
+        )
+        .expect("spawn pane");
+        let mut stalled = UnixStream::connect(pane.socket_path()).expect("connect stalled peer");
+        stalled.write_all(b"{").expect("start incomplete request");
+        thread::sleep(Duration::from_millis(50));
+
+        let started = Instant::now();
+        assert_eq!(pane.screen_size().expect("independent request succeeds"), (24, 80));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a stalled peer must not consume the helper listener"
+        );
+
+        stalled
+            .shutdown(std::net::Shutdown::Write)
+            .expect("finish stalled request");
+        pane.kill().expect("clean up pane");
     }
 
     #[test]
