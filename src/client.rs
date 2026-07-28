@@ -2922,7 +2922,7 @@ fn handle_mouse_event(
                 pane_content_hit(snapshot, mouse.row, mouse.column)
             {
                 if config.mouse.focus_on_click {
-                    let _ = request_response(
+                    let response = request_response(
                         paths,
                         CommandRequest::SelectPane {
                             target: Some(format!(
@@ -2932,23 +2932,24 @@ fn handle_mouse_event(
                             direction: None,
                         },
                     )?;
+                    if !handle_interactive_response(response, status_message) {
+                        return Ok(true);
+                    }
                 }
                 if pane.mouse_reporting {
-                send_pane_mouse(snapshot, pane.pane_id, row, col, HelperMouseEventKind::LeftDown)
-                    .or_else(|_| {
-                        request_response(
-                            paths,
-                            CommandRequest::MousePane {
-                                session: session.to_string(),
-                                window_id: snapshot.active_window_id,
-                                pane_id: pane.pane_id,
-                                row,
-                                col,
-                                kind: PaneMouseKind::LeftDown,
-                            },
-                        )
-                        .map(|_| ())
-                    })?;
+                    if let Err(error) = send_pane_mouse_or_daemon(
+                        paths,
+                        session,
+                        snapshot,
+                        pane.pane_id,
+                        row,
+                        col,
+                        HelperMouseEventKind::LeftDown,
+                        PaneMouseKind::LeftDown,
+                    ) {
+                        *status_message = Some(error.to_string());
+                        return Ok(true);
+                    }
                     *mouse_capture = Some(MouseCapture {
                         pane_id: pane.pane_id,
                         button: MouseButton::Left,
@@ -2976,7 +2977,7 @@ fn handle_mouse_event(
                 && pane.mouse_reporting
             {
                 if config.mouse.focus_on_click {
-                    let _ = request_response(
+                    let response = request_response(
                         paths,
                         CommandRequest::SelectPane {
                             target: Some(format!(
@@ -2986,24 +2987,25 @@ fn handle_mouse_event(
                             direction: None,
                         },
                     )?;
+                    if !handle_interactive_response(response, status_message) {
+                        return Ok(true);
+                    }
                 }
                 let (helper_down, _, _) = helper_mouse_kinds(button).expect("supported mouse button");
                 let (pane_down, _, _) = pane_mouse_kinds(button).expect("supported mouse button");
-                send_pane_mouse(snapshot, pane.pane_id, row, col, helper_down)
-                    .or_else(|_| {
-                        request_response(
-                            paths,
-                            CommandRequest::MousePane {
-                                session: session.to_string(),
-                                window_id: snapshot.active_window_id,
-                                pane_id: pane.pane_id,
-                                row,
-                                col,
-                                kind: pane_down,
-                            },
-                        )
-                        .map(|_| ())
-                    })?;
+                if let Err(error) = send_pane_mouse_or_daemon(
+                    paths,
+                    session,
+                    snapshot,
+                    pane.pane_id,
+                    row,
+                    col,
+                    helper_down,
+                    pane_down,
+                ) {
+                    *status_message = Some(error.to_string());
+                    return Ok(true);
+                }
                 *mouse_capture = Some(MouseCapture {
                     pane_id: pane.pane_id,
                     button,
@@ -3015,7 +3017,7 @@ fn handle_mouse_event(
                 if let Some((direction, delta)) = resize_drag_request(*resize, mouse) {
                     let target =
                         format!("{session}:{}.{}", snapshot.active_window_id, resize.pane_id);
-                    let _ = request_response(
+                    let response = request_response(
                         paths,
                         CommandRequest::ResizePane {
                             target,
@@ -3023,6 +3025,9 @@ fn handle_mouse_event(
                             amount: mouse_resize_amount(delta, resize.span),
                         },
                     )?;
+                    if !handle_interactive_response(response, status_message) {
+                        return Ok(true);
+                    }
                     resize.last_row = mouse.row;
                     resize.last_col = mouse.column;
                 }
@@ -3030,46 +3035,36 @@ fn handle_mouse_event(
                 && capture.button == MouseButton::Left
                 && let Some((row, col)) = captured_pane_mouse_position(snapshot, capture, mouse)
             {
-                send_pane_mouse(
+                if let Err(error) = send_pane_mouse_or_daemon(
+                    paths,
+                    session,
                     snapshot,
                     capture.pane_id,
                     row,
                     col,
                     HelperMouseEventKind::LeftDrag,
-                )
-                .or_else(|_| {
-                    request_response(
-                        paths,
-                        CommandRequest::MousePane {
-                            session: session.to_string(),
-                            window_id: snapshot.active_window_id,
-                            pane_id: capture.pane_id,
-                            row,
-                            col,
-                            kind: PaneMouseKind::LeftDrag,
-                        },
-                    )
-                    .map(|_| ())
-                })?;
+                    PaneMouseKind::LeftDrag,
+                ) {
+                    *status_message = Some(error.to_string());
+                    return Ok(true);
+                }
             } else if let Some((pane, row, col)) =
                 pane_content_hit(snapshot, mouse.row, mouse.column)
                 && pane.mouse_reporting
             {
-                send_pane_mouse(snapshot, pane.pane_id, row, col, HelperMouseEventKind::LeftDrag)
-                    .or_else(|_| {
-                        request_response(
-                            paths,
-                            CommandRequest::MousePane {
-                                session: session.to_string(),
-                                window_id: snapshot.active_window_id,
-                                pane_id: pane.pane_id,
-                                row,
-                                col,
-                                kind: PaneMouseKind::LeftDrag,
-                            },
-                        )
-                        .map(|_| ())
-                    })?;
+                if let Err(error) = send_pane_mouse_or_daemon(
+                    paths,
+                    session,
+                    snapshot,
+                    pane.pane_id,
+                    row,
+                    col,
+                    HelperMouseEventKind::LeftDrag,
+                    PaneMouseKind::LeftDrag,
+                ) {
+                    *status_message = Some(error.to_string());
+                    return Ok(true);
+                }
             } else if config.mouse.selection_copy
                 && let Some(anchor) = selection_anchor.as_ref()
                 && let Some((pane, row, col)) = pane_content_hit(snapshot, mouse.row, mouse.column)
@@ -3088,21 +3083,19 @@ fn handle_mouse_event(
                 && let Some(capture) = mouse_capture.take()
                 && let Some((row, col)) = captured_pane_mouse_position(snapshot, capture, mouse)
             {
-                send_pane_mouse(snapshot, capture.pane_id, row, col, HelperMouseEventKind::LeftUp)
-                    .or_else(|_| {
-                        request_response(
-                            paths,
-                            CommandRequest::MousePane {
-                                session: session.to_string(),
-                                window_id: snapshot.active_window_id,
-                                pane_id: capture.pane_id,
-                                row,
-                                col,
-                                kind: PaneMouseKind::LeftUp,
-                            },
-                        )
-                        .map(|_| ())
-                    })?;
+                if let Err(error) = send_pane_mouse_or_daemon(
+                    paths,
+                    session,
+                    snapshot,
+                    capture.pane_id,
+                    row,
+                    col,
+                    HelperMouseEventKind::LeftUp,
+                    PaneMouseKind::LeftUp,
+                ) {
+                    *status_message = Some(error.to_string());
+                    return Ok(true);
+                }
                 *selection_anchor = None;
                 *active_selection = None;
                 return Ok(false);
@@ -3125,13 +3118,17 @@ fn handle_mouse_event(
                         end_col: selection.end_col,
                     },
                 )?;
-                if let CommandResponse::SelectionCopied { text } = copied {
-                    *status_message = copy_text_to_buffer_and_clipboard(
-                        paths,
-                        stdout,
-                        &text,
-                        &config.clipboard,
-                    )?;
+                match copied {
+                    CommandResponse::SelectionCopied { text } => {
+                        *status_message = copy_text_to_buffer_and_clipboard(
+                            paths,
+                            stdout,
+                            &text,
+                            &config.clipboard,
+                        )?;
+                    }
+                    CommandResponse::Error { message } => *status_message = Some(message),
+                    other => *status_message = Some(format!("unexpected copy response: {other:?}")),
                 }
             }
             *active_selection = None;
@@ -3144,21 +3141,19 @@ fn handle_mouse_event(
             {
                 let (_, helper_drag, _) = helper_mouse_kinds(button).expect("supported mouse button");
                 let (_, pane_drag, _) = pane_mouse_kinds(button).expect("supported mouse button");
-                send_pane_mouse(snapshot, capture.pane_id, row, col, helper_drag)
-                    .or_else(|_| {
-                        request_response(
-                            paths,
-                            CommandRequest::MousePane {
-                                session: session.to_string(),
-                                window_id: snapshot.active_window_id,
-                                pane_id: capture.pane_id,
-                                row,
-                                col,
-                                kind: pane_drag,
-                            },
-                        )
-                        .map(|_| ())
-                    })?;
+                if let Err(error) = send_pane_mouse_or_daemon(
+                    paths,
+                    session,
+                    snapshot,
+                    capture.pane_id,
+                    row,
+                    col,
+                    helper_drag,
+                    pane_drag,
+                ) {
+                    *status_message = Some(error.to_string());
+                    return Ok(true);
+                }
             }
         }
         MouseEventKind::Up(button @ (MouseButton::Middle | MouseButton::Right)) => {
@@ -3168,21 +3163,19 @@ fn handle_mouse_event(
             {
                 let (_, _, helper_up) = helper_mouse_kinds(button).expect("supported mouse button");
                 let (_, _, pane_up) = pane_mouse_kinds(button).expect("supported mouse button");
-                send_pane_mouse(snapshot, capture.pane_id, row, col, helper_up)
-                    .or_else(|_| {
-                        request_response(
-                            paths,
-                            CommandRequest::MousePane {
-                                session: session.to_string(),
-                                window_id: snapshot.active_window_id,
-                                pane_id: capture.pane_id,
-                                row,
-                                col,
-                                kind: pane_up,
-                            },
-                        )
-                        .map(|_| ())
-                    })?;
+                if let Err(error) = send_pane_mouse_or_daemon(
+                    paths,
+                    session,
+                    snapshot,
+                    capture.pane_id,
+                    row,
+                    col,
+                    helper_up,
+                    pane_up,
+                ) {
+                    *status_message = Some(error.to_string());
+                    return Ok(true);
+                }
                 return Ok(false);
             }
         }
@@ -3438,6 +3431,32 @@ fn send_pane_mouse(
         .ok_or_else(|| anyhow!("pane {} has no helper socket", pane_id))?;
     let process = PaneProcess::connect(socket)?;
     process.handle_mouse_event(kind, row, col)
+}
+
+fn send_pane_mouse_or_daemon(
+    paths: &RuntimePaths,
+    session: &str,
+    snapshot: &RenderSnapshot,
+    pane_id: u64,
+    row: u16,
+    col: u16,
+    helper_kind: HelperMouseEventKind,
+    daemon_kind: PaneMouseKind,
+) -> Result<()> {
+    send_pane_mouse(snapshot, pane_id, row, col, helper_kind).or_else(|_| {
+        ensure_command_succeeded(request_response(
+            paths,
+            CommandRequest::MousePane {
+                session: session.to_string(),
+                window_id: snapshot.active_window_id,
+                pane_id,
+                row,
+                col,
+                kind: daemon_kind,
+            },
+        )?)?;
+        Ok(())
+    })
 }
 
 fn copy_via_osc52(out: &mut impl Write, text: &str) -> Result<()> {
