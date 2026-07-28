@@ -3286,19 +3286,16 @@ fn send_input_bytes(
     if let Some(pane) = focused_pane(snapshot)
         && let Some(socket) = pane.helper_socket.clone()
         && let Ok(process) = PaneProcess::connect(socket)
-        && process
-            .send_keys(&[String::from_utf8_lossy(bytes).into_owned()])
-            .is_ok()
+        && process.send_bytes(bytes).is_ok()
     {
         return Ok(());
     }
 
-    let keys = vec![String::from_utf8_lossy(bytes).into_owned()];
     ensure_command_succeeded(request_response(
         paths,
-        CommandRequest::SendKeys {
+        CommandRequest::SendBytes {
             target: session.to_string(),
-            keys,
+            bytes: bytes.to_vec(),
         },
     )?)?;
     Ok(())
@@ -4028,9 +4025,9 @@ root = { command = ["sh"] }
                 } else {
                     assert_eq!(
                         request,
-                        CommandRequest::SendKeys {
+                        CommandRequest::SendBytes {
                             target: "work".into(),
-                            keys: vec!["x".into()],
+                            bytes: b"x".to_vec(),
                         }
                     );
                     CommandResponse::KeysSent
@@ -4060,7 +4057,7 @@ root = { command = ["sh"] }
             stream.read_to_end(&mut input).expect("read send request");
             assert!(serde_json::from_slice::<serde_json::Value>(&input)
                 .expect("decode send request")
-                .get("SendKeys")
+                .get("SendBytes")
                 .is_some());
             // Dropping this response stream forces the direct-send failure that must fall back.
         });

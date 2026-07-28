@@ -539,6 +539,20 @@ impl SessionStore {
                 },
                 Err(message) => CommandResponse::Error { message },
             },
+            CommandRequest::SendBytes { target, bytes } => match self.parse_target(&target) {
+                Ok(target) => match self.sessions.get(&target.session) {
+                    Some(session) => match session.send_bytes(target.window, target.pane, &bytes) {
+                        Ok(_) => CommandResponse::KeysSent,
+                        Err(error) => CommandResponse::Error {
+                            message: error.to_string(),
+                        },
+                    },
+                    None => CommandResponse::Error {
+                        message: format!("unknown session {}", target.session),
+                    },
+                },
+                Err(message) => CommandResponse::Error { message },
+            },
             CommandRequest::SplitPane {
                 target,
                 axis,

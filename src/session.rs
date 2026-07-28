@@ -549,6 +549,23 @@ impl Session {
         Ok(())
     }
 
+    pub fn send_bytes(
+        &self,
+        window_id: Option<WindowId>,
+        pane_id: Option<PaneId>,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let window = self
+            .window(window_id)
+            .ok_or_else(|| anyhow!("unknown window"))?;
+        let pane_id = pane_id.unwrap_or(window.layout.active);
+        let pane = window
+            .panes
+            .get(&pane_id)
+            .ok_or_else(|| anyhow!("unknown pane"))?;
+        pane.process.send_bytes(bytes)
+    }
+
     pub fn set_viewport(&mut self, rows: u16, cols: u16) -> Result<()> {
         let rows = rows.max(1);
         let cols = cols.max(1);

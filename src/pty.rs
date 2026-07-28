@@ -139,6 +139,9 @@ enum PaneRequest {
     SendKeys {
         keys: Vec<String>,
     },
+    SendBytes {
+        bytes: Vec<u8>,
+    },
     PersistentSnapshot {
         lines: usize,
     },
@@ -429,6 +432,16 @@ impl PaneProcess {
             PaneResponse::Ok => Ok(()),
             PaneResponse::Error { message } => Err(anyhow!(message)),
             other => Err(anyhow!("unexpected send keys response: {other:?}")),
+        }
+    }
+
+    pub fn send_bytes(&self, bytes: &[u8]) -> Result<()> {
+        match self.request(PaneRequest::SendBytes {
+            bytes: bytes.to_vec(),
+        })? {
+            PaneResponse::Ok => Ok(()),
+            PaneResponse::Error { message } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected send bytes response: {other:?}")),
         }
     }
 
@@ -778,6 +791,12 @@ fn handle_helper_request(state: &Arc<HelperState>, request: PaneRequest) -> Pane
                 message: error.to_string(),
             },
         },
+        PaneRequest::SendBytes { bytes } => match helper_send_bytes(state, &bytes) {
+            Ok(()) => PaneResponse::Ok,
+            Err(error) => PaneResponse::Error {
+                message: error.to_string(),
+            },
+        },
         PaneRequest::PersistentSnapshot { lines } => {
             match helper_persistent_snapshot(state, lines) {
                 Ok(snapshot) => PaneResponse::PersistentSnapshot(snapshot),
@@ -1054,15 +1073,16 @@ fn helper_scroll_scrollback(state: &Arc<HelperState>, lines: i16) {
 }
 
 fn helper_send_keys(state: &Arc<HelperState>, keys: &[String]) -> Result<()> {
+    let bytes = keys.iter().flat_map(|key| encode_send_key(key)).collect::<Vec<_>>();
+    helper_send_bytes(state, &bytes)
+}
+
+fn helper_send_bytes(state: &Arc<HelperState>, bytes: &[u8]) -> Result<()> {
     let mut writer = state
         .writer
         .lock()
         .expect("pane helper writer lock poisoned");
-    for key in keys {
-        writer
-            .write_all(&encode_send_key(key))
-            .context("failed to write key bytes")?;
-    }
+    writer.write_all(bytes).context("failed to write key bytes")?;
     writer.flush().context("failed to flush PTY writer")?;
     Ok(())
 }

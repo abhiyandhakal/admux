@@ -83,6 +83,10 @@ pub enum CommandRequest {
         target: String,
         keys: Vec<String>,
     },
+    SendBytes {
+        target: String,
+        bytes: Vec<u8>,
+    },
     SplitPane {
         target: String,
         axis: SplitAxis,
@@ -352,6 +356,17 @@ mod tests {
             cwd: Some(PathBuf::from("/tmp")),
             command: vec!["bash".into()],
             switch_from: None,
+        };
+        let encoded = serde_json::to_vec(&request).expect("encode request");
+        let decoded: CommandRequest = serde_json::from_slice(&encoded).expect("decode request");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn direct_input_request_preserves_arbitrary_bytes() {
+        let request = CommandRequest::SendBytes {
+            target: "work:1.0".into(),
+            bytes: vec![0x00, 0x1b, 0x80, 0xff],
         };
         let encoded = serde_json::to_vec(&request).expect("encode request");
         let decoded: CommandRequest = serde_json::from_slice(&encoded).expect("decode request");
