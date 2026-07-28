@@ -1,7 +1,9 @@
 use std::{
     collections::BTreeMap,
     fs,
+    fs::OpenOptions,
     io::{Read, Write},
+    os::unix::{fs::{OpenOptionsExt, PermissionsExt}, io::AsRawFd},
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -1358,6 +1360,7 @@ pub fn serve(socket_path: &Path, state_path: &Path, config_path: &Path) -> Resul
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create socket directory {}", parent.display()))?;
     }
+    let _daemon_lock = acquire_daemon_lock(socket_path)?;
     let helper_dir = socket_path
         .parent()
         .map(|parent| parent.join("panes"))
@@ -1365,8 +1368,22 @@ pub fn serve(socket_path: &Path, state_path: &Path, config_path: &Path) -> Resul
     fs::create_dir_all(&helper_dir)
         .with_context(|| format!("failed to create helper directory {}", helper_dir.display()))?;
     if socket_path.exists() {
-        fs::remove_file(socket_path)
-            .with_context(|| format!("failed to remove stale socket {}", socket_path.display()))?;
+        match UnixStream::connect(socket_path) {
+            Ok(_) => bail!("admuxd is already serving {}", socket_path.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                fs::remove_file(socket_path).with_context(|| {
+                    format!("failed to remove stale socket {}", socket_path.display())
+                })?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "refusing to remove unreachable socket {}",
+                        socket_path.display()
+                    )
+                });
+            }
+        }
     }
 
     let listener = UnixListener::bind(socket_path)
@@ -1390,6 +1407,28 @@ pub fn serve(socket_path: &Path, state_path: &Path, config_path: &Path) -> Resul
     }
 
     bail!("listener stopped unexpectedly")
+}
+
+fn acquire_daemon_lock(socket_path: &Path) -> Result<fs::File> {
+    let lock_path = socket_path.with_extension("lock");
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open daemon lock {}", lock_path.display()))?;
+    lock.set_permissions(fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to restrict permissions on {}", lock_path.display()))?;
+    // SAFETY: the returned file remains open for the daemon's entire lifetime.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            bail!("admuxd is already starting or serving {}", socket_path.display());
+        }
+        return Err(error).with_context(|| format!("failed to lock {}", lock_path.display()));
+    }
+    Ok(lock)
 }
 
 fn handle_client(mut stream: UnixStream, state: Arc<Mutex<SessionStore>>) {
@@ -1456,6 +1495,16 @@ mod tests {
 
     fn tempdir() -> TempDir {
         make_tempdir().expect("tempdir")
+    }
+
+    #[test]
+    fn daemon_lock_rejects_a_second_startup() {
+        let dir = tempdir();
+        let socket = dir.path().join("socket");
+        let first = acquire_daemon_lock(&socket).expect("acquire first daemon lock");
+        assert!(acquire_daemon_lock(&socket).is_err());
+        drop(first);
+        assert!(acquire_daemon_lock(&socket).is_ok());
     }
 
     #[test]
