@@ -176,9 +176,7 @@ pub fn run(cli: AdmuxCli) -> Result<()> {
     let request = match cli.command {
         ClientCommand::Up(args) => {
             let manifest_path = resolve_workspace_manifest_path(args.path.as_deref())?;
-            let nested_switch = (!args.detach
-                && io::stdout().is_terminal()
-                && std::env::var_os("ADMUX_NONINTERACTIVE").is_none())
+            let nested_switch = (!args.detach && interactive_terminal_available())
             .then(nested_switch_source)
             .flatten();
             let response = request_response(
@@ -196,10 +194,7 @@ pub fn run(cli: AdmuxCli) -> Result<()> {
             if nested_switch.is_none() {
                 print_response(&paths, response)?;
             }
-            if !args.detach
-                && io::stdout().is_terminal()
-                && std::env::var_os("ADMUX_NONINTERACTIVE").is_none()
-                && nested_switch.is_none()
+            if !args.detach && interactive_terminal_available() && nested_switch.is_none()
             {
                 let session = session
                     .ok_or_else(|| anyhow!("workspace response did not include a session name"))?;
@@ -213,9 +208,7 @@ pub fn run(cli: AdmuxCli) -> Result<()> {
         ClientCommand::New(args) => {
             let args = normalize_new_args(args)?;
             let requested_name = args.name.clone();
-            let nested_switch = (!args.detach
-                && io::stdout().is_terminal()
-                && std::env::var_os("ADMUX_NONINTERACTIVE").is_none())
+            let nested_switch = (!args.detach && interactive_terminal_available())
             .then(nested_switch_source)
             .flatten();
             let response = request_response(
@@ -235,10 +228,7 @@ pub fn run(cli: AdmuxCli) -> Result<()> {
                 print_response(&paths, response)?;
             }
 
-            if !args.detach
-                && io::stdout().is_terminal()
-                && std::env::var_os("ADMUX_NONINTERACTIVE").is_none()
-                && nested_switch.is_none()
+            if !args.detach && interactive_terminal_available() && nested_switch.is_none()
             {
                 let session = created_session.or(requested_name).ok_or_else(|| {
                     anyhow!("new session response did not include a session name")
@@ -610,7 +600,7 @@ fn print_response(paths: &RuntimePaths, response: CommandResponse) -> Result<()>
             snapshot,
             ..
         } => {
-            if io::stdout().is_terminal() && std::env::var_os("ADMUX_NONINTERACTIVE").is_none() {
+            if interactive_terminal_available() {
                 attach_interactive(paths, &session)?;
             } else {
                 println!("attached {session}");
@@ -734,6 +724,22 @@ impl Drop for TerminalRestore {
         );
         let _ = terminal::disable_raw_mode();
     }
+}
+
+fn interactive_terminal_available() -> bool {
+    interactive_terminal_available_for(
+        io::stdin().is_terminal(),
+        io::stdout().is_terminal(),
+        std::env::var_os("ADMUX_NONINTERACTIVE").is_none(),
+    )
+}
+
+fn interactive_terminal_available_for(
+    stdin_is_terminal: bool,
+    stdout_is_terminal: bool,
+    interactive_requested: bool,
+) -> bool {
+    stdin_is_terminal && stdout_is_terminal && interactive_requested
 }
 
 fn attach_interactive(paths: &RuntimePaths, session: &str) -> Result<()> {
@@ -3015,6 +3021,14 @@ root = { command = ["sh"] }
         ];
         let error = AdmuxCli::try_parse_from(&argv).expect_err("unknown subcommand");
         assert!(!should_try_alias(&argv, &error));
+    }
+
+    #[test]
+    fn interactive_attachment_requires_both_terminal_streams() {
+        assert!(interactive_terminal_available_for(true, true, true));
+        assert!(!interactive_terminal_available_for(false, true, true));
+        assert!(!interactive_terminal_available_for(true, false, true));
+        assert!(!interactive_terminal_available_for(true, true, false));
     }
 
     #[test]
