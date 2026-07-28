@@ -281,21 +281,21 @@ impl Session {
         self.windows.get_mut(&self.active_window)
     }
 
-    pub fn active_pane_selection_text(
+    pub fn pane_selection_text(
         &self,
-        pane_id: Option<PaneId>,
+        window_id: Option<u64>,
+        pane_id: Option<u64>,
         start_row: u16,
         start_col: u16,
         end_row: u16,
         end_col: u16,
     ) -> Result<String> {
-        let pane = self
-            .active_window()
-            .and_then(|window| {
-                let pane_id = pane_id.unwrap_or(window.layout.active);
-                window.panes.get(&pane_id)
-            })
-            .ok_or_else(|| anyhow!("active pane is unavailable"))?;
+        let window = self.window_for_public_id(window_id)?;
+        let pane_id = self.pane_id_from_public(pane_id, window.layout.active)?;
+        let pane = window
+            .panes
+            .get(&pane_id)
+            .ok_or_else(|| anyhow!("pane is unavailable"))?;
         pane.process
             .selection_text(start_row, start_col, end_row, end_col)
     }
@@ -596,15 +596,14 @@ impl Session {
 
     pub fn handle_pane_mouse(
         &self,
-        pane_id: Option<PaneId>,
+        window_id: Option<u64>,
+        pane_id: Option<u64>,
         kind: PaneMouseKind,
         row: u16,
         col: u16,
     ) -> Result<()> {
-        let window = self
-            .active_window()
-            .ok_or_else(|| anyhow!("unknown window"))?;
-        let pane_id = pane_id.unwrap_or(window.layout.active);
+        let window = self.window_for_public_id(window_id)?;
+        let pane_id = self.pane_id_from_public(pane_id, window.layout.active)?;
         let pane = window
             .panes
             .get(&pane_id)
@@ -627,11 +626,14 @@ impl Session {
         Ok(())
     }
 
-    pub fn scroll_pane(&self, pane_id: Option<PaneId>, lines: i16) -> Result<()> {
-        let window = self
-            .active_window()
-            .ok_or_else(|| anyhow!("unknown window"))?;
-        let pane_id = pane_id.unwrap_or(window.layout.active);
+    pub fn scroll_pane(
+        &self,
+        window_id: Option<u64>,
+        pane_id: Option<u64>,
+        lines: i16,
+    ) -> Result<()> {
+        let window = self.window_for_public_id(window_id)?;
+        let pane_id = self.pane_id_from_public(pane_id, window.layout.active)?;
         let pane = window
             .panes
             .get(&pane_id)
@@ -1124,6 +1126,25 @@ impl Session {
         self.resize_window_panes(self.active_window, self.pane_area())
     }
 
+    fn window_for_public_id(&self, window_id: Option<u64>) -> Result<&WindowRuntime> {
+        let window_id = match window_id {
+            Some(window_id) => self
+                .numbering
+                .parse_public_window_id(window_id, &self.window_order)?,
+            None => self.active_window,
+        };
+        self.windows
+            .get(&window_id)
+            .ok_or_else(|| anyhow!("unknown window"))
+    }
+
+    fn pane_id_from_public(&self, pane_id: Option<u64>, default: PaneId) -> Result<PaneId> {
+        pane_id
+            .map(|pane_id| self.numbering.parse_public_pane_number(pane_id))
+            .transpose()
+            .map(|pane_id| pane_id.unwrap_or(default))
+    }
+
     fn resize_window_panes(&self, window_id: WindowId, area: Rect) -> Result<()> {
         let window = self
             .windows
@@ -1464,6 +1485,51 @@ mod tests {
         );
 
         fs::rename(&moved_socket, &hidden_socket).expect("restore helper socket");
+        session.kill().expect("clean up session");
+    }
+
+    #[test]
+    fn pane_requests_resolve_public_window_and_pane_ids_without_using_active_window() {
+        let helper_dir = tempdir();
+        let mut session = Session::new(
+            "work".into(),
+            None,
+            None,
+            vec!["sh".into()],
+            WindowId(1),
+            None,
+            10_000,
+            Numbering {
+                window_base: 1,
+                pane_base: 10,
+            },
+            WindowDefaults::default(),
+            helper_dir.path().to_path_buf(),
+        )
+        .expect("create session");
+        session
+            .new_window(WindowId(2), Some("target".into()), &["sh".into()])
+            .expect("create target window");
+        session.select_window(WindowId(1)).expect("select source window");
+        let target_socket = session
+            .windows
+            .get(&WindowId(2))
+            .expect("target window")
+            .panes
+            .get(&PaneId(0))
+            .expect("target pane")
+            .process
+            .socket_path()
+            .to_path_buf();
+        let hidden_socket = target_socket.with_extension("hidden");
+        fs::rename(&target_socket, &hidden_socket).expect("hide target helper socket");
+
+        let error = session
+            .scroll_pane(Some(2), Some(10), 1)
+            .expect_err("request must target the hidden second window, not the active first window");
+        assert!(error.to_string().contains("failed to connect pane helper"));
+
+        fs::rename(&hidden_socket, &target_socket).expect("restore target helper socket");
         session.kill().expect("clean up session");
     }
 

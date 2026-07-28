@@ -1421,6 +1421,7 @@ fn run_attach_loop(
                                     paths,
                                     CommandRequest::ScrollPane {
                                         session: current_session.clone(),
+                                        window_id: Some(snapshot.active_window_id),
                                         pane_id: Some(copy.pane_id),
                                         lines: -page,
                                     },
@@ -1446,6 +1447,7 @@ fn run_attach_loop(
                                     paths,
                                     CommandRequest::ScrollPane {
                                         session: current_session.clone(),
+                                        window_id: Some(snapshot.active_window_id),
                                         pane_id: Some(copy.pane_id),
                                         lines: page,
                                     },
@@ -1466,6 +1468,7 @@ fn run_attach_loop(
                                     paths,
                                     CommandRequest::CopySelection {
                                         session: current_session.clone(),
+                                        window_id: Some(snapshot.active_window_id),
                                         pane_id: Some(copy.pane_id),
                                         start_row: selection.start_row,
                                         start_col: selection.start_col,
@@ -2911,6 +2914,7 @@ fn handle_mouse_event(
                             paths,
                             CommandRequest::MousePane {
                                 session: session.to_string(),
+                                window_id: snapshot.active_window_id,
                                 pane_id: pane.pane_id,
                                 row,
                                 col,
@@ -2965,6 +2969,7 @@ fn handle_mouse_event(
                             paths,
                             CommandRequest::MousePane {
                                 session: session.to_string(),
+                                window_id: snapshot.active_window_id,
                                 pane_id: pane.pane_id,
                                 row,
                                 col,
@@ -3011,6 +3016,7 @@ fn handle_mouse_event(
                         paths,
                         CommandRequest::MousePane {
                             session: session.to_string(),
+                            window_id: snapshot.active_window_id,
                             pane_id: capture.pane_id,
                             row,
                             col,
@@ -3029,6 +3035,7 @@ fn handle_mouse_event(
                             paths,
                             CommandRequest::MousePane {
                                 session: session.to_string(),
+                                window_id: snapshot.active_window_id,
                                 pane_id: pane.pane_id,
                                 row,
                                 col,
@@ -3061,6 +3068,7 @@ fn handle_mouse_event(
                             paths,
                             CommandRequest::MousePane {
                                 session: session.to_string(),
+                                window_id: snapshot.active_window_id,
                                 pane_id: capture.pane_id,
                                 row,
                                 col,
@@ -3083,6 +3091,7 @@ fn handle_mouse_event(
                     paths,
                     CommandRequest::CopySelection {
                         session: session.to_string(),
+                        window_id: Some(snapshot.active_window_id),
                         pane_id: Some(pane.pane_id),
                         start_row: selection.start_row,
                         start_col: selection.start_col,
@@ -3115,6 +3124,7 @@ fn handle_mouse_event(
                             paths,
                             CommandRequest::MousePane {
                                 session: session.to_string(),
+                                window_id: snapshot.active_window_id,
                                 pane_id: capture.pane_id,
                                 row,
                                 col,
@@ -3138,6 +3148,7 @@ fn handle_mouse_event(
                             paths,
                             CommandRequest::MousePane {
                                 session: session.to_string(),
+                                window_id: snapshot.active_window_id,
                                 pane_id: capture.pane_id,
                                 row,
                                 col,

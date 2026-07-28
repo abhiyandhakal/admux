@@ -738,13 +738,14 @@ impl SessionStore {
             },
             CommandRequest::MousePane {
                 session,
+                window_id,
                 pane_id,
                 row,
                 col,
                 kind,
             } => match self.sessions.get(&session) {
                 Some(session) => {
-                    match session.handle_pane_mouse(Some(PaneId(pane_id)), kind, row, col) {
+                    match session.handle_pane_mouse(Some(window_id), Some(pane_id), kind, row, col) {
                         Ok(_) => CommandResponse::FocusChanged,
                         Err(error) => CommandResponse::Error {
                             message: error.to_string(),
@@ -757,14 +758,16 @@ impl SessionStore {
             },
             CommandRequest::CopySelection {
                 session,
+                window_id,
                 pane_id,
                 start_row,
                 start_col,
                 end_row,
                 end_col,
             } => match self.sessions.get(&session) {
-                Some(session) => match session.active_pane_selection_text(
-                        pane_id.map(PaneId),
+                Some(session) => match session.pane_selection_text(
+                        window_id,
+                        pane_id,
                         start_row,
                         start_col,
                         end_row,
@@ -781,10 +784,11 @@ impl SessionStore {
             },
             CommandRequest::ScrollPane {
                 session,
+                window_id,
                 pane_id,
                 lines,
             } => match self.sessions.get(&session) {
-                Some(session) => match session.scroll_pane(pane_id.map(PaneId), lines) {
+                Some(session) => match session.scroll_pane(window_id, pane_id, lines) {
                     Ok(_) => CommandResponse::Scrolled,
                     Err(error) => CommandResponse::Error {
                         message: error.to_string(),

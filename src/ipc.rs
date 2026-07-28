@@ -11,7 +11,7 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtocolVersion(pub u16);
 
-pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(7);
+pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(8);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientViewport {
@@ -138,6 +138,7 @@ pub enum CommandRequest {
     },
     MousePane {
         session: String,
+        window_id: u64,
         pane_id: u64,
         row: u16,
         col: u16,
@@ -145,6 +146,7 @@ pub enum CommandRequest {
     },
     CopySelection {
         session: String,
+        window_id: Option<u64>,
         pane_id: Option<u64>,
         start_row: u16,
         start_col: u16,
@@ -153,6 +155,7 @@ pub enum CommandRequest {
     },
     ScrollPane {
         session: String,
+        window_id: Option<u64>,
         pane_id: Option<u64>,
         lines: i16,
     },
