@@ -1,13 +1,13 @@
 use std::{
-    collections::{BTreeMap, hash_map::DefaultHasher},
+    collections::BTreeMap,
     fs,
-    hash::{Hash, Hasher},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{
     layout::{LayoutNode, SplitAxis},
@@ -62,11 +62,15 @@ pub struct WorkspaceSnapshot {
     pub version: u16,
     pub saved_at_unix: u64,
     pub manifest_path: String,
+    #[serde(default)]
+    pub manifest_digest_algorithm: String,
     pub manifest_digest: String,
     pub session_name: String,
     pub active_window: usize,
     pub windows: Vec<WorkspaceWindowSnapshot>,
 }
+
+const MANIFEST_DIGEST_ALGORITHM: &str = "sha256";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceWindowSnapshot {
@@ -679,6 +683,7 @@ fn export_snapshot(
             .unwrap_or_default()
             .as_secs(),
         manifest_path: manifest_path.display().to_string(),
+        manifest_digest_algorithm: MANIFEST_DIGEST_ALGORITHM.to_string(),
         manifest_digest: digest.to_string(),
         session_name: session.name.clone(),
         active_window: session.numbering.public_window_number(
@@ -704,6 +709,9 @@ fn load_snapshot_sidecar(manifest_path: &Path, digest: &str) -> Result<Option<Wo
     if snapshot.version != 1 {
         return Ok(None);
     }
+    if snapshot.manifest_digest_algorithm != MANIFEST_DIGEST_ALGORITHM {
+        return Ok(None);
+    }
     if snapshot.manifest_digest != digest {
         return Ok(None);
     }
@@ -722,9 +730,7 @@ fn workspace_snapshot_path(manifest_path: &Path) -> PathBuf {
 }
 
 fn manifest_digest(raw: &str) -> String {
-    let mut hasher = DefaultHasher::new();
-    raw.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    format!("{:x}", Sha256::digest(raw.as_bytes()))
 }
 
 fn is_zero_usize(value: &usize) -> bool {
@@ -1000,6 +1006,14 @@ command = ["cargo", "test"]
     }
 
     #[test]
+    fn manifest_digest_uses_identified_sha256() {
+        assert_eq!(
+            manifest_digest("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
     fn save_writes_snapshot_sidecar_and_loads_it_back() {
         let dir = tempdir();
         let session_dir = dir.path().join("project");
@@ -1028,6 +1042,14 @@ command = ["cargo", "test"]
 
         assert!(snapshot_path.exists(), "snapshot sidecar should exist");
         assert!(gitignore_path.exists(), "workspace .gitignore should exist");
+        let snapshot_json: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&snapshot_path).expect("read snapshot"),
+        )
+        .expect("decode snapshot");
+        assert_eq!(
+            snapshot_json["manifest_digest_algorithm"],
+            MANIFEST_DIGEST_ALGORITHM
+        );
 
         let loaded = load_workspace(
             &manifest_path,
