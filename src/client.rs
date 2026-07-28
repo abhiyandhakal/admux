@@ -110,6 +110,9 @@ enum PromptResult {
     KeepOpen,
     Close,
     CloseAndClearSelection,
+    OpenChooseTree,
+    OpenChooseBuffer,
+    Detach,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -953,6 +956,16 @@ fn run_attach_loop(
                                 selection_anchor = None;
                                 active_selection = None;
                             }
+                            PromptResult::OpenChooseTree => {
+                                overlay = OverlayState::ChooseTree(build_choose_tree(
+                                    paths,
+                                    &current_session,
+                                )?);
+                            }
+                            PromptResult::OpenChooseBuffer => {
+                                overlay = OverlayState::ChooseBuffer(build_choose_buffer(paths)?);
+                            }
+                            PromptResult::Detach => break,
                         }
                     }
                     OverlayState::ChooseTree(mut tree) => {
@@ -1585,22 +1598,47 @@ fn handle_prompt_key(
         KeyCode::Enter => {
             let command = prompt.buffer.trim().to_string();
             if !command.is_empty() {
-                let result = if matches!(parse_command(&command), Ok(InteractiveCommand::ReloadConfig)) {
-                    reload_interactive_config(paths, input_state, config)
-                        .map(|()| Some("config reloaded".into()))
-                } else {
-                    execute_prompt_command(paths, snapshot, current_session, &command)
+                match parse_command(&command) {
+                    Ok(parsed) => {
+                        if let Some(result) = prompt_overlay_command(&parsed) {
+                            history.push(command);
+                            return Ok(result);
+                        }
+                        if matches!(parsed, InteractiveCommand::ReloadConfig) {
+                            match reload_interactive_config(paths, input_state, config) {
+                                Ok(()) => {
+                                    history.push(command);
+                                    *status_message = Some("config reloaded".into());
+                                }
+                                Err(error) => {
+                                    *status_message = Some(error.to_string());
+                                    return Ok(PromptResult::KeepOpen);
+                                }
+                            }
+                        } else {
+                            match execute_prompt_command(paths, snapshot, current_session, &command) {
+                                Ok(result) => {
+                                    history.push(command);
+                                    *status_message = result;
+                                }
+                                Err(error) => {
+                                    *status_message = Some(error.to_string());
+                                    return Ok(PromptResult::KeepOpen);
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => match execute_prompt_command(paths, snapshot, current_session, &command) {
+                        Ok(result) => {
+                            history.push(command);
+                            *status_message = result;
+                        }
+                        Err(error) => {
+                            *status_message = Some(error.to_string());
+                            return Ok(PromptResult::KeepOpen);
+                        }
+                    },
                 };
-                match result {
-                    Ok(result) => {
-                        history.push(command);
-                        *status_message = result;
-                    }
-                    Err(error) => {
-                        *status_message = Some(error.to_string());
-                        return Ok(PromptResult::KeepOpen);
-                    }
-                }
             }
             return Ok(PromptResult::CloseAndClearSelection);
         }
@@ -1662,6 +1700,15 @@ fn handle_prompt_key(
 
     refresh_prompt_completions(prompt);
     Ok(PromptResult::KeepOpen)
+}
+
+fn prompt_overlay_command(command: &InteractiveCommand) -> Option<PromptResult> {
+    match command {
+        InteractiveCommand::ChooseTree => Some(PromptResult::OpenChooseTree),
+        InteractiveCommand::ChooseBuffer => Some(PromptResult::OpenChooseBuffer),
+        InteractiveCommand::DetachClient => Some(PromptResult::Detach),
+        _ => None,
+    }
 }
 
 fn reload_interactive_config(
@@ -1875,9 +1922,9 @@ fn execute_prompt_command(
             )?)?;
             Ok(Some(format_list_response(response)))
         }
-        InteractiveCommand::ChooseBuffer => Ok(Some("use Ctrl-b =".into())),
-        InteractiveCommand::ChooseTree => Ok(Some("use Ctrl-b s".into())),
-        InteractiveCommand::DetachClient => Ok(Some("use Ctrl-b d".into())),
+        InteractiveCommand::ChooseBuffer
+        | InteractiveCommand::ChooseTree
+        | InteractiveCommand::DetachClient => unreachable!("handled before prompt dispatch"),
         InteractiveCommand::RenameWindow { name } => {
             let target = format!("{}:{}", current_session, snapshot.active_window_id);
             ensure_command_succeeded(request_response(paths, CommandRequest::RenameWindow { target, name })?)?;
@@ -3114,6 +3161,22 @@ root = { command = ["sh"] }
             &mut status,
         ));
         assert_eq!(status.as_deref(), Some("unknown window"));
+    }
+
+    #[test]
+    fn prompt_overlay_commands_open_their_real_interactive_targets() {
+        assert_eq!(
+            prompt_overlay_command(&InteractiveCommand::ChooseTree),
+            Some(PromptResult::OpenChooseTree)
+        );
+        assert_eq!(
+            prompt_overlay_command(&InteractiveCommand::ChooseBuffer),
+            Some(PromptResult::OpenChooseBuffer)
+        );
+        assert_eq!(
+            prompt_overlay_command(&InteractiveCommand::DetachClient),
+            Some(PromptResult::Detach)
+        );
     }
 
     #[test]
