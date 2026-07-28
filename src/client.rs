@@ -368,6 +368,13 @@ fn normalize_new_args(mut args: crate::cli::NewArgs) -> Result<crate::cli::NewAr
     if args.cwd.is_none() {
         args.cwd = Some(std::env::current_dir().context("failed to resolve current directory")?);
     }
+    if let Some(cwd) = args.cwd.as_mut()
+        && cwd.is_relative()
+    {
+        *cwd = std::env::current_dir()
+            .context("failed to resolve current directory")?
+            .join(&*cwd);
+    }
 
     Ok(args)
 }
@@ -3056,6 +3063,26 @@ root = { command = ["sh"] }
         let normalized = normalize_new_args(args).expect("normalize");
         assert_eq!(normalized.cwd, Some(dir.path().to_path_buf()));
         assert!(normalized.command.is_empty());
+    }
+
+    #[test]
+    fn normalize_new_args_makes_explicit_relative_cwd_client_relative() {
+        let args = crate::cli::NewArgs {
+            detach: true,
+            name: Some("work".into()),
+            cwd: Some(PathBuf::from("relative-project")),
+            command: Vec::new(),
+        };
+
+        let normalized = normalize_new_args(args).expect("normalize");
+        assert_eq!(
+            normalized.cwd,
+            Some(
+                std::env::current_dir()
+                    .expect("current directory")
+                    .join("relative-project")
+            )
+        );
     }
 
     #[test]
