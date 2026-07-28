@@ -113,6 +113,7 @@ pub fn render_session<W: Write>(
     for pane in &snapshot.panes {
         render_pane(out, pane, ui)?;
     }
+    render_pane_labels(out, snapshot, ui)?;
     render_split_separators(out, snapshot, ui)?;
     if let Some(selection) = selection {
         render_selection_overlay(out, snapshot, selection, ui)?;
@@ -366,6 +367,38 @@ fn render_pane<W: Write>(
         )?;
         out.write_all(row.as_bytes())?;
         out.write_all(b"\x1b[0m")?;
+    }
+    Ok(())
+}
+
+fn render_pane_labels<W: Write>(
+    out: &mut W,
+    snapshot: &RenderSnapshot,
+    ui: &ResolvedUiConfig,
+) -> std::io::Result<()> {
+    if !ui.show_pane_labels {
+        return Ok(());
+    }
+    for pane in &snapshot.panes {
+        if pane.rect.width == 0 || pane.rect.height == 0 {
+            continue;
+        }
+        let style = if pane.focused {
+            &ui.theme.active_window
+        } else {
+            &ui.theme.inactive_window
+        };
+        let label = fit_width(
+            &format!(" {}:{} ", pane.pane_id, pane.title),
+            pane.rect.width,
+        );
+        queue_style(out, style)?;
+        queue!(
+            out,
+            MoveTo(pane.rect.x, offset_row(pane.rect.y, ui)),
+            Print(label)
+        )?;
+        reset_style(out)?;
     }
     Ok(())
 }
@@ -1430,6 +1463,47 @@ mod tests {
         assert!(rendered.contains("copied 5 chars"));
         assert!(rendered.contains("\u{1b}[?25h"));
         assert!(rendered.contains("\u{1b}[0m"));
+    }
+
+    #[test]
+    fn pane_labels_follow_the_ui_setting() {
+        let mut snapshot = sample_snapshot();
+        snapshot.panes[0].title = "pane-label".into();
+        let mut ui = sample_ui();
+        ui.status_show_pane = false;
+
+        let mut shown = Vec::new();
+        render_session(
+            &mut shown,
+            "work",
+            &snapshot,
+            BottomBar::Status { message: None },
+            None,
+            &ui,
+            TerminalSize {
+                width: 40,
+                height: 6,
+            },
+        )
+        .expect("render labels");
+        assert!(String::from_utf8_lossy(&shown).contains("1:pane-label"));
+
+        ui.show_pane_labels = false;
+        let mut hidden = Vec::new();
+        render_session(
+            &mut hidden,
+            "work",
+            &snapshot,
+            BottomBar::Status { message: None },
+            None,
+            &ui,
+            TerminalSize {
+                width: 40,
+                height: 6,
+            },
+        )
+        .expect("render without labels");
+        assert!(!String::from_utf8_lossy(&hidden).contains("pane-label"));
     }
 
     #[test]
