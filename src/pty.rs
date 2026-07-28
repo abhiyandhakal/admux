@@ -193,19 +193,20 @@ impl From<PaneSnapshotWire> for PaneSnapshot {
     }
 }
 
-impl From<PanePersistentSnapshotWire> for PanePersistentSnapshot {
-    fn from(value: PanePersistentSnapshotWire) -> Self {
-        Self {
+impl TryFrom<PanePersistentSnapshotWire> for PanePersistentSnapshot {
+    type Error = anyhow::Error;
+
+    fn try_from(value: PanePersistentSnapshotWire) -> Result<Self> {
+        let vt_bytes = STANDARD
+            .decode(value.vt_b64)
+            .context("pane snapshot wire contains invalid base64")?;
+        let vt = String::from_utf8(vt_bytes).context("pane snapshot wire contains invalid UTF-8")?;
+        Ok(Self {
             rows: value.rows,
             cols: value.cols,
-            vt: String::from_utf8(
-                STANDARD
-                    .decode(value.vt_b64)
-                    .expect("pane snapshot wire should contain valid base64"),
-            )
-            .expect("pane snapshot wire should contain valid utf-8"),
+            vt,
             command: value.command,
-        }
+        })
     }
 }
 
@@ -415,7 +416,7 @@ impl PaneProcess {
 
     pub fn persistent_snapshot(&self, lines: usize) -> Result<PanePersistentSnapshot> {
         match self.request(PaneRequest::PersistentSnapshot { lines })? {
-            PaneResponse::PersistentSnapshot(snapshot) => Ok(snapshot.into()),
+            PaneResponse::PersistentSnapshot(snapshot) => snapshot.try_into(),
             PaneResponse::Error { message } => Err(anyhow!(message)),
             other => Err(anyhow!(
                 "unexpected persistent snapshot response: {other:?}"
@@ -1171,6 +1172,25 @@ mod tests {
     #[test]
     fn send_keys_preserves_literal_text() {
         assert_eq!(encode_send_key("echo hello"), b"echo hello".to_vec());
+    }
+
+    #[test]
+    fn invalid_persistent_snapshot_wire_is_an_error_not_a_panic() {
+        let invalid_base64 = PanePersistentSnapshotWire {
+            rows: 24,
+            cols: 80,
+            vt_b64: "not base64!".into(),
+            command: Vec::new(),
+        };
+        assert!(PanePersistentSnapshot::try_from(invalid_base64).is_err());
+
+        let invalid_utf8 = PanePersistentSnapshotWire {
+            rows: 24,
+            cols: 80,
+            vt_b64: STANDARD.encode([0xff]),
+            command: Vec::new(),
+        };
+        assert!(PanePersistentSnapshot::try_from(invalid_utf8).is_err());
     }
 
     fn wait_for_preview(pane: &PaneProcess, needle: &str) -> String {
