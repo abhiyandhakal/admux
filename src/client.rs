@@ -2459,19 +2459,22 @@ fn chooser_preview(
             ..
         } => Some(format!("{session}:{window_index}.{pane_id}")),
     };
-    let snapshot = match request_response(
+    let (title, snapshot) = match request_response(
         paths,
         CommandRequest::PreviewSession {
             session: session.clone(),
             target,
         },
     )? {
-        CommandResponse::SessionPreview { snapshot } => snapshot,
-        CommandResponse::Error { message } => return Err(anyhow!(message)),
+        CommandResponse::SessionPreview { snapshot } => (session.clone(), snapshot),
+        CommandResponse::Error { message } => (
+            format!("{session} (unavailable)"),
+            fallback_snapshot(format!("preview unavailable: {message}"), 80, 24),
+        ),
         other => return Err(anyhow!("unexpected session preview response: {other:?}")),
     };
-    tree.preview = Some((tree.selected, session.clone(), snapshot.clone()));
-    Ok((session, snapshot))
+    tree.preview = Some((tree.selected, title.clone(), snapshot.clone()));
+    Ok((title, snapshot))
 }
 
 fn buffer_preview(paths: &RuntimePaths, chooser: &mut ChooseBufferState) -> Result<String> {
@@ -3685,6 +3688,68 @@ root = { command = ["sh"] }
             &mut status,
         ));
         assert_eq!(status.as_deref(), Some("unknown window"));
+    }
+
+    #[test]
+    fn stale_chooser_preview_uses_an_unavailable_placeholder() {
+        let dir = tempdir();
+        let socket_path = dir.path().join("socket");
+        let paths = RuntimePaths {
+            socket_path: socket_path.clone(),
+            config_path: dir.path().join("config.toml"),
+            state_path: dir.path().join("state.json"),
+            aliases_path: dir.path().join("aliases.json"),
+        };
+        let listener = UnixListener::bind(&socket_path).expect("bind daemon socket");
+        let server = std::thread::spawn(move || {
+            for response in [
+                CommandResponse::HelloAck {
+                    version: crate::ipc::CURRENT_PROTOCOL_VERSION,
+                },
+                CommandResponse::Error {
+                    message: "session previous-run is not running".into(),
+                },
+            ] {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut input = Vec::new();
+                stream.read_to_end(&mut input).expect("read request");
+                let request: CommandRequest = serde_json::from_slice(&input).expect("decode request");
+                match &response {
+                    CommandResponse::HelloAck { .. } => {
+                        assert!(matches!(request, CommandRequest::Hello { .. }));
+                    }
+                    CommandResponse::Error { .. } => assert_eq!(
+                        request,
+                        CommandRequest::PreviewSession {
+                            session: "previous-run".into(),
+                            target: None,
+                        }
+                    ),
+                    _ => unreachable!(),
+                }
+                stream
+                    .write_all(&serde_json::to_vec(&response).expect("encode response"))
+                    .expect("write response");
+            }
+        });
+        let mut tree = ChooseTreeState {
+            items: vec![ChooseItem::Session("previous-run".into())],
+            lines: Vec::new(),
+            selected: 0,
+            expanded_sessions: BTreeSet::new(),
+            expanded_windows: BTreeSet::new(),
+            attached_session: "work".into(),
+            search_input: None,
+            last_search: None,
+            preview: None,
+        };
+
+        let (title, snapshot) = chooser_preview(&paths, &mut tree).expect("placeholder preview");
+
+        assert_eq!(title, "previous-run (unavailable)");
+        assert_eq!(snapshot.panes[0].preview, "preview unavailable: session previous-run is not running");
+        assert!(tree.preview.is_some());
+        server.join().expect("server thread");
     }
 
     #[test]
