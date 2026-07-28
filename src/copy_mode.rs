@@ -87,8 +87,8 @@ impl CopyMode {
         self.update_selection();
     }
 
-    pub fn move_line_end(&mut self, cols: usize) {
-        self.cursor_col = terminal_index(cols);
+    pub fn move_line_end(&mut self, line: &str) {
+        self.cursor_col = terminal_index(line.trim_end().chars().count());
         self.update_selection();
     }
 
@@ -183,6 +183,15 @@ mod tests {
         mode.move_right(6);
 
         assert_eq!(mode.selection(), Some(Selection::new(1, 2, 2, 3)));
+    }
+
+    #[test]
+    fn line_end_stops_at_content_not_pane_width() {
+        let mut mode = CopyMode::new(1, 0, 0);
+
+        mode.move_line_end("hello     ");
+
+        assert_eq!(mode.cursor_col, 4);
     }
 
     #[test]

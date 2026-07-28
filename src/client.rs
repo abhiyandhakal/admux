@@ -1225,15 +1225,17 @@ fn run_attach_loop(
                             }
                         }
                         InputAction::CopyLineEnd => {
-                            let cols = copy_mode.as_ref().and_then(|copy| {
+                            let line = copy_mode.as_ref().and_then(|copy| {
                                 snapshot
                                     .panes
                                     .iter()
                                     .find(|pane| pane.pane_id == copy.pane_id)
-                                    .map(|pane| pane.rect.width.max(1) as usize)
+                                    .and_then(|pane| {
+                                        pane.rows_plain.get(copy.cursor_row as usize).cloned()
+                                    })
                             });
-                            if let (Some(copy), Some(cols)) = (copy_mode.as_mut(), cols) {
-                                copy.move_line_end(cols);
+                            if let (Some(copy), Some(line)) = (copy_mode.as_mut(), line) {
+                                copy.move_line_end(&line);
                             }
                         }
                         InputAction::CopyTop => {
