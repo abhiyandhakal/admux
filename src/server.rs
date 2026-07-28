@@ -154,6 +154,7 @@ impl SessionStore {
                 store.sessions.insert(name, session);
             } else {
                 store.persisted_sessions.remove(&name);
+                store.remove_workspace_mappings_for_session(&name);
             }
         }
         Ok(store)
@@ -458,11 +459,13 @@ impl SessionStore {
                 if let Some(removed) = self.sessions.remove(&session) {
                     let _ = removed.kill();
                     self.persisted_sessions.remove(&session);
+                    self.remove_workspace_mappings_for_session(&session);
                     if self.last_session.as_deref() == Some(session.as_str()) {
                         self.last_session = self.sessions.keys().next_back().cloned();
                     }
                     CommandResponse::SessionKilled { session }
                 } else if self.persisted_sessions.remove(&session).is_some() {
+                    self.remove_workspace_mappings_for_session(&session);
                     CommandResponse::SessionKilled { session }
                 } else {
                     CommandResponse::Error {
@@ -707,6 +710,12 @@ impl SessionStore {
         WindowId(self.next_window_id)
     }
 
+    fn remove_workspace_mappings_for_session(&mut self, session: &str) -> bool {
+        let before = self.workspace_mappings.len();
+        self.workspace_mappings.retain(|_, mapped| mapped != session);
+        before != self.workspace_mappings.len()
+    }
+
     fn next_session_name(&self) -> String {
         let prefix = &self.config.defaults.session.name_prefix;
         let mut suffix = 1_u64;
@@ -731,6 +740,7 @@ impl SessionStore {
         for session in dead_sessions {
             self.sessions.remove(&session);
             self.persisted_sessions.remove(&session);
+            self.remove_workspace_mappings_for_session(&session);
             changed = true;
         }
         let pending_switches = self.pending_switches.len();
@@ -956,6 +966,7 @@ impl SessionStore {
                         if !session.is_alive() {
                             self.sessions.remove(&target.session);
                             self.persisted_sessions.remove(&target.session);
+                            self.remove_workspace_mappings_for_session(&target.session);
                             CommandResponse::SessionKilled {
                                 session: target.session,
                             }
@@ -988,6 +999,7 @@ impl SessionStore {
                         if !still_alive {
                             self.sessions.remove(&target.session);
                             self.persisted_sessions.remove(&target.session);
+                            self.remove_workspace_mappings_for_session(&target.session);
                         }
                         CommandResponse::WindowKilled {
                             session: target.session,
@@ -1049,6 +1061,7 @@ impl SessionStore {
                 let _ = session.kill();
             }
             self.persisted_sessions.remove(&existing);
+            self.remove_workspace_mappings_for_session(&existing);
         }
 
         if let Some(existing) = self.workspace_mappings.get(&manifest_key).cloned()
@@ -1505,6 +1518,24 @@ mod tests {
         assert!(acquire_daemon_lock(&socket).is_err());
         drop(first);
         assert!(acquire_daemon_lock(&socket).is_ok());
+    }
+
+    #[test]
+    fn removing_a_session_removes_its_workspace_mapping() {
+        let mut store = SessionStore::default();
+        store
+            .workspace_mappings
+            .insert("/work/admux.toml".into(), "work".into());
+        store
+            .workspace_mappings
+            .insert("/other/admux.toml".into(), "other".into());
+
+        assert!(store.remove_workspace_mappings_for_session("work"));
+        assert_eq!(
+            store.workspace_mappings,
+            BTreeMap::from([("/other/admux.toml".into(), "other".into())])
+        );
+        assert!(!store.remove_workspace_mappings_for_session("missing"));
     }
 
     #[test]
