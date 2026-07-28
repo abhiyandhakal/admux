@@ -526,8 +526,7 @@ impl Session {
             .panes
             .get(&pane_id)
             .ok_or_else(|| anyhow!("unknown pane"))?;
-        pane.process.scroll_scrollback_by(lines);
-        Ok(())
+        pane.process.scroll_scrollback_by(lines)
     }
 
     pub fn split_active_pane(

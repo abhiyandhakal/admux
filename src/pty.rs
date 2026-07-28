@@ -387,8 +387,12 @@ impl PaneProcess {
         }
     }
 
-    pub fn scroll_scrollback_by(&self, lines: i16) {
-        let _ = self.request(PaneRequest::Scrollback { lines });
+    pub fn scroll_scrollback_by(&self, lines: i16) -> Result<()> {
+        match self.request(PaneRequest::Scrollback { lines })? {
+            PaneResponse::Ok => Ok(()),
+            PaneResponse::Error { message } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected scrollback response: {other:?}")),
+        }
     }
 
     pub fn send_keys(&self, keys: &[String]) -> Result<()> {
@@ -1271,6 +1275,29 @@ mod tests {
         let reconnected =
             PaneProcess::connect(pane.socket_path().to_path_buf()).expect("reconnect helper");
         assert!(wait_for_preview(&reconnected, "reconnect-test").contains("reconnect-test"));
+    }
+
+    #[test]
+    fn scrollback_reports_helper_transport_failures() {
+        let dir = helper_dir();
+        let pane = PaneProcess::spawn(
+            &["sh".into(), "-lc".into(), "sleep 1".into()],
+            None,
+            None,
+            None,
+            10_000,
+            dir.path(),
+            None,
+        )
+        .expect("spawn pane");
+        let socket = pane.socket_path().to_path_buf();
+        let hidden = socket.with_extension("hidden");
+        fs::rename(&socket, &hidden).expect("hide helper socket");
+
+        assert!(pane.scroll_scrollback_by(1).is_err());
+
+        fs::rename(&hidden, &socket).expect("restore helper socket");
+        pane.kill().expect("clean up helper");
     }
 
     #[test]
