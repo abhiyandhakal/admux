@@ -7,7 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::{collections::BTreeMap, fs, path::Path};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub ui: UiConfig,
     pub keys: KeyConfig,
@@ -17,7 +17,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct UiConfig {
     pub status_position: StatusPosition,
     pub show_pane_labels: bool,
@@ -35,7 +35,7 @@ pub struct UiConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct StatusConfig {
     pub show_sessions: bool,
     pub show_window_list: bool,
@@ -44,27 +44,27 @@ pub struct StatusConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DividerConfig {
     pub charset: DividerCharset,
     pub highlight_active: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct OverlayConfig {
     pub border: bool,
     pub title: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ModeBarConfig {
     pub show_hints: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ThemeConfig {
     pub status: StyleConfig,
     pub current_session: StyleConfig,
@@ -85,7 +85,7 @@ pub struct ThemeConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct StyleConfig {
     pub fg: Option<ThemeColor>,
     pub bg: Option<ThemeColor>,
@@ -105,7 +105,7 @@ pub struct KeyConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct RawKeyConfig {
     pub prefix: Option<String>,
     pub bindings: BTreeMap<String, String>,
@@ -116,7 +116,7 @@ struct RawKeyConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct MouseConfig {
     pub enabled: bool,
     pub focus_on_click: bool,
@@ -126,7 +126,7 @@ pub struct MouseConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct BehaviorConfig {
     pub scrollback_lines: usize,
     pub default_shell: Option<String>,
@@ -138,20 +138,20 @@ pub struct BehaviorConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DefaultsConfig {
     pub session: SessionDefaults,
     pub window: WindowDefaults,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SessionDefaults {
     pub name_prefix: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct WindowDefaults {
     pub shell_name: String,
     pub use_command_name: bool,
@@ -1174,6 +1174,16 @@ mod tests {
         .expect("config");
         let error = config.resolve().expect_err("invalid action");
         assert!(error.to_string().contains("invalid action"));
+    }
+
+    #[test]
+    fn unknown_configuration_fields_are_rejected() {
+        let _top_level = Config::from_toml("typo = true").expect_err("reject top-level typo");
+        let nested = Config::from_toml("[behavior]\nscrollbak_lines = 1000")
+            .expect_err("reject nested typo");
+        assert!(!nested.to_string().is_empty());
+        let _keys = Config::from_toml("[keys]\nprefx = 'Ctrl-a'")
+            .expect_err("reject key-section typo");
     }
 
     #[test]
