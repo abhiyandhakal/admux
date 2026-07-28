@@ -897,13 +897,7 @@ fn helper_mouse_scroll(
     row: u16,
     col: u16,
 ) -> Result<()> {
-    let mouse_mode = state
-        .terminal
-        .lock()
-        .expect("pane helper terminal lock poisoned")
-        .parser
-        .screen()
-        .mouse_protocol_mode();
+    let (mouse_mode, mouse_encoding) = helper_mouse_protocol(state);
 
     if mouse_mode == vt100::MouseProtocolMode::None {
         let mut terminal = state
@@ -923,13 +917,13 @@ fn helper_mouse_scroll(
         ScrollDirection::Up => 64,
         ScrollDirection::Down => 65,
     };
-    let sgr = format!("\x1b[<{};{};{}M", code, col + 1, row + 1);
+    let report = encode_mouse_report(mouse_encoding, code, false, false, row, col)?;
     let mut writer = state
         .writer
         .lock()
         .expect("pane helper writer lock poisoned");
     writer
-        .write_all(sgr.as_bytes())
+        .write_all(&report)
         .context("failed to write mouse scroll bytes")?;
     writer.flush().context("failed to flush PTY writer")?;
     Ok(())
@@ -941,38 +935,103 @@ fn helper_mouse_event(
     row: u16,
     col: u16,
 ) -> Result<()> {
-    let mouse_mode = state
-        .terminal
-        .lock()
-        .expect("pane helper terminal lock poisoned")
-        .parser
-        .screen()
-        .mouse_protocol_mode();
+    let (mouse_mode, mouse_encoding) = helper_mouse_protocol(state);
     if mouse_mode == vt100::MouseProtocolMode::None {
         return Ok(());
     }
 
-    let (code, suffix) = match kind {
-        HelperMouseEventKind::LeftDown => (0, 'M'),
-        HelperMouseEventKind::LeftDrag => (32, 'M'),
-        HelperMouseEventKind::LeftUp => (0, 'm'),
-        HelperMouseEventKind::MiddleDown => (1, 'M'),
-        HelperMouseEventKind::MiddleDrag => (33, 'M'),
-        HelperMouseEventKind::MiddleUp => (1, 'm'),
-        HelperMouseEventKind::RightDown => (2, 'M'),
-        HelperMouseEventKind::RightDrag => (34, 'M'),
-        HelperMouseEventKind::RightUp => (2, 'm'),
+    let (button, drag, release) = match kind {
+        HelperMouseEventKind::LeftDown => (0, false, false),
+        HelperMouseEventKind::LeftDrag => (0, true, false),
+        HelperMouseEventKind::LeftUp => (0, false, true),
+        HelperMouseEventKind::MiddleDown => (1, false, false),
+        HelperMouseEventKind::MiddleDrag => (1, true, false),
+        HelperMouseEventKind::MiddleUp => (1, false, true),
+        HelperMouseEventKind::RightDown => (2, false, false),
+        HelperMouseEventKind::RightDrag => (2, true, false),
+        HelperMouseEventKind::RightUp => (2, false, true),
     };
-    let sgr = format!("\x1b[<{};{};{}{}", code, col + 1, row + 1, suffix);
+
+    if !mouse_event_is_requested(mouse_mode, drag, release) {
+        return Ok(());
+    }
+
+    let report = encode_mouse_report(mouse_encoding, button, drag, release, row, col)?;
     let mut writer = state
         .writer
         .lock()
         .expect("pane helper writer lock poisoned");
     writer
-        .write_all(sgr.as_bytes())
+        .write_all(&report)
         .context("failed to write mouse event bytes")?;
     writer.flush().context("failed to flush PTY writer")?;
     Ok(())
+}
+
+fn helper_mouse_protocol(
+    state: &Arc<HelperState>,
+) -> (vt100::MouseProtocolMode, vt100::MouseProtocolEncoding) {
+    let terminal = state
+        .terminal
+        .lock()
+        .expect("pane helper terminal lock poisoned");
+    let screen = terminal.parser.screen();
+    (
+        screen.mouse_protocol_mode(),
+        screen.mouse_protocol_encoding(),
+    )
+}
+
+fn mouse_event_is_requested(mode: vt100::MouseProtocolMode, drag: bool, release: bool) -> bool {
+    match mode {
+        vt100::MouseProtocolMode::None => false,
+        vt100::MouseProtocolMode::Press => !drag && !release,
+        vt100::MouseProtocolMode::PressRelease => !drag,
+        vt100::MouseProtocolMode::ButtonMotion | vt100::MouseProtocolMode::AnyMotion => true,
+    }
+}
+
+fn encode_mouse_report(
+    encoding: vt100::MouseProtocolEncoding,
+    button: u8,
+    drag: bool,
+    release: bool,
+    row: u16,
+    col: u16,
+) -> Result<Vec<u8>> {
+    let code = if release && encoding != vt100::MouseProtocolEncoding::Sgr {
+        3
+    } else {
+        button + u8::from(drag) * 32
+    };
+    let x = u32::from(col) + 33;
+    let y = u32::from(row) + 33;
+
+    match encoding {
+        vt100::MouseProtocolEncoding::Sgr => Ok(format!(
+            "\x1b[<{};{};{}{}",
+            code,
+            u32::from(col) + 1,
+            u32::from(row) + 1,
+            if release { 'm' } else { 'M' }
+        )
+        .into_bytes()),
+        vt100::MouseProtocolEncoding::Default => {
+            let x =
+                u8::try_from(x).context("mouse column exceeds the default xterm encoding limit")?;
+            let y =
+                u8::try_from(y).context("mouse row exceeds the default xterm encoding limit")?;
+            Ok(vec![b'\x1b', b'[', b'M', code + 32, x, y])
+        }
+        vt100::MouseProtocolEncoding::Utf8 => {
+            let x = char::from_u32(x).context("invalid UTF-8 mouse column")?;
+            let y = char::from_u32(y).context("invalid UTF-8 mouse row")?;
+            let mut bytes = vec![b'\x1b', b'[', b'M', code + 32];
+            bytes.extend(x.to_string().bytes());
+            bytes.extend(y.to_string().bytes());
+            Ok(bytes)
+        }
+    }
 }
 
 fn helper_scroll_scrollback(state: &Arc<HelperState>, lines: i16) {
@@ -1294,6 +1353,79 @@ mod tests {
     #[test]
     fn send_keys_preserves_literal_text() {
         assert_eq!(encode_send_key("echo hello"), b"echo hello".to_vec());
+    }
+
+    #[test]
+    fn mouse_reports_honor_requested_encoding() {
+        assert_eq!(
+            encode_mouse_report(vt100::MouseProtocolEncoding::Default, 1, false, false, 2, 4,)
+                .expect("default mouse report"),
+            b"\x1b[M!%#"
+        );
+        assert_eq!(
+            encode_mouse_report(vt100::MouseProtocolEncoding::Default, 1, false, true, 2, 4,)
+                .expect("default release report"),
+            b"\x1b[M#%#"
+        );
+        assert_eq!(
+            encode_mouse_report(vt100::MouseProtocolEncoding::Utf8, 2, true, false, 300, 400,)
+                .expect("UTF-8 mouse report"),
+            format!(
+                "\x1b[M{}{}{}",
+                66u8 as char,
+                char::from_u32(433).unwrap(),
+                char::from_u32(333).unwrap()
+            )
+            .into_bytes()
+        );
+        assert_eq!(
+            encode_mouse_report(vt100::MouseProtocolEncoding::Sgr, 2, false, true, 2, 4,)
+                .expect("SGR release report"),
+            b"\x1b[<2;5;3m"
+        );
+    }
+
+    #[test]
+    fn mouse_reports_honor_requested_motion_mode() {
+        assert!(mouse_event_is_requested(
+            vt100::MouseProtocolMode::Press,
+            false,
+            false
+        ));
+        assert!(!mouse_event_is_requested(
+            vt100::MouseProtocolMode::Press,
+            true,
+            false
+        ));
+        assert!(!mouse_event_is_requested(
+            vt100::MouseProtocolMode::PressRelease,
+            true,
+            false
+        ));
+        assert!(mouse_event_is_requested(
+            vt100::MouseProtocolMode::PressRelease,
+            false,
+            true
+        ));
+        assert!(mouse_event_is_requested(
+            vt100::MouseProtocolMode::ButtonMotion,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn default_mouse_encoding_rejects_unrepresentable_coordinates() {
+        let error = encode_mouse_report(
+            vt100::MouseProtocolEncoding::Default,
+            0,
+            false,
+            false,
+            0,
+            223,
+        )
+        .expect_err("default encoding must not wrap coordinates");
+        assert!(error.to_string().contains("column exceeds"));
     }
 
     #[test]
