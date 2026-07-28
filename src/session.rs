@@ -550,17 +550,34 @@ impl Session {
     }
 
     pub fn set_viewport(&mut self, rows: u16, cols: u16) -> Result<()> {
-        self.rows = rows.max(1);
-        self.cols = cols.max(1);
-        self.sync_pane_sizes()
+        let rows = rows.max(1);
+        let cols = cols.max(1);
+        let previous_area = self.pane_area();
+        let next_area = self.pane_area_for(rows, cols);
+        if let Err(error) = self.resize_window_panes(self.active_window, next_area) {
+            if let Err(rollback_error) = self.resize_window_panes(self.active_window, previous_area)
+            {
+                return Err(error.context(format!(
+                    "failed to restore pane sizes after resize failure: {rollback_error}"
+                )));
+            }
+            return Err(error);
+        }
+        self.rows = rows;
+        self.cols = cols;
+        Ok(())
     }
 
     pub fn pane_area(&self) -> Rect {
+        self.pane_area_for(self.rows, self.cols)
+    }
+
+    fn pane_area_for(&self, rows: u16, cols: u16) -> Rect {
         Rect {
             x: 0,
             y: 0,
-            width: self.cols.max(1),
-            height: self.rows.saturating_sub(1).max(1),
+            width: cols.max(1),
+            height: rows.saturating_sub(1).max(1),
         }
     }
 
@@ -788,17 +805,35 @@ impl Session {
 
     pub fn select_pane(&mut self, window_id: Option<WindowId>, pane_id: PaneId) -> Result<()> {
         let window_id = window_id.unwrap_or(self.active_window);
-        let window = self
-            .windows
+        let previous_pane = {
+            let window = self
+                .windows
+                .get(&window_id)
+                .ok_or_else(|| anyhow!("unknown window"))?;
+            if !window.panes.contains_key(&pane_id) {
+                return Err(anyhow!("unknown pane"));
+            }
+            window.layout.active
+        };
+        let previous_window = self.active_window;
+        let previous_last = self.last_window;
+        self.windows
             .get_mut(&window_id)
-            .ok_or_else(|| anyhow!("unknown window"))?;
-        if window.panes.contains_key(&pane_id) {
-            window.layout.active = pane_id;
-            self.remember_window_switch(window_id);
-            Ok(())
-        } else {
-            Err(anyhow!("unknown pane"))
+            .expect("window was checked above")
+            .layout
+            .active = pane_id;
+        self.remember_window_switch(window_id);
+        if let Err(error) = self.sync_pane_sizes() {
+            self.windows
+                .get_mut(&window_id)
+                .expect("window was checked above")
+                .layout
+                .active = previous_pane;
+            self.active_window = previous_window;
+            self.last_window = previous_last;
+            return Err(error);
         }
+        Ok(())
     }
 
     pub fn move_focus(&mut self, direction: NavigationDirection, area: Rect) -> Result<()> {
@@ -848,7 +883,14 @@ impl Session {
 
     pub fn select_window(&mut self, window_id: WindowId) -> Result<()> {
         if self.windows.contains_key(&window_id) {
+            let previous_active = self.active_window;
+            let previous_last = self.last_window;
             self.remember_window_switch(window_id);
+            if let Err(error) = self.sync_pane_sizes() {
+                self.active_window = previous_active;
+                self.last_window = previous_last;
+                return Err(error);
+            }
             Ok(())
         } else {
             Err(anyhow!("unknown window"))
@@ -867,8 +909,7 @@ impl Session {
         } else {
             (current + len - 1) % len
         };
-        self.remember_window_switch(self.window_order[next_index]);
-        Ok(())
+        self.select_window(self.window_order[next_index])
     }
 
     pub fn kill_pane(
@@ -1031,13 +1072,18 @@ impl Session {
     }
 
     fn sync_pane_sizes(&mut self) -> Result<()> {
-        let area = self.pane_area();
-        for window in self.windows.values() {
-            let rects = window.layout.pane_rects(area);
-            for (pane_id, pane) in &window.panes {
-                let rect = rects.get(pane_id).copied().unwrap_or(area);
-                pane.process.resize(rect.height.max(1), rect.width.max(1))?;
-            }
+        self.resize_window_panes(self.active_window, self.pane_area())
+    }
+
+    fn resize_window_panes(&self, window_id: WindowId, area: Rect) -> Result<()> {
+        let window = self
+            .windows
+            .get(&window_id)
+            .ok_or_else(|| anyhow!("unknown window {}", window_id.0))?;
+        let rects = window.layout.pane_rects(area);
+        for (pane_id, pane) in &window.panes {
+            let rect = rects.get(pane_id).copied().unwrap_or(area);
+            pane.process.resize(rect.height.max(1), rect.width.max(1))?;
         }
         Ok(())
     }
@@ -1206,6 +1252,56 @@ mod tests {
 
         assert_eq!(rows, 29);
         assert_eq!(cols, 120);
+    }
+
+    #[test]
+    fn resizing_the_active_window_does_not_contact_hidden_windows() {
+        let helper_dir = tempdir();
+        let mut session = Session::new(
+            "work".into(),
+            None,
+            None,
+            vec!["sh".into()],
+            WindowId(1),
+            None,
+            10_000,
+            Numbering {
+                window_base: 0,
+                pane_base: 0,
+            },
+            WindowDefaults::default(),
+            helper_dir.path().to_path_buf(),
+        )
+        .expect("create session");
+        session
+            .new_window(WindowId(2), Some("hidden".into()), &["sh".into()])
+            .expect("create hidden window");
+        session.select_window(WindowId(1)).expect("select visible window");
+        let hidden_socket = session
+            .windows
+            .get(&WindowId(2))
+            .expect("hidden window")
+            .panes
+            .get(&PaneId(0))
+            .expect("hidden pane")
+            .process
+            .socket_path()
+            .to_path_buf();
+        let hidden_path = hidden_socket.with_extension("hidden");
+        fs::rename(&hidden_socket, &hidden_path).expect("hide helper socket");
+
+        session.set_viewport(40, 120).expect("resize active window");
+        let visible = session
+            .windows
+            .get(&WindowId(1))
+            .expect("visible window")
+            .panes
+            .get(&PaneId(0))
+            .expect("visible pane");
+        assert_eq!(visible.process.screen_size(), (39, 120));
+
+        fs::rename(&hidden_path, &hidden_socket).expect("restore helper socket");
+        session.kill().expect("clean up session");
     }
 
     #[test]
