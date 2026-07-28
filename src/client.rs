@@ -2956,18 +2956,21 @@ fn send_input_bytes(
     if let Some(pane) = focused_pane(snapshot)
         && let Some(socket) = pane.helper_socket.clone()
         && let Ok(process) = PaneProcess::connect(socket)
+        && process
+            .send_keys(&[String::from_utf8_lossy(bytes).into_owned()])
+            .is_ok()
     {
-        return process.send_keys(&[String::from_utf8_lossy(bytes).into_owned()]);
+        return Ok(());
     }
 
     let keys = vec![String::from_utf8_lossy(bytes).into_owned()];
-    let _ = request_response(
+    ensure_command_succeeded(request_response(
         paths,
         CommandRequest::SendKeys {
             target: session.to_string(),
             keys,
         },
-    )?;
+    )?)?;
     Ok(())
 }
 
@@ -3627,6 +3630,75 @@ root = { command = ["sh"] }
             &mut status,
         ));
         assert_eq!(status.as_deref(), Some("unknown pane"));
+    }
+
+    #[test]
+    fn failed_helper_input_falls_back_to_daemon_input() {
+        let dir = tempdir();
+        let socket_path = dir.path().join("socket");
+        let paths = RuntimePaths {
+            socket_path: socket_path.clone(),
+            config_path: dir.path().join("config.toml"),
+            state_path: dir.path().join("state.json"),
+            aliases_path: dir.path().join("aliases.json"),
+        };
+        let listener = UnixListener::bind(&socket_path).expect("bind daemon socket");
+        let server = std::thread::spawn(move || {
+            for hello in [true, false] {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut input = Vec::new();
+                stream.read_to_end(&mut input).expect("read request");
+                let request: CommandRequest = serde_json::from_slice(&input).expect("decode request");
+                let response = if hello {
+                    assert!(matches!(request, CommandRequest::Hello { .. }));
+                    CommandResponse::HelloAck {
+                        version: crate::ipc::CURRENT_PROTOCOL_VERSION,
+                    }
+                } else {
+                    assert_eq!(
+                        request,
+                        CommandRequest::SendKeys {
+                            target: "work".into(),
+                            keys: vec!["x".into()],
+                        }
+                    );
+                    CommandResponse::KeysSent
+                };
+                stream
+                    .write_all(&serde_json::to_vec(&response).expect("encode response"))
+                    .expect("write response");
+            }
+        });
+        let helper_socket = dir.path().join("helper");
+        let helper_listener = UnixListener::bind(&helper_socket).expect("bind helper socket");
+        let helper = std::thread::spawn(move || {
+            let (mut stream, _) = helper_listener.accept().expect("accept liveness request");
+            let mut input = Vec::new();
+            stream.read_to_end(&mut input).expect("read liveness request");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&input).expect("decode liveness request"),
+                serde_json::json!("IsAlive"),
+            );
+            stream
+                .write_all(br#"{"IsAlive":{"alive":true}}"#)
+                .expect("write liveness response");
+            drop(stream);
+
+            let (mut stream, _) = helper_listener.accept().expect("accept send request");
+            let mut input = Vec::new();
+            stream.read_to_end(&mut input).expect("read send request");
+            assert!(serde_json::from_slice::<serde_json::Value>(&input)
+                .expect("decode send request")
+                .get("SendKeys")
+                .is_some());
+            // Dropping this response stream forces the direct-send failure that must fall back.
+        });
+        let mut snapshot = fallback_snapshot(String::new(), 80, 24);
+        snapshot.panes[0].helper_socket = Some(helper_socket);
+
+        send_input_bytes(&paths, &snapshot, "work", b"x").expect("daemon fallback");
+        helper.join().expect("helper thread");
+        server.join().expect("server thread");
     }
 
     #[test]
