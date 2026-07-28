@@ -18,7 +18,7 @@ const MAX_SESSION_NAME_BYTES: usize = 64;
 use anyhow::{Context, Result, bail};
 
 use crate::{
-    buffer::BufferStore,
+    buffer::{BufferStore, MAX_BUFFER_BYTES},
     config::{Config, ResolvedConfig},
     ipc::{
         BufferSummary, CURRENT_PROTOCOL_VERSION, CommandRequest, CommandResponse, CycleDirection,
@@ -315,10 +315,14 @@ impl SessionStore {
                 buffer,
                 data,
                 append,
-            } => {
-                let name = self.buffers.set(buffer, data, append).name.clone();
-                CommandResponse::BufferSet { name }
-            }
+            } => match self.buffers.set(buffer, data, append) {
+                Ok(buffer) => CommandResponse::BufferSet {
+                    name: buffer.name.clone(),
+                },
+                Err(error) => CommandResponse::Error {
+                    message: error.to_string(),
+                },
+            },
             CommandRequest::DeleteBuffer { buffer } => match self.buffers.delete(buffer.as_deref())
             {
                 Some(buffer) => CommandResponse::BufferDeleted { name: buffer.name },
@@ -369,10 +373,16 @@ impl SessionStore {
                     },
                 }
             }
-            CommandRequest::LoadBuffer { path, buffer } => match std::fs::read_to_string(&path) {
+            CommandRequest::LoadBuffer { path, buffer } => match read_buffer_file(&path) {
                 Ok(data) => {
-                    let name = self.buffers.set(buffer, data, false).name.clone();
-                    CommandResponse::BufferLoaded { name }
+                    match self.buffers.set(buffer, data, false) {
+                        Ok(buffer) => CommandResponse::BufferLoaded {
+                            name: buffer.name.clone(),
+                        },
+                        Err(error) => CommandResponse::Error {
+                            message: error.to_string(),
+                        },
+                    }
                 }
                 Err(error) => CommandResponse::Error {
                     message: format!("failed to load buffer: {error}"),
@@ -1497,6 +1507,20 @@ fn write_response(stream: &mut UnixStream, response: &CommandResponse) -> Result
     Ok(())
 }
 
+fn read_buffer_file(path: &Path) -> Result<String> {
+    let file = fs::File::open(path)
+        .with_context(|| format!("failed to open buffer file {}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_BUFFER_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read buffer file {}", path.display()))?;
+    if bytes.len() > MAX_BUFFER_BYTES {
+        bail!("buffer file exceeds the {MAX_BUFFER_BYTES} byte limit");
+    }
+    String::from_utf8(bytes)
+        .with_context(|| format!("buffer file {} is not valid UTF-8", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1536,6 +1560,15 @@ mod tests {
             BTreeMap::from([("/other/admux.toml".into(), "other".into())])
         );
         assert!(!store.remove_workspace_mappings_for_session("missing"));
+    }
+
+    #[test]
+    fn oversized_buffer_files_are_rejected_before_loading() {
+        let dir = tempdir();
+        let path = dir.path().join("oversized.txt");
+        fs::write(&path, vec![b'x'; MAX_BUFFER_BYTES + 1]).expect("write oversized buffer");
+        let error = read_buffer_file(&path).expect_err("reject oversized file");
+        assert!(error.to_string().contains("byte limit"));
     }
 
     #[test]
