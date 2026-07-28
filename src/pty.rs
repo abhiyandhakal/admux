@@ -28,7 +28,7 @@ const MAX_REPLAY_HISTORY_BYTES: usize = 64 * 1024 * 1024;
 const IPC_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_IPC_MESSAGE_BYTES: u64 = 1024 * 1024;
 const MAX_HELPER_CLIENTS: usize = 64;
-const HELPER_PROTOCOL_VERSION: u16 = 3;
+const HELPER_PROTOCOL_VERSION: u16 = 4;
 static HELPER_NAME_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct TerminalState {
@@ -86,7 +86,6 @@ pub struct PanePersistentSnapshot {
     pub rows: u16,
     pub cols: u16,
     pub vt: String,
-    pub command: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -173,7 +172,6 @@ struct PanePersistentSnapshotWire {
     rows: u16,
     cols: u16,
     vt_b64: String,
-    command: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -239,7 +237,6 @@ impl TryFrom<PanePersistentSnapshotWire> for PanePersistentSnapshot {
             rows: value.rows,
             cols: value.cols,
             vt,
-            command: value.command,
         })
     }
 }
@@ -1327,51 +1324,7 @@ fn helper_persistent_snapshot(
         rows,
         cols,
         vt_b64: STANDARD.encode(vt.as_bytes()),
-        command: helper_foreground_command(state).unwrap_or_default(),
     })
-}
-
-fn helper_foreground_command(state: &Arc<HelperState>) -> Option<Vec<String>> {
-    let pid = state
-        .master
-        .lock()
-        .expect("pane helper master lock poisoned")
-        .process_group_leader()?;
-    foreground_command_for_pid(pid)
-}
-
-fn foreground_command_for_pid(pid: i32) -> Option<Vec<String>> {
-    #[cfg(target_os = "linux")]
-    {
-        let path = PathBuf::from(format!("/proc/{pid}/cmdline"));
-        if let Ok(raw) = fs::read(path)
-            && !raw.is_empty()
-        {
-            let args: Vec<String> = raw
-                .split(|byte| *byte == 0)
-                .filter(|part| !part.is_empty())
-                .map(|part| String::from_utf8_lossy(part).into_owned())
-                .collect();
-            if !args.is_empty() {
-                return Some(args);
-            }
-        }
-    }
-
-    let output = Command::new("ps")
-        .args(["-o", "command=", "-p", &pid.to_string()])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if raw.is_empty() {
-        return None;
-    }
-    shell_words::split(&raw)
-        .ok()
-        .filter(|args| !args.is_empty())
 }
 
 fn read_helper_request(stream: &mut UnixStream) -> Result<PaneRequest> {
@@ -1781,7 +1734,6 @@ mod tests {
             rows: 24,
             cols: 80,
             vt_b64: "not base64!".into(),
-            command: Vec::new(),
         };
         assert!(PanePersistentSnapshot::try_from(invalid_base64).is_err());
 
@@ -1789,7 +1741,6 @@ mod tests {
             rows: 24,
             cols: 80,
             vt_b64: STANDARD.encode([0xff]),
-            command: Vec::new(),
         };
         assert!(PanePersistentSnapshot::try_from(invalid_utf8).is_err());
     }
@@ -2157,7 +2108,7 @@ mod tests {
     }
 
     #[test]
-    fn persistent_snapshot_prefers_foreground_command() {
+    fn persistent_snapshot_does_not_include_runtime_command_metadata() {
         let dir = helper_dir();
         let pane = PaneProcess::spawn(
             &["sh".into(), "-lc".into(), "exec sleep 3".into()],
@@ -2169,16 +2120,10 @@ mod tests {
             None,
         )
         .expect("spawn pane");
-        let mut command = None;
-        for _ in 0..50 {
-            let snapshot = pane.persistent_snapshot(500).expect("persistent snapshot");
-            command = snapshot.command.first().cloned();
-            if command.as_deref() == Some("sleep") {
-                break;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-        assert_eq!(command.as_deref(), Some("sleep"));
+        let snapshot = pane.persistent_snapshot(500).expect("persistent snapshot");
+        assert_eq!(snapshot.rows, 24);
+        assert_eq!(snapshot.cols, 80);
+        assert!(!snapshot.vt.is_empty());
         pane.kill().expect("clean up pane");
     }
 
