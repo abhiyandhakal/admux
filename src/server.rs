@@ -466,8 +466,13 @@ impl SessionStore {
                 Err(message) => CommandResponse::Error { message },
             },
             CommandRequest::KillSession { session } => {
-                if let Some(removed) = self.sessions.remove(&session) {
-                    let _ = removed.kill();
+                if let Some(live) = self.sessions.get(&session) {
+                    if let Err(error) = live.kill() {
+                        return CommandResponse::Error {
+                            message: format!("failed to shut down session {session}: {error}"),
+                        };
+                    }
+                    self.sessions.remove(&session);
                     self.persisted_sessions.remove(&session);
                     self.remove_workspace_mappings_for_session(&session);
                     if self.last_session.as_deref() == Some(session.as_str()) {
@@ -1067,9 +1072,14 @@ impl SessionStore {
             };
         }
         if rebuild && let Some(existing) = self.workspace_mappings.get(&manifest_key).cloned() {
-            if let Some(session) = self.sessions.remove(&existing) {
-                let _ = session.kill();
+            if let Some(session) = self.sessions.get(&existing)
+                && let Err(error) = session.kill()
+            {
+                return CommandResponse::Error {
+                    message: format!("failed to shut down existing workspace session {existing}: {error}"),
+                };
             }
+            self.sessions.remove(&existing);
             self.persisted_sessions.remove(&existing);
             self.remove_workspace_mappings_for_session(&existing);
         }

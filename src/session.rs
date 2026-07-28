@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 
 use crate::{
     config::WindowDefaults,
@@ -864,11 +864,17 @@ impl Session {
         Ok(())
     }
 
-    pub fn kill(self) -> Result<()> {
-        for window in self.windows.into_values() {
-            for pane in window.panes.into_values() {
-                pane.process.kill()?;
+    pub fn kill(&self) -> Result<()> {
+        let mut failures = Vec::new();
+        for (window_id, window) in &self.windows {
+            for (pane_id, pane) in &window.panes {
+                if let Err(error) = pane.process.kill() {
+                    failures.push(format!("window {} pane {}: {error}", window_id.0, pane_id.0));
+                }
             }
+        }
+        if !failures.is_empty() {
+            bail!("failed to shut down session panes: {}", failures.join("; "));
         }
         Ok(())
     }
