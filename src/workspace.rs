@@ -589,15 +589,35 @@ fn write_snapshot_sidecar(snapshot: &WorkspaceSnapshot, manifest_path: &Path) ->
     fs::create_dir_all(&state_dir)
         .with_context(|| format!("failed to create {}", state_dir.display()))?;
     let gitignore = state_dir.join(".gitignore");
-    if !gitignore.exists() {
-        fs::write(&gitignore, "*\n!.gitignore\n")
-            .with_context(|| format!("failed to write {}", gitignore.display()))?;
-    }
+    ensure_snapshot_gitignore(&gitignore)?;
     let snapshot_path = workspace_snapshot_path(manifest_path);
     let raw = serde_json::to_vec_pretty(snapshot).context("failed to encode workspace snapshot")?;
     fs::write(&snapshot_path, raw)
         .with_context(|| format!("failed to write {}", snapshot_path.display()))?;
     Ok(())
+}
+
+fn ensure_snapshot_gitignore(gitignore: &Path) -> Result<()> {
+    const REQUIRED_RULES: &str = "*\n!.gitignore\n";
+
+    let existing = if gitignore.exists() {
+        fs::read_to_string(gitignore)
+            .with_context(|| format!("failed to read {}", gitignore.display()))?
+    } else {
+        String::new()
+    };
+    let rules = existing.lines().map(str::trim).collect::<Vec<_>>();
+    if rules.contains(&"*") && rules.contains(&"!.gitignore") {
+        return Ok(());
+    }
+
+    let separator = if existing.is_empty() || existing.ends_with('\n') {
+        ""
+    } else {
+        "\n"
+    };
+    fs::write(gitignore, format!("{existing}{separator}{REQUIRED_RULES}"))
+        .with_context(|| format!("failed to write {}", gitignore.display()))
 }
 
 fn export_snapshot(
@@ -962,6 +982,21 @@ command = ["cargo", "test"]
         .unwrap_err();
 
         assert!(error.to_string().contains("between 0.1 and 0.9"));
+    }
+
+    #[test]
+    fn existing_snapshot_gitignore_is_amended_to_protect_snapshot_contents() {
+        let dir = tempdir();
+        let gitignore = dir.path().join(".gitignore");
+        fs::write(&gitignore, "# retain this comment\n!.keep")
+            .expect("write existing gitignore");
+
+        ensure_snapshot_gitignore(&gitignore).expect("amend gitignore");
+
+        assert_eq!(
+            fs::read_to_string(&gitignore).expect("read gitignore"),
+            "# retain this comment\n!.keep\n*\n!.gitignore\n"
+        );
     }
 
     #[test]
