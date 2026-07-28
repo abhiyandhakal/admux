@@ -403,7 +403,7 @@ impl PaneProcess {
 
     pub fn kill(&self) -> Result<()> {
         match self.request(PaneRequest::Shutdown)? {
-            PaneResponse::Ok => Ok(()),
+            PaneResponse::Ok => wait_for_socket_removal(&self.socket_path),
             PaneResponse::Error { message } => Err(anyhow!(message)),
             other => Err(anyhow!("unexpected shutdown response: {other:?}")),
         }
@@ -1087,6 +1087,20 @@ fn wait_for_socket(socket_path: &Path) -> Result<()> {
     }
     Err(anyhow!(
         "timed out waiting for pane helper socket {}",
+        socket_path.display()
+    ))
+}
+
+fn wait_for_socket_removal(socket_path: &Path) -> Result<()> {
+    let deadline = Instant::now() + IPC_TIMEOUT;
+    while Instant::now() < deadline {
+        if !socket_path.exists() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    Err(anyhow!(
+        "timed out waiting for pane helper socket {} to close",
         socket_path.display()
     ))
 }
