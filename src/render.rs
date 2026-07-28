@@ -10,7 +10,7 @@ use crossterm::{
 };
 
 use crate::{
-    config::{DividerCharset, ResolvedUiConfig, StatusPosition, StyleConfig},
+    config::{DividerCharset, OverlayConfig, ResolvedUiConfig, StatusPosition, StyleConfig},
     copy_mode::Selection,
     ipc::{BufferSummary, PaneRender, RenderSnapshot},
     pane::Rect,
@@ -180,31 +180,17 @@ pub fn render_choose_tree<W: Write>(
         }
     }
 
-    queue_style(out, &ui.theme.chooser_border)?;
-    queue!(
-        out,
-        MoveTo(0, body_start + list_height),
-        Print(fit_width(
-            &format!(
-                " {preview_title} {}",
-                "-".repeat(
-                    size.width
-                        .saturating_sub(
-                            u16::try_from(preview_title.len())
-                                .unwrap_or(u16::MAX)
-                                .saturating_add(2),
-                        ) as usize,
-                )
-            ),
-            size.width,
-        ))
-    )?;
-    reset_style(out)?;
+    let separator = overlay_heading(preview_title, &ui.chooser, size.width);
+    if let Some(separator) = &separator {
+        queue_style(out, &ui.theme.chooser_border)?;
+        queue!(out, MoveTo(0, body_start + list_height), Print(separator))?;
+        reset_style(out)?;
+    }
     let preview_area = Rect {
         x: 0,
-        y: body_start + list_height.saturating_add(1),
+        y: body_start + list_height + u16::from(separator.is_some()),
         width: size.width,
-        height: body_height.saturating_sub(list_height.saturating_add(1)),
+        height: body_height.saturating_sub(list_height + u16::from(separator.is_some())),
     };
     if preview_area.height > 0 {
         render_preview_snapshot(out, preview_snapshot, preview_area, ui)?;
@@ -241,13 +227,21 @@ pub fn render_help_overlay<W: Write>(
     let body_height = size.height.saturating_sub(1);
     let body_start = body_start_row(ui);
 
-    for (index, line) in lines.iter().take(usize::from(body_height)).enumerate() {
+    let heading = overlay_heading("help", &ui.help, size.width);
+    if let Some(heading) = &heading {
+        queue_style(out, &ui.theme.chooser_border)?;
+        queue!(out, MoveTo(0, body_start), Print(heading))?;
+        reset_style(out)?;
+    }
+    let line_start = body_start + u16::from(heading.is_some());
+    let line_height = body_height.saturating_sub(u16::from(heading.is_some()));
+    for (index, line) in lines.iter().take(usize::from(line_height)).enumerate() {
         queue_style(out, &ui.theme.help)?;
         queue!(
             out,
             MoveTo(
                 0,
-                body_start + u16::try_from(index).expect("body height bounds index"),
+                line_start + u16::try_from(index).expect("body height bounds index"),
             ),
             Print(fit_width(line, size.width))
         )?;
@@ -313,27 +307,22 @@ pub fn render_buffer_chooser<W: Write>(
         }
     }
 
-    queue_style(out, &ui.theme.chooser_border)?;
-    queue!(
-        out,
-        MoveTo(0, body_start + list_height),
-        Print(fit_width(
-            &format!(
-                " buffers {}",
-                "-".repeat(size.width.saturating_sub(9) as usize)
-            ),
-            size.width,
-        ))
-    )?;
-    reset_style(out)?;
-    let preview_height = body_height.saturating_sub(list_height.saturating_add(1));
+    let separator = overlay_heading("buffers", &ui.chooser, size.width);
+    if let Some(separator) = &separator {
+        queue_style(out, &ui.theme.chooser_border)?;
+        queue!(out, MoveTo(0, body_start + list_height), Print(separator))?;
+        reset_style(out)?;
+    }
+    let separator_height = u16::from(separator.is_some());
+    let preview_height = body_height.saturating_sub(list_height + separator_height);
     for (offset, line) in preview
         .lines()
         .take(usize::from(preview_height))
         .enumerate()
     {
         let row = body_start
-            + list_height.saturating_add(1)
+            + list_height
+            + separator_height
             + u16::try_from(offset).expect("preview height bounds offset");
         queue_style(out, &ui.theme.help)?;
         queue!(out, MoveTo(0, row), Print(fit_width(line, size.width)))?;
@@ -498,6 +487,22 @@ fn render_preview_snapshot<W: Write>(
     }
 
     Ok(())
+}
+
+fn overlay_heading(title: &str, overlay: &OverlayConfig, width: u16) -> Option<String> {
+    if !overlay.border && !overlay.title {
+        return None;
+    }
+    let mut heading = if overlay.title {
+        format!(" {} ", terminal_safe(title))
+    } else {
+        String::new()
+    };
+    if overlay.border {
+        let heading_width = u16::try_from(display_width(&heading)).unwrap_or(u16::MAX);
+        heading.push_str(&"─".repeat(width.saturating_sub(heading_width) as usize));
+    }
+    Some(fit_width(&heading, width))
 }
 
 fn scale_rect(source: Rect, area: Rect, source_width: u16, source_height: u16) -> Rect {
@@ -1285,6 +1290,43 @@ mod tests {
         assert_eq!(chooser_viewport_start(0, 12, 8), 0);
         assert_eq!(chooser_viewport_start(8, 12, 8), 4);
         assert_eq!(chooser_viewport_start(11, 12, 8), 4);
+    }
+
+    #[test]
+    fn overlay_heading_honors_border_and_title_configuration() {
+        assert_eq!(
+            overlay_heading(
+                "buffers",
+                &OverlayConfig {
+                    border: false,
+                    title: false,
+                },
+                20,
+            ),
+            None
+        );
+        let title = overlay_heading(
+            "buffers",
+            &OverlayConfig {
+                border: false,
+                title: true,
+            },
+            20,
+        )
+        .expect("title heading");
+        assert_eq!(display_width(&title), 20);
+        assert!(title.starts_with(" buffers "));
+        let border = overlay_heading(
+            "buffers",
+            &OverlayConfig {
+                border: true,
+                title: false,
+            },
+            20,
+        )
+        .expect("border heading");
+        assert_eq!(display_width(&border), 20);
+        assert!(!border.contains("buffers"));
     }
 
     fn sample_snapshot() -> RenderSnapshot {
