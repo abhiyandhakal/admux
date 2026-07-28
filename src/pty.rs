@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs,
     io::{Read, Write},
-    os::unix::fs::FileTypeExt,
+    os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -233,9 +233,7 @@ impl PaneProcess {
         helper_dir: &Path,
         restore_seed: Option<PaneRestoreSeed>,
     ) -> Result<Self> {
-        fs::create_dir_all(helper_dir).with_context(|| {
-            format!("failed to create helper directory {}", helper_dir.display())
-        })?;
+        ensure_private_helper_directory(helper_dir)?;
         let socket_path = helper_dir.join(unique_helper_name());
         let helper_bin = resolve_helper_binary()?;
 
@@ -461,12 +459,7 @@ impl PaneProcess {
 
 pub fn run_helper(args: PaneHelperArgs) -> Result<()> {
     if let Some(parent) = args.socket.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "failed to create pane helper directory {}",
-                parent.display()
-            )
-        })?;
+        ensure_private_helper_directory(parent)?;
     }
     if args.socket.exists() {
         fs::remove_file(&args.socket).with_context(|| {
@@ -481,6 +474,12 @@ pub fn run_helper(args: PaneHelperArgs) -> Result<()> {
     let listener = UnixListener::bind(&args.socket).with_context(|| {
         format!(
             "failed to bind pane helper socket {}",
+            args.socket.display()
+        )
+    })?;
+    fs::set_permissions(&args.socket, fs::Permissions::from_mode(0o600)).with_context(|| {
+        format!(
+            "failed to restrict pane helper socket permissions {}",
             args.socket.display()
         )
     })?;
@@ -512,6 +511,23 @@ pub fn run_helper(args: PaneHelperArgs) -> Result<()> {
     }
 
     let _ = fs::remove_file(&args.socket);
+    Ok(())
+}
+
+fn ensure_private_helper_directory(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)
+        .with_context(|| format!("failed to create pane helper directory {}", path.display()))?;
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("failed to inspect pane helper directory {}", path.display()))?;
+    if !metadata.is_dir() {
+        bail!("pane helper path {} is not a directory", path.display());
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        bail!("refusing pane helper directory not owned by the effective user: {}", path.display());
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).with_context(|| {
+        format!("failed to restrict pane helper directory permissions {}", path.display())
+    })?;
     Ok(())
 }
 
@@ -1433,5 +1449,49 @@ mod tests {
             "full helper socket path should fit typical Unix-domain socket limits"
         );
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn helper_directory_and_socket_are_private() {
+        let dir = helper_dir();
+        let helper_root = dir.path().join("helpers");
+        ensure_private_helper_directory(&helper_root).expect("create private helper directory");
+        assert_eq!(
+            fs::metadata(&helper_root).expect("directory metadata").mode() & 0o777,
+            0o700
+        );
+
+        let pane = PaneProcess::spawn(
+            &["sh".into(), "-lc".into(), "sleep 1".into()],
+            None,
+            None,
+            None,
+            10_000,
+            &helper_root,
+            None,
+        )
+        .expect("spawn pane");
+        assert_eq!(
+            fs::metadata(pane.socket_path())
+                .expect("socket metadata")
+                .mode()
+                & 0o777,
+            0o600
+        );
+        pane.kill().expect("clean up pane");
+    }
+
+    #[test]
+    fn helper_directory_restricts_insecure_existing_permissions() {
+        let dir = helper_dir();
+        let helper_root = dir.path().join("insecure");
+        fs::create_dir(&helper_root).expect("create helper directory");
+        fs::set_permissions(&helper_root, fs::Permissions::from_mode(0o755))
+            .expect("make directory insecure");
+        ensure_private_helper_directory(&helper_root).expect("restrict helper directory");
+        assert_eq!(
+            fs::metadata(&helper_root).expect("directory metadata").mode() & 0o777,
+            0o700
+        );
     }
 }

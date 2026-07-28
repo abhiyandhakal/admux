@@ -3,7 +3,7 @@ use std::{
     fs,
     fs::OpenOptions,
     io::{Read, Write},
-    os::unix::{fs::{OpenOptionsExt, PermissionsExt}, io::AsRawFd},
+    os::unix::{fs::{MetadataExt, OpenOptionsExt, PermissionsExt}, io::AsRawFd},
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -1471,16 +1471,14 @@ impl SessionStore {
 
 pub fn serve(socket_path: &Path, state_path: &Path, config_path: &Path) -> Result<()> {
     if let Some(parent) = socket_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create socket directory {}", parent.display()))?;
+        ensure_private_directory(parent, "socket")?;
     }
     let _daemon_lock = acquire_daemon_lock(socket_path)?;
     let helper_dir = socket_path
         .parent()
         .map(|parent| parent.join("panes"))
         .unwrap_or_else(|| PathBuf::from("/tmp/admux-panes"));
-    fs::create_dir_all(&helper_dir)
-        .with_context(|| format!("failed to create helper directory {}", helper_dir.display()))?;
+    ensure_private_directory(&helper_dir, "helper")?;
     if socket_path.exists() {
         match UnixStream::connect(socket_path) {
             Ok(_) => bail!("admuxd is already serving {}", socket_path.display()),
@@ -1502,6 +1500,9 @@ pub fn serve(socket_path: &Path, state_path: &Path, config_path: &Path) -> Resul
 
     let listener = UnixListener::bind(socket_path)
         .with_context(|| format!("failed to bind socket {}", socket_path.display()))?;
+    fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600)).with_context(|| {
+        format!("failed to restrict daemon socket permissions {}", socket_path.display())
+    })?;
     let state = Arc::new(Mutex::new(SessionStore::with_paths(
         state_path.to_path_buf(),
         config_path.to_path_buf(),
@@ -1521,6 +1522,29 @@ pub fn serve(socket_path: &Path, state_path: &Path, config_path: &Path) -> Resul
     }
 
     bail!("listener stopped unexpectedly")
+}
+
+fn ensure_private_directory(path: &Path, kind: &str) -> Result<()> {
+    let existed = path.exists();
+    fs::create_dir_all(path)
+        .with_context(|| format!("failed to create {kind} directory {}", path.display()))?;
+    if !existed {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).with_context(|| {
+            format!("failed to restrict {kind} directory permissions {}", path.display())
+        })?;
+    }
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("failed to inspect {kind} directory {}", path.display()))?;
+    if !metadata.is_dir() {
+        bail!("{kind} path {} is not a directory", path.display());
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        bail!("refusing {kind} directory not owned by the effective user: {}", path.display());
+    }
+    if metadata.mode() & 0o077 != 0 {
+        bail!("refusing non-private {kind} directory {}", path.display());
+    }
+    Ok(())
 }
 
 fn acquire_daemon_lock(socket_path: &Path) -> Result<fs::File> {
