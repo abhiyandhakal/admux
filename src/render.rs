@@ -723,6 +723,7 @@ fn render_selection_overlay<W: Write>(
             let cell = line
                 .and_then(|line| terminal_cell_at(line, col as usize))
                 .unwrap_or(" ");
+            queue_style(out, &ui.theme.selection)?;
             queue!(
                 out,
                 MoveTo(pane.rect.x + col, offset_row(pane.rect.y + row, ui)),
@@ -1572,6 +1573,8 @@ mod tests {
     #[test]
     fn render_highlights_selected_text() {
         let mut buf = Vec::new();
+        let mut ui = sample_ui();
+        ui.theme.selection.fg = Some(ThemeColor::Red);
         render_session(
             &mut buf,
             "work",
@@ -1581,7 +1584,7 @@ mod tests {
                 pane_id: 1,
                 selection: Selection::new(0, 1, 0, 3),
             }),
-            &sample_ui(),
+            &ui,
             TerminalSize {
                 width: 20,
                 height: 6,
@@ -1591,6 +1594,7 @@ mod tests {
         let rendered = String::from_utf8_lossy(&buf);
 
         assert!(rendered.contains("\u{1b}[7m"));
+        assert!(rendered.contains("\u{1b}[31m"));
         assert!(rendered.contains("\u{1b}[1;2H"));
     }
 
