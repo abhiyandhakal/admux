@@ -305,6 +305,11 @@ impl PaneProcess {
             let _ = fs::remove_file(&args_path);
             return Err(error);
         }
+        thread::spawn(move || {
+            if let Err(error) = child.wait() {
+                eprintln!("admux: failed to reap pane helper: {error}");
+            }
+        });
         Ok(Self { socket_path })
     }
 
