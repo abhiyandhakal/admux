@@ -633,7 +633,7 @@ fn render_bottom_bar<W: Write>(
                 && message.is_none()
                 && let Some(zones) = build_tmux_status_zones(session, snapshot, ui, size.width)
             {
-                render_status_zones(out, row, &zones, size.width)?;
+                render_status_zones(out, row, &zones, ui, size.width)?;
                 return Ok(None);
             }
             render_status_line(session, snapshot, message, ui, size.width)
@@ -642,7 +642,8 @@ fn render_bottom_bar<W: Write>(
             "[copy-mode] h/j/k/l move  0/$ line  g/G top/bottom  PgUp/PgDn scroll  Space select  y copy  q quit"
         } else {
             "[copy-mode]"
-        })],
+        })
+        .styled(&ui.theme.copy_mode)],
         BottomBar::Prompt {
             buffer,
             completions,
@@ -650,6 +651,7 @@ fn render_bottom_bar<W: Write>(
             cursor,
         } => {
             let line = render_prompt_line(buffer, completions, selected, size.width);
+            queue_style(out, &ui.theme.prompt)?;
             queue!(
                 out,
                 MoveTo(0, row),
@@ -664,7 +666,7 @@ fn render_bottom_bar<W: Write>(
         }
     };
 
-    render_status_segments(out, row, &content, size.width)?;
+    render_status_segments(out, row, &content, &ui.theme.status, size.width)?;
     Ok(None)
 }
 
@@ -737,6 +739,7 @@ fn render_selection_overlay<W: Write>(
 struct StatusSegment {
     text: String,
     attrs: Vec<Attribute>,
+    style: StyleConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -753,6 +756,7 @@ impl StatusSegment {
         Self {
             text: text.into(),
             attrs: vec![Attribute::Reverse, Attribute::Bold],
+            style: StyleConfig::default(),
         }
     }
 
@@ -760,6 +764,7 @@ impl StatusSegment {
         Self {
             text: text.into(),
             attrs: vec![Attribute::Reverse],
+            style: StyleConfig::default(),
         }
     }
 
@@ -767,6 +772,7 @@ impl StatusSegment {
         Self {
             text: text.into(),
             attrs: vec![Attribute::Reverse, Attribute::Bold],
+            style: StyleConfig::default(),
         }
     }
 
@@ -774,7 +780,13 @@ impl StatusSegment {
         Self {
             text: text.into(),
             attrs: vec![Attribute::Reverse, Attribute::Bold],
+            style: StyleConfig::default(),
         }
+    }
+
+    fn styled(mut self, style: &StyleConfig) -> Self {
+        self.style = style.clone();
+        self
     }
 
     fn len(&self) -> usize {
@@ -790,7 +802,7 @@ fn render_status_line(
     width: u16,
 ) -> Vec<StatusSegment> {
     if let Some(message) = message {
-        return vec![StatusSegment::message(fit_width(message, width))];
+        return vec![StatusSegment::message(fit_width(message, width)).styled(&ui.theme.message)];
     }
 
     match ui.status_style {
@@ -812,7 +824,8 @@ fn build_minimal_status(
     snapshot: &RenderSnapshot,
     ui: &ResolvedUiConfig,
 ) -> Vec<StatusSegment> {
-    let mut segments = vec![StatusSegment::session(format!("[{session}] "))];
+    let mut segments = vec![StatusSegment::session(format!("[{session}] "))
+        .styled(&ui.theme.current_session)];
     if ui.status_show_pane {
         if let Some(pane) = snapshot
             .panes
@@ -823,13 +836,17 @@ fn build_minimal_status(
                 " pane:{}:{} ",
                 pane.pane_id,
                 terminal_safe(&pane.title)
-            )));
+            ))
+            .styled(&ui.theme.active_window));
         }
     }
     segments
 }
 
-fn render_window_segment(window: &crate::window::WindowSummary) -> StatusSegment {
+fn render_window_segment(
+    window: &crate::window::WindowSummary,
+    ui: &ResolvedUiConfig,
+) -> StatusSegment {
     let marker = if window.active {
         "*"
     } else if window.last_selected {
@@ -839,8 +856,13 @@ fn render_window_segment(window: &crate::window::WindowSummary) -> StatusSegment
     };
     if window.active {
         StatusSegment::active(format!(" {}:{}{} ", window.index, window.name, marker))
+            .styled(&ui.theme.active_window)
+    } else if window.last_selected {
+        StatusSegment::plain(format!(" {}:{}{} ", window.index, window.name, marker))
+            .styled(&ui.theme.last_window)
     } else {
         StatusSegment::plain(format!(" {}:{}{} ", window.index, window.name, marker))
+            .styled(&ui.theme.inactive_window)
     }
 }
 
@@ -851,9 +873,9 @@ fn build_tmux_status_zones(
     width: u16,
 ) -> Option<StatusZones> {
     let mut left = if ui.status.show_sessions {
-        build_session_segments(session, snapshot)
+        build_session_segments(session, snapshot, ui)
     } else {
-        vec![StatusSegment::session(format!("[{session}] "))]
+        vec![StatusSegment::session(format!("[{session}] ")).styled(&ui.theme.current_session)]
     };
     if ui.status_show_pane {
         if let Some(pane) = snapshot
@@ -865,14 +887,15 @@ fn build_tmux_status_zones(
                 " pane:{}:{} ",
                 pane.pane_id,
                 terminal_safe(&pane.title)
-            )));
+            ))
+            .styled(&ui.theme.active_window));
         }
     }
     let mut center = if ui.status.show_window_list {
         snapshot
             .windows
             .iter()
-            .map(render_window_segment)
+            .map(|window| render_window_segment(window, ui))
             .collect::<Vec<_>>()
     } else {
         Vec::new()
@@ -882,12 +905,12 @@ fn build_tmux_status_zones(
         if ui.status.show_host
             && let Some(host) = short_hostname()
         {
-            segments.push(StatusSegment::plain(format!("{host} ")));
+            segments.push(StatusSegment::plain(format!("{host} ")).styled(&ui.theme.right_status));
         }
         if ui.status.show_clock
             && let Some(clock) = local_clock()
         {
-            segments.push(StatusSegment::plain(clock));
+            segments.push(StatusSegment::plain(clock).styled(&ui.theme.right_status));
         }
         segments
     } else {
@@ -970,9 +993,13 @@ fn fit_tmux_status_layout(
     }
 }
 
-fn build_session_segments(session: &str, snapshot: &RenderSnapshot) -> Vec<StatusSegment> {
+fn build_session_segments(
+    session: &str,
+    snapshot: &RenderSnapshot,
+    ui: &ResolvedUiConfig,
+) -> Vec<StatusSegment> {
     if snapshot.sessions.is_empty() {
-        return vec![StatusSegment::session(format!("[{}] ", session))];
+        return vec![StatusSegment::session(format!("[{}] ", session)).styled(&ui.theme.current_session)];
     }
 
     snapshot
@@ -985,9 +1012,9 @@ fn build_session_segments(session: &str, snapshot: &RenderSnapshot) -> Vec<Statu
                 summary.name.clone()
             };
             if summary.name == session {
-                StatusSegment::session(format!("[{}] ", label))
+                StatusSegment::session(format!("[{}] ", label)).styled(&ui.theme.current_session)
             } else {
-                StatusSegment::plain(format!("{} ", label))
+                StatusSegment::plain(format!("{} ", label)).styled(&ui.theme.other_session)
             }
         })
         .collect()
@@ -1090,12 +1117,16 @@ fn render_status_segments<W: Write>(
     out: &mut W,
     row: u16,
     segments: &[StatusSegment],
+    base_style: &StyleConfig,
     width: u16,
 ) -> std::io::Result<()> {
-    queue!(out, MoveTo(0, row), SetAttribute(Attribute::Reverse))?;
+    queue!(out, MoveTo(0, row))?;
+    queue_style(out, base_style)?;
+    queue!(out, SetAttribute(Attribute::Reverse))?;
     let mut written = 0usize;
     for segment in segments {
         queue!(out, SetAttribute(Attribute::Reset))?;
+        queue_style(out, &segment.style)?;
         for attr in &segment.attrs {
             queue!(out, SetAttribute(*attr))?;
         }
@@ -1122,11 +1153,13 @@ fn render_status_zones<W: Write>(
     out: &mut W,
     row: u16,
     zones: &StatusZones,
+    ui: &ResolvedUiConfig,
     width: u16,
 ) -> std::io::Result<()> {
+    queue!(out, MoveTo(0, row))?;
+    queue_style(out, &ui.theme.status)?;
     queue!(
         out,
-        MoveTo(0, row),
         SetAttribute(Attribute::Reverse),
         Print(" ".repeat(width as usize)),
         SetAttribute(Attribute::Reset)
@@ -1154,6 +1187,7 @@ fn render_status_segments_at<W: Write>(
             MoveTo(written as u16, row),
             SetAttribute(Attribute::Reset)
         )?;
+        queue_style(out, &segment.style)?;
         for attr in &segment.attrs {
             queue!(out, SetAttribute(*attr))?;
         }
@@ -1351,7 +1385,7 @@ mod tests {
     use super::*;
     use crate::config::{
         DividerCharset, DividerConfig, ModeBarConfig, OverlayConfig, ResolvedUiConfig,
-        StatusConfig, StatusPosition, ThemeConfig,
+        StatusConfig, StatusPosition, ThemeColor, ThemeConfig,
     };
     use crate::ipc::{PaneCursor, PaneRender, RenderSnapshot};
     use crate::layout::{LayoutTree, SplitAxis};
@@ -1839,6 +1873,23 @@ mod tests {
             .map(|segment| segment.text)
             .collect::<String>();
         assert!(!hidden.contains("pane:1:shell"));
+    }
+
+    #[test]
+    fn status_segments_use_the_configured_theme_styles() {
+        let mut ui = sample_ui();
+        ui.theme.current_session.fg = Some(ThemeColor::Red);
+        ui.theme.other_session.fg = Some(ThemeColor::Blue);
+        ui.theme.active_window.bg = Some(ThemeColor::Green);
+        ui.theme.right_status.dim = true;
+
+        let zones = build_tmux_status_zones("work", &sample_snapshot(), &ui, 120)
+            .expect("status zones");
+
+        assert_eq!(zones.left[0].style.fg, Some(ThemeColor::Red));
+        assert_eq!(zones.left[1].style.fg, Some(ThemeColor::Blue));
+        assert_eq!(zones.left[2].style.bg, Some(ThemeColor::Green));
+        assert!(zones.right.iter().all(|segment| segment.style.dim));
     }
 
     #[test]
