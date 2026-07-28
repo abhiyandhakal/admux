@@ -53,8 +53,13 @@ use crate::{
     window::WindowSummary,
 };
 
-const ATTACH_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+const ATTACH_INPUT_POLL_INTERVAL: Duration = Duration::from_millis(16);
+const SNAPSHOT_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
 const ALT_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(150);
+
+fn snapshot_refresh_due(elapsed: Duration) -> bool {
+    elapsed >= SNAPSHOT_REFRESH_INTERVAL
+}
 
 #[derive(Debug, Clone)]
 struct PromptState {
@@ -896,6 +901,7 @@ fn run_attach_loop(
     let mut overlay = OverlayState::None;
     let mut snapshot = fetch_attach_snapshot(paths, &mut current_session, &mut last_size, 80, 24)?;
     let mut snapshot_dirty = false;
+    let mut render_dirty = true;
     let mut last_snapshot_refresh = Instant::now();
     let mut pending_event = None;
     let mut event_logger = event_logger;
@@ -914,13 +920,19 @@ fn run_attach_loop(
                 },
             )?;
             last_size = (rows, cols);
-            snapshot =
+            let updated =
                 fetch_attach_snapshot(paths, &mut current_session, &mut last_size, width, height)?;
+            render_dirty |= updated != snapshot;
+            render_dirty |= matches!(overlay, OverlayState::ChooseTree(_));
+            snapshot = updated;
             snapshot_dirty = false;
             last_snapshot_refresh = Instant::now();
-        } else if snapshot_dirty && last_snapshot_refresh.elapsed() >= ATTACH_FRAME_INTERVAL {
-            snapshot =
+        } else if snapshot_dirty && snapshot_refresh_due(last_snapshot_refresh.elapsed()) {
+            let updated =
                 fetch_attach_snapshot(paths, &mut current_session, &mut last_size, width, height)?;
+            render_dirty |= updated != snapshot;
+            render_dirty |= matches!(overlay, OverlayState::ChooseTree(_));
+            snapshot = updated;
             snapshot_dirty = false;
             last_snapshot_refresh = Instant::now();
         }
@@ -953,7 +965,8 @@ fn run_attach_loop(
             }
         }
 
-        match &mut overlay {
+        if render_dirty {
+            match &mut overlay {
             OverlayState::None => {
                 render_session(
                     stdout,
@@ -1019,12 +1032,24 @@ fn run_attach_loop(
                     TerminalSize { width, height },
                 )?;
             }
+            }
+            render_dirty = false;
         }
-        if !event::poll(ATTACH_FRAME_INTERVAL).context("failed to poll terminal events")? {
-            snapshot =
-                fetch_attach_snapshot(paths, &mut current_session, &mut last_size, width, height)?;
-            snapshot_dirty = false;
-            last_snapshot_refresh = Instant::now();
+        if !event::poll(ATTACH_INPUT_POLL_INTERVAL).context("failed to poll terminal events")? {
+            if snapshot_refresh_due(last_snapshot_refresh.elapsed()) {
+                let updated = fetch_attach_snapshot(
+                    paths,
+                    &mut current_session,
+                    &mut last_size,
+                    width,
+                    height,
+                )?;
+                render_dirty |= updated != snapshot;
+                render_dirty |= matches!(overlay, OverlayState::ChooseTree(_));
+                snapshot = updated;
+                snapshot_dirty = false;
+                last_snapshot_refresh = Instant::now();
+            }
             continue;
         }
 
@@ -1477,16 +1502,20 @@ fn run_attach_loop(
             Event::FocusGained | Event::FocusLost => {}
         }
 
+        render_dirty = true;
         if needs_refresh {
             snapshot_dirty = true;
-            if refresh_before_next_input || last_snapshot_refresh.elapsed() >= ATTACH_FRAME_INTERVAL {
-                snapshot = fetch_attach_snapshot(
+            if refresh_before_next_input
+                || snapshot_refresh_due(last_snapshot_refresh.elapsed())
+            {
+                let updated = fetch_attach_snapshot(
                     paths,
                     &mut current_session,
                     &mut last_size,
                     width,
                     height,
                 )?;
+                snapshot = updated;
                 snapshot_dirty = false;
                 last_snapshot_refresh = Instant::now();
             }
@@ -3950,6 +3979,12 @@ root = { command = ["sh"] }
 
         assert_eq!(current_session, "logs");
         assert_eq!(last_size, (0, 0));
+    }
+
+    #[test]
+    fn idle_snapshot_refresh_is_not_tied_to_input_poll_frequency() {
+        assert!(!snapshot_refresh_due(Duration::from_millis(99)));
+        assert!(snapshot_refresh_due(Duration::from_millis(100)));
     }
 
     #[test]
