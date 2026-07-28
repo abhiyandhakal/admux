@@ -1476,11 +1476,49 @@ fn unique_helper_args_name() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ops::Deref;
     use std::{thread, time::Duration};
     use tempfile::{TempDir, tempdir as make_tempdir};
 
     fn helper_dir() -> TempDir {
         make_tempdir().expect("tempdir")
+    }
+
+    struct TestPane(PaneProcess);
+
+    impl Deref for TestPane {
+        type Target = PaneProcess;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl Drop for TestPane {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+        }
+    }
+
+    fn spawn_test_pane(
+        command: &[String],
+        cwd: Option<&std::path::Path>,
+        admux_context: Option<(&str, WindowId, PaneId)>,
+        default_shell: Option<&str>,
+        scrollback_lines: usize,
+        helper_dir: &std::path::Path,
+        restore_seed: Option<PaneRestoreSeed>,
+    ) -> Result<TestPane> {
+        PaneProcess::spawn(
+            command,
+            cwd,
+            admux_context,
+            default_shell,
+            scrollback_lines,
+            helper_dir,
+            restore_seed,
+        )
+        .map(TestPane)
     }
 
     #[test]
@@ -1496,6 +1534,26 @@ mod tests {
     #[test]
     fn send_keys_preserves_literal_text() {
         assert_eq!(encode_send_key("echo hello"), b"echo hello".to_vec());
+    }
+
+    #[test]
+    fn test_pane_guard_shuts_down_its_helper() {
+        let dir = helper_dir();
+        let socket = {
+            let pane = spawn_test_pane(
+                &["sh".into(), "-lc".into(), "sleep 1".into()],
+                None,
+                None,
+                None,
+                10_000,
+                dir.path(),
+                None,
+            )
+            .expect("spawn pane");
+            pane.socket_path().to_path_buf()
+        };
+
+        assert!(!socket.exists());
     }
 
     #[test]
@@ -1652,7 +1710,7 @@ mod tests {
     #[test]
     fn pane_process_can_move_to_scrollback_bounds() {
         let dir = helper_dir();
-        let pane = PaneProcess::spawn(
+        let pane = spawn_test_pane(
             &[
                 "sh".into(),
                 "-lc".into(),
@@ -1736,7 +1794,7 @@ mod tests {
     #[test]
     fn stalled_helper_client_does_not_block_other_requests() {
         let dir = helper_dir();
-        let pane = PaneProcess::spawn(
+        let pane = spawn_test_pane(
             &["sh".into(), "-lc".into(), "sleep 2".into()],
             None,
             None,
@@ -1855,7 +1913,7 @@ mod tests {
     #[test]
     fn pane_process_captures_command_output() {
         let dir = helper_dir();
-        let pane = PaneProcess::spawn(
+        let pane = spawn_test_pane(
             &["sh".into(), "-lc".into(), "printf 'hello from pane'".into()],
             None,
             None,
@@ -1872,7 +1930,7 @@ mod tests {
     #[test]
     fn pane_process_accepts_restore_data_larger_than_a_command_argument() {
         let dir = helper_dir();
-        let pane = PaneProcess::spawn(
+        let pane = spawn_test_pane(
             &["sh".into(), "-lc".into(), "sleep 1".into()],
             None,
             None,
@@ -1896,7 +1954,7 @@ mod tests {
     #[test]
     fn pane_process_handles_clear_screen_sequences() {
         let dir = helper_dir();
-        let pane = PaneProcess::spawn(
+        let pane = spawn_test_pane(
             &[
                 "sh".into(),
                 "-lc".into(),
@@ -1919,7 +1977,7 @@ mod tests {
     #[test]
     fn pane_snapshot_reports_application_cursor_mode() {
         let dir = helper_dir();
-        let pane = PaneProcess::spawn(
+        let pane = spawn_test_pane(
             &[
                 "sh".into(),
                 "-lc".into(),
@@ -1952,7 +2010,7 @@ mod tests {
     #[test]
     fn pane_process_restores_history_after_expanding() {
         let dir = helper_dir();
-        let pane = PaneProcess::spawn(
+        let pane = spawn_test_pane(
             &[
                 "sh".into(),
                 "-lc".into(),
@@ -1982,7 +2040,7 @@ mod tests {
     #[test]
     fn pane_process_replays_history_when_one_resize_axis_expands() {
         let dir = helper_dir();
-        let pane = PaneProcess::spawn(
+        let pane = spawn_test_pane(
             &[
                 "sh".into(),
                 "-lc".into(),
@@ -2011,7 +2069,7 @@ mod tests {
     #[test]
     fn pane_resize_retains_scrollback_beyond_the_legacy_history_cap() {
         let dir = helper_dir();
-        let pane = PaneProcess::spawn(
+        let pane = spawn_test_pane(
             &[
                 "sh".into(),
                 "-lc".into(),
@@ -2042,7 +2100,7 @@ mod tests {
     #[test]
     fn pane_process_can_reconnect_to_existing_helper() {
         let dir = helper_dir();
-        let pane = PaneProcess::spawn(
+        let pane = spawn_test_pane(
             &[
                 "sh".into(),
                 "-lc".into(),
@@ -2065,7 +2123,7 @@ mod tests {
     #[test]
     fn scrollback_reports_helper_transport_failures() {
         let dir = helper_dir();
-        let pane = PaneProcess::spawn(
+        let pane = spawn_test_pane(
             &["sh".into(), "-lc".into(), "sleep 1".into()],
             None,
             None,
@@ -2088,7 +2146,7 @@ mod tests {
     #[test]
     fn selection_text_reports_helper_transport_failures() {
         let dir = helper_dir();
-        let pane = PaneProcess::spawn(
+        let pane = spawn_test_pane(
             &["sh".into(), "-lc".into(), "printf selected; sleep 1".into()],
             None,
             None,
@@ -2111,7 +2169,7 @@ mod tests {
     #[test]
     fn pane_process_can_restore_persistent_snapshot() {
         let dir = helper_dir();
-        let pane = PaneProcess::spawn(
+        let pane = spawn_test_pane(
             &[
                 "sh".into(),
                 "-lc".into(),
@@ -2127,7 +2185,7 @@ mod tests {
         .expect("spawn pane");
         assert!(wait_for_preview(&pane, "snapshot-two").contains("snapshot-two"));
         let snapshot = pane.persistent_snapshot(500).expect("persistent snapshot");
-        let restored = PaneProcess::spawn(
+        let restored = spawn_test_pane(
             &["sh".into(), "-lc".into(), "sleep 1".into()],
             None,
             None,
@@ -2145,7 +2203,7 @@ mod tests {
     #[test]
     fn persistent_snapshot_does_not_include_runtime_command_metadata() {
         let dir = helper_dir();
-        let pane = PaneProcess::spawn(
+        let pane = spawn_test_pane(
             &["sh".into(), "-lc".into(), "exec sleep 3".into()],
             None,
             None,
@@ -2189,7 +2247,7 @@ mod tests {
             0o700
         );
 
-        let pane = PaneProcess::spawn(
+        let pane = spawn_test_pane(
             &["sh".into(), "-lc".into(), "sleep 1".into()],
             None,
             None,
