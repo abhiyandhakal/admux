@@ -76,6 +76,14 @@ impl InputState {
     }
 
     pub fn handle_key(&mut self, event: KeyEvent) -> InputAction {
+        self.handle_key_with_application_cursor(event, false)
+    }
+
+    pub fn handle_key_with_application_cursor(
+        &mut self,
+        event: KeyEvent,
+        application_cursor: bool,
+    ) -> InputAction {
         match self.mode {
             InputMode::Normal => {
                 if config::key_event_matches(&self.keymap.prefix, event) {
@@ -84,12 +92,16 @@ impl InputState {
                 } else if let Some(action) = self.resolve(&self.keymap.normal, event) {
                     self.map_action(action)
                 } else {
-                    key_to_bytes(event)
+                    key_to_bytes(event, application_cursor)
                 }
             }
             InputMode::Leader => {
                 self.mode = InputMode::Normal;
-                if let Some(action) = self.resolve(&self.keymap.leader, event) {
+                if config::key_event_matches(&self.keymap.prefix, event) {
+                    // Match tmux's prefix-prefix convention: the second prefix
+                    // key is delivered to the foreground application.
+                    key_to_bytes(event, application_cursor)
+                } else if let Some(action) = self.resolve(&self.keymap.leader, event) {
                     match action {
                         Action::EnterCopyMode => {
                             self.mode = InputMode::CopyMode;
@@ -179,15 +191,10 @@ impl InputState {
     }
 }
 
-fn key_to_bytes(event: KeyEvent) -> InputAction {
+fn key_to_bytes(event: KeyEvent, application_cursor: bool) -> InputAction {
     match event.code {
         KeyCode::Char(ch) if event.modifiers.contains(KeyModifiers::CONTROL) => {
-            let ascii = ch.to_ascii_lowercase() as u8;
-            if ascii.is_ascii_lowercase() {
-                InputAction::SendBytes(vec![ascii - b'a' + 1])
-            } else {
-                InputAction::Noop
-            }
+            control_character_bytes(ch, event.modifiers)
         }
         KeyCode::Char(ch) if event.modifiers.contains(KeyModifiers::ALT) => {
             let mut bytes = vec![0x1b];
@@ -199,15 +206,100 @@ fn key_to_bytes(event: KeyEvent) -> InputAction {
         KeyCode::Enter => InputAction::SendBytes(vec![b'\r']),
         KeyCode::Tab => InputAction::SendBytes(vec![b'\t']),
         KeyCode::Backspace => InputAction::SendBytes(vec![0x7f]),
-        KeyCode::Left => InputAction::SendBytes(b"\x1b[D".to_vec()),
-        KeyCode::Right => InputAction::SendBytes(b"\x1b[C".to_vec()),
-        KeyCode::Up => InputAction::SendBytes(b"\x1b[A".to_vec()),
-        KeyCode::Down => InputAction::SendBytes(b"\x1b[B".to_vec()),
-        KeyCode::Home => InputAction::SendBytes(b"\x1b[H".to_vec()),
-        KeyCode::End => InputAction::SendBytes(b"\x1b[F".to_vec()),
-        KeyCode::Delete => InputAction::SendBytes(b"\x1b[3~".to_vec()),
+        KeyCode::Left => cursor_key_bytes('D', event.modifiers, application_cursor),
+        KeyCode::Right => cursor_key_bytes('C', event.modifiers, application_cursor),
+        KeyCode::Up => cursor_key_bytes('A', event.modifiers, application_cursor),
+        KeyCode::Down => cursor_key_bytes('B', event.modifiers, application_cursor),
+        KeyCode::Home => csi_cursor_key_bytes('H', event.modifiers),
+        KeyCode::End => csi_cursor_key_bytes('F', event.modifiers),
+        KeyCode::Insert => csi_tilde_key_bytes(2, event.modifiers),
+        KeyCode::Delete => csi_tilde_key_bytes(3, event.modifiers),
+        KeyCode::PageUp => csi_tilde_key_bytes(5, event.modifiers),
+        KeyCode::PageDown => csi_tilde_key_bytes(6, event.modifiers),
+        KeyCode::F(number) => function_key_bytes(number, event.modifiers),
         _ => InputAction::Noop,
     }
+}
+
+fn control_character_bytes(ch: char, modifiers: KeyModifiers) -> InputAction {
+    let ascii = ch.to_ascii_lowercase() as u8;
+    let byte = match ascii {
+        b'a'..=b'z' => ascii - b'a' + 1,
+        b'@' | b' ' => 0x00,
+        b'[' => 0x1b,
+        b'\\' => 0x1c,
+        b']' => 0x1d,
+        b'^' => 0x1e,
+        b'_' => 0x1f,
+        b'?' => 0x7f,
+        _ => return InputAction::Noop,
+    };
+    let mut bytes = Vec::with_capacity(2);
+    if modifiers.contains(KeyModifiers::ALT) {
+        bytes.push(0x1b);
+    }
+    bytes.push(byte);
+    InputAction::SendBytes(bytes)
+}
+
+fn function_key_bytes(number: u8, modifiers: KeyModifiers) -> InputAction {
+    let modifier = xterm_modifier_parameter(modifiers);
+    let sequence = match (number, modifier) {
+        (1, None) => "\x1bOP".to_string(),
+        (2, None) => "\x1bOQ".to_string(),
+        (3, None) => "\x1bOR".to_string(),
+        (4, None) => "\x1bOS".to_string(),
+        (1..=4, Some(modifier)) => format!("\x1b[1;{modifier}{}", (b'P' + number - 1) as char),
+        (5, None) => "\x1b[15~".to_string(),
+        (6, None) => "\x1b[17~".to_string(),
+        (7, None) => "\x1b[18~".to_string(),
+        (8, None) => "\x1b[19~".to_string(),
+        (9, None) => "\x1b[20~".to_string(),
+        (10, None) => "\x1b[21~".to_string(),
+        (11, None) => "\x1b[23~".to_string(),
+        (12, None) => "\x1b[24~".to_string(),
+        (5..=12, Some(modifier)) => {
+            let code = [15, 17, 18, 19, 20, 21, 23, 24][(number - 5) as usize];
+            format!("\x1b[{code};{modifier}~")
+        }
+        _ => return InputAction::Noop,
+    };
+    InputAction::SendBytes(sequence.into_bytes())
+}
+
+fn csi_cursor_key_bytes(final_byte: char, modifiers: KeyModifiers) -> InputAction {
+    let sequence = match xterm_modifier_parameter(modifiers) {
+        Some(modifier) => format!("\x1b[1;{modifier}{final_byte}"),
+        None => format!("\x1b[{final_byte}"),
+    };
+    InputAction::SendBytes(sequence.into_bytes())
+}
+
+fn cursor_key_bytes(
+    final_byte: char,
+    modifiers: KeyModifiers,
+    application_cursor: bool,
+) -> InputAction {
+    if application_cursor && xterm_modifier_parameter(modifiers).is_none() {
+        return InputAction::SendBytes(format!("\x1bO{final_byte}").into_bytes());
+    }
+    csi_cursor_key_bytes(final_byte, modifiers)
+}
+
+fn csi_tilde_key_bytes(code: u8, modifiers: KeyModifiers) -> InputAction {
+    let sequence = match xterm_modifier_parameter(modifiers) {
+        Some(modifier) => format!("\x1b[{code};{modifier}~"),
+        None => format!("\x1b[{code}~"),
+    };
+    InputAction::SendBytes(sequence.into_bytes())
+}
+
+fn xterm_modifier_parameter(modifiers: KeyModifiers) -> Option<u8> {
+    let shift = modifiers.contains(KeyModifiers::SHIFT) as u8;
+    let alt = modifiers.contains(KeyModifiers::ALT) as u8;
+    let control = modifiers.contains(KeyModifiers::CONTROL) as u8;
+    let value = 1 + shift + 2 * alt + 4 * control;
+    (value != 1).then_some(value)
 }
 
 #[cfg(test)]
@@ -244,6 +336,14 @@ mod tests {
     }
 
     #[test]
+    fn pressing_the_prefix_twice_forwards_it_to_the_pane() {
+        let mut state = configured_state("");
+        let prefix = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        assert_eq!(state.handle_key(prefix), InputAction::Noop);
+        assert_eq!(state.handle_key(prefix), InputAction::SendBytes(vec![0x02]));
+    }
+
+    #[test]
     fn escape_is_forwarded_to_the_pane() {
         let mut state = configured_state("");
         assert_eq!(
@@ -253,11 +353,71 @@ mod tests {
     }
 
     #[test]
+    fn application_cursor_mode_uses_ss3_for_unmodified_arrows() {
+        let mut state = configured_state("");
+        assert_eq!(
+            state.handle_key_with_application_cursor(
+                KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+                true,
+            ),
+            InputAction::SendBytes(b"\x1bOA".to_vec())
+        );
+        assert_eq!(
+            state.handle_key_with_application_cursor(
+                KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL),
+                true,
+            ),
+            InputAction::SendBytes(b"\x1b[1;5A".to_vec())
+        );
+    }
+
+    #[test]
     fn alt_key_is_forwarded_as_escape_sequence() {
         let mut state = configured_state("");
         assert_eq!(
             state.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::ALT)),
             InputAction::SendBytes(vec![0x1b, b'j'])
+        );
+    }
+
+    #[test]
+    fn forwards_extended_terminal_keys_and_modifiers() {
+        let mut state = configured_state("");
+        assert_eq!(
+            state.handle_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE)),
+            InputAction::SendBytes(b"\x1b[15~".to_vec())
+        );
+        assert_eq!(
+            state.handle_key(KeyEvent::new(KeyCode::F(12), KeyModifiers::ALT)),
+            InputAction::SendBytes(b"\x1b[24;3~".to_vec())
+        );
+        assert_eq!(
+            state.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::CONTROL)),
+            InputAction::SendBytes(b"\x1b[6;5~".to_vec())
+        );
+        assert_eq!(
+            state.handle_key(KeyEvent::new(KeyCode::Insert, KeyModifiers::NONE)),
+            InputAction::SendBytes(b"\x1b[2~".to_vec())
+        );
+        assert_eq!(
+            state.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT)),
+            InputAction::SendBytes(b"\x1b[1;3D".to_vec())
+        );
+    }
+
+    #[test]
+    fn forwards_control_punctuation() {
+        let mut state = configured_state("");
+        assert_eq!(
+            state.handle_key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::CONTROL)),
+            InputAction::SendBytes(vec![0x1b])
+        );
+        assert_eq!(
+            state.handle_key(KeyEvent::new(
+                KeyCode::Char('?'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            )),
+            InputAction::SendBytes(vec![0x1b, 0x7f])
         );
     }
 

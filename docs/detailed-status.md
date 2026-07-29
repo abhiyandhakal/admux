@@ -10,8 +10,7 @@
 ### Configuration and paths
 
 - TOML config parsing with defaults in `src/config.rs`
-- XDG-aware path resolution with `ADMUX_SOCKET` and `ADMUX_CONFIG` overrides in `src/paths.rs`
-- persistent metadata path resolution via `state.json` in `src/paths.rs`
+- XDG-aware socket, config, and metadata paths with independent `ADMUX_SOCKET`, `ADMUX_CONFIG`, and `ADMUX_STATE` overrides in `src/paths.rs`
 - UI config includes statusline position plus legacy compatibility knobs from the earlier custom statusline
 
 ### Protocol and daemon
@@ -26,10 +25,10 @@
 - PTY-backed command spawning through `portable-pty`
 - per-pane `admux-pane` helper processes now own PTYs so live panes survive `admuxd` restart
 - session now owns ordered windows and each window owns a split-tree of panes
-- pane numbers are window-local, starting at `0` in each window and remaining stable for the pane lifetime
+- pane numbers are window-local and stable for the pane lifetime; public window/pane bases default to `1` and can be configured under `[behavior]`
 - VT100-backed screen parsing of PTY output
 - pane output capture for clipped pane regions and attach previews from parsed screen state
-- pane/window/session cleanup when child processes exit
+- bounded liveness pruning removes exited panes and shuts down their helpers; explicit pane/window/session kills perform shutdown immediately
 - resize path from the client into all pane PTYs plus stored viewport geometry
 - PTY resize handling now keeps the current screen stable while shrinking and rebuilds from raw history when panes expand again
 - session/window/pane metadata persists across daemon restarts
@@ -54,7 +53,7 @@
   - prompt, copy mode, chooser, and help repurpose the single status row instead of mixing normal status content with mode text
   - `status_position` now works for both top and bottom placement, including cursor/mouse/body offsets
   - `Ctrl-b d` detach
-  - `Ctrl-b 0` through `Ctrl-b 9` window index selection
+  - `Ctrl-b 1` through `Ctrl-b 9` window selection by the default public numbering (adjusted when `behavior.window_base` changes)
   - `Ctrl-b :` status-row command prompt with tmux-style command names and completion
   - `Ctrl-b s` tmux-like chooser with a stacked session list and pane preview grid
   - chooser starts collapsed and supports `Tab` plus `+` / `-` expand-collapse controls

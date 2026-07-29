@@ -8,29 +8,74 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use tempfile::tempdir;
+use tempfile::{TempDir, tempdir as make_tempdir};
 
-fn spawn_daemon(socket: &Path) -> Child {
+fn tempdir() -> TempDir {
+    make_tempdir().expect("tempdir")
+}
+
+struct DaemonGuard {
+    child: Child,
+    socket: std::path::PathBuf,
+    config: std::path::PathBuf,
+}
+
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let output = StdCommand::new(env!("CARGO_BIN_EXE_admux"))
+                .env("ADMUX_SOCKET", &self.socket)
+                .env("ADMUX_CONFIG", &self.config)
+                .arg("ls")
+                .output();
+            if let Ok(output) = output {
+                for session in String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .filter_map(|line| line.split_whitespace().next())
+                {
+                    let _ = StdCommand::new(env!("CARGO_BIN_EXE_admux"))
+                        .env("ADMUX_SOCKET", &self.socket)
+                        .env("ADMUX_CONFIG", &self.config)
+                        .args(["kill", session])
+                        .output();
+                }
+            }
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+fn spawn_daemon(socket: &Path, state: &Path, config: &Path) -> DaemonGuard {
     let child = StdCommand::new(env!("CARGO_BIN_EXE_admuxd"))
         .arg("serve")
         .arg("--socket")
         .arg(socket)
+        .arg("--state")
+        .arg(state)
+        .arg("--config")
+        .arg(config)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn admuxd");
     assert!(wait_for_path(socket, Duration::from_secs(2)));
-    child
+    DaemonGuard {
+        child,
+        socket: socket.to_path_buf(),
+        config: config.to_path_buf(),
+    }
 }
 
 #[test]
 fn daemon_backed_cli_can_manage_sessions() {
-    let temp = tempdir().expect("tempdir");
+    let temp = tempdir();
     let socket = temp.path().join("runtime").join("admux.sock");
     let config = temp.path().join("config.toml");
     std::fs::write(&config, "").expect("write config");
-    let mut daemon = spawn_daemon(&socket);
+    let state = temp.path().join("state.json");
+    let _daemon = spawn_daemon(&socket, &state, &config);
 
     Command::new(env!("CARGO_BIN_EXE_admux"))
         .env("ADMUX_SOCKET", &socket)
@@ -86,13 +131,11 @@ fn daemon_backed_cli_can_manage_sessions() {
         .success()
         .stdout(predicate::str::contains("killed work"));
 
-    let _ = daemon.kill();
-    let _ = daemon.wait();
 }
 
 #[test]
 fn daemon_backed_cli_can_bootstrap_workspace_manifest() {
-    let temp = tempdir().expect("tempdir");
+    let temp = tempdir();
     let socket = temp.path().join("runtime").join("admux.sock");
     let config = temp.path().join("config.toml");
     let workspace = temp.path().join("admux.toml");
@@ -115,7 +158,8 @@ root = { command = ["sh", "-lc", "printf tests-ready; sleep 2"] }
 "#,
     )
     .expect("write workspace");
-    let mut daemon = spawn_daemon(&socket);
+    let state = temp.path().join("state.json");
+    let _daemon = spawn_daemon(&socket, &state, &config);
 
     Command::new(env!("CARGO_BIN_EXE_admux"))
         .current_dir(temp.path())
@@ -144,13 +188,100 @@ root = { command = ["sh", "-lc", "printf tests-ready; sleep 2"] }
         .success()
         .stdout(predicate::str::contains("workspace shared-work attached"));
 
-    let _ = daemon.kill();
-    let _ = daemon.wait();
+}
+
+#[test]
+fn daemon_backed_cli_can_launch_workspace_alias() {
+    let temp = tempdir();
+    let socket = temp.path().join("runtime").join("admux.sock");
+    let config = temp.path().join("config.toml");
+    let aliases = temp.path().join("aliases.json");
+    let workspace = temp.path().join("admux.toml");
+    fs::write(&config, "").expect("write config");
+    fs::write(
+        &workspace,
+        r#"
+version = 1
+
+[workspace]
+name = "shared-work"
+
+[[windows]]
+name = "editor"
+root = { command = ["sh", "-lc", "printf editor-ready; sleep 2"] }
+"#,
+    )
+    .expect("write workspace");
+    let state = temp.path().join("state.json");
+    let _daemon = spawn_daemon(&socket, &state, &config);
+
+    Command::new(env!("CARGO_BIN_EXE_admux"))
+        .env("ADMUX_SOCKET", &socket)
+        .env("ADMUX_CONFIG", &config)
+        .env("ADMUX_ALIASES", &aliases)
+        .args([
+            "alias",
+            "add",
+            "demo",
+            workspace.to_str().expect("utf8 path"),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("added alias demo"));
+
+    Command::new(env!("CARGO_BIN_EXE_admux"))
+        .env("ADMUX_SOCKET", &socket)
+        .env("ADMUX_CONFIG", &config)
+        .env("ADMUX_ALIASES", &aliases)
+        .args(["alias", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("demo"))
+        .stdout(predicate::str::contains("admux.toml"));
+
+    Command::new(env!("CARGO_BIN_EXE_admux"))
+        .current_dir(temp.path())
+        .env("ADMUX_SOCKET", &socket)
+        .env("ADMUX_CONFIG", &config)
+        .env("ADMUX_ALIASES", &aliases)
+        .arg("demo")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("workspace shared-work ready"));
+
+    Command::new(env!("CARGO_BIN_EXE_admux"))
+        .current_dir(temp.path())
+        .env("ADMUX_SOCKET", &socket)
+        .env("ADMUX_CONFIG", &config)
+        .env("ADMUX_ALIASES", &aliases)
+        .arg("demo")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("workspace shared-work attached"));
+
+    Command::new(env!("CARGO_BIN_EXE_admux"))
+        .env("ADMUX_SOCKET", &socket)
+        .env("ADMUX_CONFIG", &config)
+        .env("ADMUX_ALIASES", &aliases)
+        .args(["alias", "remove", "demo"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("removed alias demo"));
+
+    Command::new(env!("CARGO_BIN_EXE_admux"))
+        .env("ADMUX_SOCKET", &socket)
+        .env("ADMUX_CONFIG", &config)
+        .env("ADMUX_ALIASES", &aliases)
+        .arg("demo")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unrecognized subcommand"));
+
 }
 
 #[test]
 fn save_writes_workspace_manifest_into_session_directory() {
-    let temp = tempdir().expect("tempdir");
+    let temp = tempdir();
     let socket = temp.path().join("runtime").join("admux.sock");
     let config = temp.path().join("config.toml");
     let session_dir = temp.path().join("project");
@@ -158,7 +289,8 @@ fn save_writes_workspace_manifest_into_session_directory() {
     fs::create_dir_all(&session_dir).expect("session dir");
     fs::create_dir_all(&other_dir).expect("other dir");
     fs::write(&config, "").expect("write config");
-    let mut daemon = spawn_daemon(&socket);
+    let state = temp.path().join("state.json");
+    let _daemon = spawn_daemon(&socket, &state, &config);
 
     Command::new(env!("CARGO_BIN_EXE_admux"))
         .env("ADMUX_SOCKET", &socket)
@@ -231,19 +363,18 @@ fn save_writes_workspace_manifest_into_session_directory() {
     assert!(raw.contains("name = \"logs\""));
     assert!(raw.contains("direction = \"vertical\""));
 
-    let _ = daemon.kill();
-    let _ = daemon.wait();
 }
 
 #[test]
 fn workspace_save_and_up_restore_snapshot_sidecar() {
-    let temp = tempdir().expect("tempdir");
+    let temp = tempdir();
     let socket = temp.path().join("runtime").join("admux.sock");
     let config = temp.path().join("config.toml");
     let session_dir = temp.path().join("project");
     fs::create_dir_all(&session_dir).expect("session dir");
     fs::write(&config, "").expect("write config");
-    let mut daemon = spawn_daemon(&socket);
+    let state = temp.path().join("state.json");
+    let _daemon = spawn_daemon(&socket, &state, &config);
 
     Command::new(env!("CARGO_BIN_EXE_admux"))
         .env("ADMUX_SOCKET", &socket)
@@ -268,7 +399,7 @@ fn workspace_save_and_up_restore_snapshot_sidecar() {
             "send-keys",
             "snapshot-work",
             "printf snapshot-visible",
-            "\n",
+            "Enter",
         ])
         .assert()
         .success();
@@ -353,6 +484,4 @@ fn workspace_save_and_up_restore_snapshot_sidecar() {
         .stdout(predicate::str::contains("attached snapshot-work"))
         .stdout(predicate::str::contains("snapshot-visible").not());
 
-    let _ = daemon.kill();
-    let _ = daemon.wait();
 }

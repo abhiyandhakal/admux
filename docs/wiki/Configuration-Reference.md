@@ -8,6 +8,14 @@ Global config lives at:
 
 `admux` keeps config intentionally grouped and typed.
 
+For isolated runs and tests, the runtime paths can be overridden independently:
+
+```text
+ADMUX_SOCKET=/path/to/admux.sock
+ADMUX_CONFIG=/path/to/config.toml
+ADMUX_STATE=/path/to/state.json
+```
+
 ## Main Sections
 
 - `[ui]`
@@ -15,6 +23,7 @@ Global config lives at:
 - `[ui.dividers]`
 - `[ui.theme.*]`
 - `[mouse]`
+- `[clipboard]`
 - `[behavior]`
 - `[defaults.session]`
 - `[defaults.window]`
@@ -28,6 +37,9 @@ Global config lives at:
 ```toml
 [ui]
 status_position = "bottom"
+# "tmux-plus" is the default multi-zone bar; "minimal" shows only the
+# current session and optional active-pane segment.
+status_style = "tmux-plus"
 
 [ui.status]
 show_sessions = true
@@ -42,12 +54,20 @@ selection_copy = true
 border_resize = true
 wheel_scroll = true
 
+[clipboard]
+# The default is "osc52". For a local clipboard integration, configure an
+# explicit command that accepts copied text on stdin.
+backend = "external-command"
+command = ["wl-copy", "--type", "text/plain"]
+
 [behavior]
 default_shell = "/bin/zsh"
 scrollback_lines = 10000
 workspace_snapshot_lines = 500
 resize_step = 25
 copy_page_size = 20
+window_base = 1
+pane_base = 1
 
 [defaults.session]
 name_prefix = "work"
@@ -63,6 +83,7 @@ leader = "Ctrl-b"
 ## Notes
 
 - `admux reload-config` reloads UI/keybinding behavior plus future creation defaults
+- `ui.status_style` accepts `tmux-plus` (default) or `minimal`
 - duplicate key bindings and invalid key names fail explicitly
 - legacy aliases still load where compatibility is supported
 - already-running pane processes are not retroactively respawned on config reload

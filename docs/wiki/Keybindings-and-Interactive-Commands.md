@@ -10,7 +10,7 @@
 
 - `Ctrl-b %` split vertically
 - `Ctrl-b "` split horizontally
-- `Ctrl-b 0..9` select windows by index
+- `Ctrl-b 1..9` select windows by the default public numbering; configure `behavior.window_base` to change that range
 - `Ctrl-b h/j/k/l` move pane focus
 - `Ctrl-b H/J/K/L` resize the active pane
 - `Ctrl-b c` create a new window

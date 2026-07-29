@@ -1,41 +1,50 @@
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::BTreeSet,
+    ffi::OsString,
+    fs::OpenOptions,
     io::{self, IsTerminal, Read, Write},
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     os::unix::net::UnixStream,
     path::PathBuf,
     process::{Command, Stdio},
-    sync::{Mutex, OnceLock},
+    sync::atomic::{AtomicU64, Ordering},
     thread,
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use clap::Parser;
+use clap::{Parser, error::ErrorKind};
 use crossterm::{
     cursor::{Hide, Show},
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+        MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
 
 use crate::{
+    alias::AliasRegistry,
     cli::{
-        AdmuxCli, ClientCommand, NewWindowArgs, PasteBufferArgs, ResizePaneArgs, SelectPaneArgs,
-        SetBufferArgs, SplitPaneArgs,
+        AdmuxCli, AliasAddArgs, AliasArgs, AliasCommand, ClientCommand, NewWindowArgs,
+        PasteBufferArgs, ResizePaneArgs, SelectPaneArgs, SetBufferArgs, SplitPaneArgs,
+        is_reserved_top_level_name,
     },
     commands::{InteractiveCommand, complete as complete_commands, parse as parse_command},
+    clipboard::{ClipboardBackend, ClipboardConfig},
     config::{Config, ResolvedConfig, StatusPosition},
     copy_mode::{CopyMode, Selection},
     input::{InputAction, InputMode, InputState},
     ipc::{
-        BufferSummary, CommandRequest, CommandResponse, CycleDirection, NavigationDirection,
+        BufferSummary, ClientViewport, CommandRequest, CommandResponse, CycleDirection, NavigationDirection,
         PaneCursor, PaneMouseKind, PaneRender, RenderSnapshot, SwitchSource,
     },
     layout::SplitAxis,
+    numbering::Numbering,
     pane::Rect,
     pty::{HelperMouseEventKind, PaneProcess},
     paths::RuntimePaths,
@@ -46,11 +55,21 @@ use crate::{
     window::WindowSummary,
 };
 
-const ATTACH_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+const ATTACH_INPUT_POLL_INTERVAL: Duration = Duration::from_millis(16);
+const SNAPSHOT_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
+const ALT_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(150);
+static INTERACTIVE_CLIENT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-fn validated_sockets() -> &'static Mutex<HashSet<PathBuf>> {
-    static VALIDATED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
-    VALIDATED.get_or_init(|| Mutex::new(HashSet::new()))
+fn snapshot_refresh_due(elapsed: Duration) -> bool {
+    elapsed >= SNAPSHOT_REFRESH_INTERVAL
+}
+
+fn interactive_client_id() -> String {
+    format!(
+        "{}-{}",
+        std::process::id(),
+        INTERACTIVE_CLIENT_COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -67,11 +86,11 @@ enum ChooseItem {
     Session(String),
     Window {
         session: String,
-        window_id: u64,
+        window_index: u64,
     },
     Pane {
         session: String,
-        window_id: u64,
+        window_index: u64,
         pane_id: u64,
     },
 }
@@ -86,12 +105,14 @@ struct ChooseTreeState {
     attached_session: String,
     search_input: Option<String>,
     last_search: Option<String>,
+    preview: Option<(usize, String, RenderSnapshot)>,
 }
 
 #[derive(Debug, Clone)]
 struct ChooseBufferState {
     buffers: Vec<BufferSummary>,
     selected: usize,
+    preview: Option<(usize, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -108,6 +129,9 @@ enum PromptResult {
     KeepOpen,
     Close,
     CloseAndClearSelection,
+    OpenChooseTree,
+    OpenChooseBuffer,
+    Detach,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -123,11 +147,101 @@ struct ResizeDrag {
     direction: NavigationDirection,
     last_row: u16,
     last_col: u16,
+    span: u16,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MouseCapture {
+    pane_id: u64,
+    button: MouseButton,
+}
+
+fn helper_mouse_kinds(
+    button: MouseButton,
+) -> Option<(HelperMouseEventKind, HelperMouseEventKind, HelperMouseEventKind)> {
+    match button {
+        MouseButton::Left => Some((
+            HelperMouseEventKind::LeftDown,
+            HelperMouseEventKind::LeftDrag,
+            HelperMouseEventKind::LeftUp,
+        )),
+        MouseButton::Middle => Some((
+            HelperMouseEventKind::MiddleDown,
+            HelperMouseEventKind::MiddleDrag,
+            HelperMouseEventKind::MiddleUp,
+        )),
+        MouseButton::Right => Some((
+            HelperMouseEventKind::RightDown,
+            HelperMouseEventKind::RightDrag,
+            HelperMouseEventKind::RightUp,
+        )),
+    }
+}
+
+fn pane_mouse_kinds(
+    button: MouseButton,
+) -> Option<(PaneMouseKind, PaneMouseKind, PaneMouseKind)> {
+    match button {
+        MouseButton::Left => Some((
+            PaneMouseKind::LeftDown,
+            PaneMouseKind::LeftDrag,
+            PaneMouseKind::LeftUp,
+        )),
+        MouseButton::Middle => Some((
+            PaneMouseKind::MiddleDown,
+            PaneMouseKind::MiddleDrag,
+            PaneMouseKind::MiddleUp,
+        )),
+        MouseButton::Right => Some((
+            PaneMouseKind::RightDown,
+            PaneMouseKind::RightDrag,
+            PaneMouseKind::RightUp,
+        )),
+    }
+}
+
+struct EventLogger {
+    out: std::fs::File,
 }
 
 pub fn run_from_env() -> Result<()> {
-    let cli = AdmuxCli::parse();
-    run(cli)
+    let argv = std::env::args_os().collect::<Vec<_>>();
+    let paths = RuntimePaths::resolve();
+    match AdmuxCli::try_parse_from(&argv) {
+        Ok(cli) => run(cli),
+        Err(err) => {
+            if should_try_alias(&argv, &err)
+                && let Some(cli) = try_resolve_alias_invocation(&argv, &paths)?
+            {
+                return run(cli);
+            }
+            err.exit()
+        }
+    }
+}
+
+fn should_try_alias(argv: &[OsString], err: &clap::Error) -> bool {
+    argv.len() == 2 && matches!(err.kind(), ErrorKind::InvalidSubcommand)
+}
+
+fn try_resolve_alias_invocation(argv: &[OsString], paths: &RuntimePaths) -> Result<Option<AdmuxCli>> {
+    let Some(name) = argv.get(1).and_then(|value| value.to_str()) else {
+        return Ok(None);
+    };
+    if name.starts_with('-') || is_reserved_top_level_name(name) {
+        return Ok(None);
+    }
+    let registry = AliasRegistry::load(&paths.aliases_path)?;
+    let Some(path) = registry.resolve(name) else {
+        return Ok(None);
+    };
+    Ok(Some(AdmuxCli {
+        command: ClientCommand::Up(crate::cli::UpArgs {
+            detach: false,
+            rebuild: false,
+            path: Some(path.to_path_buf()),
+        }),
+    }))
 }
 
 pub fn run(cli: AdmuxCli) -> Result<()> {
@@ -135,9 +249,7 @@ pub fn run(cli: AdmuxCli) -> Result<()> {
     let request = match cli.command {
         ClientCommand::Up(args) => {
             let manifest_path = resolve_workspace_manifest_path(args.path.as_deref())?;
-            let nested_switch = (!args.detach
-                && io::stdout().is_terminal()
-                && std::env::var_os("ADMUX_NONINTERACTIVE").is_none())
+            let nested_switch = (!args.detach && interactive_terminal_available())
             .then(nested_switch_source)
             .flatten();
             let response = request_response(
@@ -154,11 +266,10 @@ pub fn run(cli: AdmuxCli) -> Result<()> {
             };
             if nested_switch.is_none() {
                 print_response(&paths, response)?;
+            } else {
+                ensure_command_succeeded(response)?;
             }
-            if !args.detach
-                && io::stdout().is_terminal()
-                && std::env::var_os("ADMUX_NONINTERACTIVE").is_none()
-                && nested_switch.is_none()
+            if !args.detach && interactive_terminal_available() && nested_switch.is_none()
             {
                 let session = session
                     .ok_or_else(|| anyhow!("workspace response did not include a session name"))?;
@@ -172,9 +283,7 @@ pub fn run(cli: AdmuxCli) -> Result<()> {
         ClientCommand::New(args) => {
             let args = normalize_new_args(args)?;
             let requested_name = args.name.clone();
-            let nested_switch = (!args.detach
-                && io::stdout().is_terminal()
-                && std::env::var_os("ADMUX_NONINTERACTIVE").is_none())
+            let nested_switch = (!args.detach && interactive_terminal_available())
             .then(nested_switch_source)
             .flatten();
             let response = request_response(
@@ -192,12 +301,11 @@ pub fn run(cli: AdmuxCli) -> Result<()> {
             };
             if nested_switch.is_none() {
                 print_response(&paths, response)?;
+            } else {
+                ensure_command_succeeded(response)?;
             }
 
-            if !args.detach
-                && io::stdout().is_terminal()
-                && std::env::var_os("ADMUX_NONINTERACTIVE").is_none()
-                && nested_switch.is_none()
+            if !args.detach && interactive_terminal_available() && nested_switch.is_none()
             {
                 let session = created_session.or(requested_name).ok_or_else(|| {
                     anyhow!("new session response did not include a session name")
@@ -208,6 +316,7 @@ pub fn run(cli: AdmuxCli) -> Result<()> {
         }
         ClientCommand::Attach(args) => CommandRequest::Attach {
             session: args.session,
+            viewport: None,
         },
         ClientCommand::Ls => CommandRequest::ListSessions,
         ClientCommand::ListWindows(args) => CommandRequest::ListWindows {
@@ -238,10 +347,10 @@ pub fn run(cli: AdmuxCli) -> Result<()> {
         },
         ClientCommand::SaveBuffer(args) => CommandRequest::SaveBuffer {
             buffer: args.buffer,
-            path: args.path,
+            path: resolve_client_path(args.path)?,
         },
         ClientCommand::LoadBuffer(args) => CommandRequest::LoadBuffer {
-            path: args.path,
+            path: resolve_client_path(args.path)?,
             buffer: args.buffer,
         },
         ClientCommand::Kill(args) => CommandRequest::KillSession {
@@ -281,6 +390,10 @@ pub fn run(cli: AdmuxCli) -> Result<()> {
         },
         ClientCommand::ResizePane(args) => resize_pane_request(args),
         ClientCommand::ReloadConfig => CommandRequest::ReloadConfig,
+        ClientCommand::Alias(args) => {
+            run_alias_command(&paths, args)?;
+            return Ok(());
+        }
     };
 
     let response = request_response(&paths, request)?;
@@ -317,8 +430,24 @@ fn normalize_new_args(mut args: crate::cli::NewArgs) -> Result<crate::cli::NewAr
     if args.cwd.is_none() {
         args.cwd = Some(std::env::current_dir().context("failed to resolve current directory")?);
     }
+    if let Some(cwd) = args.cwd.as_mut()
+        && cwd.is_relative()
+    {
+        *cwd = std::env::current_dir()
+            .context("failed to resolve current directory")?
+            .join(&*cwd);
+    }
 
     Ok(args)
+}
+
+fn resolve_client_path(path: PathBuf) -> Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    Ok(std::env::current_dir()
+        .context("failed to resolve current directory")?
+        .join(path))
 }
 
 fn apply_attached_session(
@@ -335,31 +464,14 @@ fn apply_attached_session(
 }
 
 pub fn request_response(paths: &RuntimePaths, request: CommandRequest) -> Result<CommandResponse> {
-    {
-        let validated = validated_sockets()
-            .lock()
-            .expect("validated sockets lock poisoned");
-        if !validated.contains(&paths.socket_path) {
-            drop(validated);
-            ensure_protocol(paths)?;
-            validated_sockets()
-                .lock()
-                .expect("validated sockets lock poisoned")
-                .insert(paths.socket_path.clone());
-        }
-    }
-    let response = with_connection(paths, |stream| {
+    // Every request opens a new Unix socket connection. Handshake that
+    // connection instead of caching by pathname: a daemon can be replaced at
+    // the same path between requests.
+    ensure_protocol(paths)?;
+    with_connection(paths, |stream| {
         write_message(stream, &request)?;
         read_message(stream)
-    });
-    if response.is_err() {
-        validated_sockets()
-            .lock()
-            .expect("validated sockets lock poisoned")
-            .remove(&paths.socket_path);
-    }
-    let response = response?;
-    Ok(response)
+    })
 }
 
 fn ensure_protocol(paths: &RuntimePaths) -> Result<()> {
@@ -439,7 +551,7 @@ fn with_connection<T>(
 ) -> Result<T> {
     match UnixStream::connect(&paths.socket_path) {
         Ok(mut stream) => f(&mut stream),
-        Err(_) => {
+        Err(error) if should_autostart_daemon(&error) => {
             spawn_daemon(paths)?;
             let deadline = Instant::now() + Duration::from_secs(3);
             loop {
@@ -452,15 +564,29 @@ fn with_connection<T>(
                     Err(error) => {
                         return Err(error).with_context(|| {
                             format!(
-                                "failed to connect to admuxd at {} after autostart",
-                                paths.socket_path.display()
+                                "failed to connect to admuxd at {} after autostart; see {}",
+                                paths.socket_path.display(),
+                                daemon_start_log_path(paths).display(),
                             )
                         });
                     }
                 }
             }
         }
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to connect to admuxd at {}; not attempting autostart",
+                paths.socket_path.display()
+            )
+        }),
     }
+}
+
+fn should_autostart_daemon(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+    )
 }
 
 fn spawn_daemon(paths: &RuntimePaths) -> Result<()> {
@@ -468,6 +594,27 @@ fn spawn_daemon(paths: &RuntimePaths) -> Result<()> {
     let socket = paths.socket_path.display().to_string();
     let state = paths.state_path.display().to_string();
     let config = paths.config_path.display().to_string();
+    let log_path = daemon_start_log_path(paths);
+    let log_dir = log_path.parent().ok_or_else(|| {
+        anyhow!("daemon startup log {} has no parent directory", log_path.display())
+    })?;
+    std::fs::create_dir_all(log_dir).with_context(|| {
+        format!(
+            "failed to create daemon startup log directory {}",
+            log_dir.display()
+        )
+    })?;
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(&log_path)
+        .with_context(|| format!("failed to open daemon startup log {}", log_path.display()))?;
+    log.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to restrict daemon startup log {}", log_path.display()))?;
+    let stderr_log = log
+        .try_clone()
+        .with_context(|| format!("failed to duplicate daemon startup log {}", log_path.display()))?;
     Command::new(daemon_path)
         .arg("serve")
         .arg("--socket")
@@ -477,11 +624,19 @@ fn spawn_daemon(paths: &RuntimePaths) -> Result<()> {
         .arg("--config")
         .arg(config)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(stderr_log))
         .spawn()
         .context("failed to spawn admuxd")?;
     Ok(())
+}
+
+fn daemon_start_log_path(paths: &RuntimePaths) -> PathBuf {
+    paths
+        .state_path
+        .parent()
+        .map(|parent| parent.join("admuxd-startup.log"))
+        .unwrap_or_else(|| PathBuf::from("admuxd-startup.log"))
 }
 
 fn resolve_daemon_binary() -> Result<std::path::PathBuf> {
@@ -502,6 +657,8 @@ fn resolve_daemon_binary() -> Result<std::path::PathBuf> {
 }
 
 fn write_message(stream: &mut UnixStream, request: &CommandRequest) -> Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let payload = serde_json::to_vec(request).context("failed to encode request")?;
     stream
         .write_all(&payload)
@@ -514,9 +671,13 @@ fn write_message(stream: &mut UnixStream, request: &CommandRequest) -> Result<()
 
 fn read_message(stream: &mut UnixStream) -> Result<CommandResponse> {
     let mut payload = Vec::new();
-    stream
+    (&mut *stream)
+        .take(1024 * 1024 + 1)
         .read_to_end(&mut payload)
         .context("failed to read response payload")?;
+    if payload.len() > 1024 * 1024 {
+        bail!("response payload exceeds 1048576 byte limit");
+    }
     let response = serde_json::from_slice(&payload).context("failed to decode response")?;
     Ok(response)
 }
@@ -560,7 +721,7 @@ fn print_response(paths: &RuntimePaths, response: CommandResponse) -> Result<()>
             snapshot,
             ..
         } => {
-            if io::stdout().is_terminal() && std::env::var_os("ADMUX_NONINTERACTIVE").is_none() {
+            if interactive_terminal_available() {
                 attach_interactive(paths, &session)?;
             } else {
                 println!("attached {session}");
@@ -585,6 +746,18 @@ fn print_response(paths: &RuntimePaths, response: CommandResponse) -> Result<()>
                     println!("{} (stale)", session.name);
                 } else {
                     println!("{}", session.name);
+                }
+            }
+        }
+        CommandResponse::ChooseTreeList { sessions } => {
+            for session in sessions {
+                let stale = if session.stale { " (stale)" } else { "" };
+                println!("{}:{} windows{stale}", session.name, session.windows.len());
+                for entry in session.windows {
+                    println!("  {} {}", entry.window.index, entry.window.name);
+                    for pane in entry.panes {
+                        println!("    {} {}", pane.id, pane.title);
+                    }
                 }
             }
         }
@@ -631,6 +804,7 @@ fn print_response(paths: &RuntimePaths, response: CommandResponse) -> Result<()>
         CommandResponse::SelectionCopied { .. }
         | CommandResponse::Scrolled
         | CommandResponse::Resized
+        | CommandResponse::InputRegistered
         | CommandResponse::FocusChanged => {}
         CommandResponse::ConfigReloaded => println!("config reloaded"),
         CommandResponse::Error { message } => return Err(anyhow!(message)),
@@ -638,30 +812,103 @@ fn print_response(paths: &RuntimePaths, response: CommandResponse) -> Result<()>
     Ok(())
 }
 
+fn handle_interactive_response(
+    response: CommandResponse,
+    status_message: &mut Option<String>,
+) -> bool {
+    match response {
+        CommandResponse::Error { message } => {
+            *status_message = Some(message);
+            false
+        }
+        _ => true,
+    }
+}
+
+struct TerminalRestore {
+    mouse_capture_enabled: bool,
+}
+
+impl TerminalRestore {
+    fn after_raw_mode_enabled() -> Self {
+        Self {
+            mouse_capture_enabled: false,
+        }
+    }
+
+    fn enable_mouse_capture(&mut self, stdout: &mut io::Stdout) -> Result<()> {
+        execute!(*stdout, EnableMouseCapture).context("failed to enable mouse capture")?;
+        self.mouse_capture_enabled = true;
+        Ok(())
+    }
+}
+
+impl Drop for TerminalRestore {
+    fn drop(&mut self) {
+        let mut stdout = io::stdout();
+        if self.mouse_capture_enabled {
+            let _ = execute!(stdout, DisableMouseCapture);
+        }
+        let _ = execute!(
+            stdout,
+            DisableBracketedPaste,
+            PopKeyboardEnhancementFlags,
+            Show,
+            LeaveAlternateScreen
+        );
+        let _ = terminal::disable_raw_mode();
+    }
+}
+
+fn interactive_terminal_available() -> bool {
+    interactive_terminal_available_for(
+        io::stdin().is_terminal(),
+        io::stdout().is_terminal(),
+        std::env::var_os("ADMUX_NONINTERACTIVE").is_none(),
+    )
+}
+
+fn interactive_terminal_available_for(
+    stdin_is_terminal: bool,
+    stdout_is_terminal: bool,
+    interactive_requested: bool,
+) -> bool {
+    stdin_is_terminal && stdout_is_terminal && interactive_requested
+}
+
 fn attach_interactive(paths: &RuntimePaths, session: &str) -> Result<()> {
     let mut config = load_config(paths)?;
     let mut stdout = io::stdout();
+    let mut event_logger = EventLogger::from_env(paths)?;
     terminal::enable_raw_mode().context("failed to enable raw mode")?;
+    let mut terminal_restore = TerminalRestore::after_raw_mode_enabled();
     execute!(
         stdout,
         EnterAlternateScreen,
         Hide,
-        EnableMouseCapture,
-        EnableBracketedPaste
+        EnableBracketedPaste,
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+        )
     )
     .context("failed to enter alternate screen")?;
+    if config.mouse.enabled {
+        terminal_restore.enable_mouse_capture(&mut stdout)?;
+    }
 
-    let result = run_attach_loop(paths, session.to_string(), &mut config, &mut stdout);
+    if let Some(logger) = event_logger.as_mut() {
+        logger.log_line("attach session start")?;
+    }
 
-    let _ = execute!(
-        stdout,
-        DisableBracketedPaste,
-        DisableMouseCapture,
-        Show,
-        LeaveAlternateScreen
-    );
-    let _ = terminal::disable_raw_mode();
-    result
+    run_attach_loop(
+        paths,
+        session.to_string(),
+        &mut config,
+        &mut stdout,
+        event_logger.as_mut(),
+    )
 }
 
 fn run_attach_loop(
@@ -669,6 +916,7 @@ fn run_attach_loop(
     mut current_session: String,
     config: &mut ResolvedConfig,
     stdout: &mut impl Write,
+    event_logger: Option<&mut EventLogger>,
 ) -> Result<()> {
     let mut state = InputState::new(config.keys.clone(), config.behavior.resize_step);
     let mut last_size = (0, 0);
@@ -676,34 +924,50 @@ fn run_attach_loop(
     let mut active_selection: Option<PaneSelection> = None;
     let mut copy_mode: Option<CopyMode> = None;
     let mut resize_drag: Option<ResizeDrag> = None;
+    let mut mouse_capture: Option<MouseCapture> = None;
     let mut status_message: Option<String> = None;
     let mut prompt_history = Vec::<String>::new();
     let mut overlay = OverlayState::None;
-    let mut snapshot = fetch_attach_snapshot(paths, &mut current_session, &mut last_size, 80, 24)?;
+    let client_id = interactive_client_id();
+    let mut snapshot = fetch_attach_snapshot(
+        paths,
+        &mut current_session,
+        &mut last_size,
+        80,
+        24,
+        Some(&client_id),
+    )?;
     let mut snapshot_dirty = false;
+    let mut render_dirty = true;
     let mut last_snapshot_refresh = Instant::now();
+    let mut pending_event = None;
+    let mut event_logger = event_logger;
 
     loop {
         let (width, height) = terminal::size().context("failed to read terminal size")?;
         let rows = height.max(1);
         let cols = width.max(1);
         if last_size != (rows, cols) {
-            let _ = request_response(
-                paths,
-                CommandRequest::Resize {
-                    session: current_session.clone(),
-                    rows,
-                    cols,
-                },
-            )?;
             last_size = (rows, cols);
-            snapshot =
-                fetch_attach_snapshot(paths, &mut current_session, &mut last_size, width, height)?;
+            let updated =
+                fetch_attach_snapshot(paths, &mut current_session, &mut last_size, width, height, Some(&client_id))?;
+            render_dirty |= updated != snapshot;
+            render_dirty |= matches!(overlay, OverlayState::ChooseTree(_));
+            snapshot = updated;
             snapshot_dirty = false;
             last_snapshot_refresh = Instant::now();
-        } else if snapshot_dirty && last_snapshot_refresh.elapsed() >= ATTACH_FRAME_INTERVAL {
-            snapshot =
-                fetch_attach_snapshot(paths, &mut current_session, &mut last_size, width, height)?;
+        } else if snapshot_dirty && snapshot_refresh_due(last_snapshot_refresh.elapsed()) {
+            let updated = fetch_attach_snapshot(
+                paths,
+                &mut current_session,
+                &mut last_size,
+                width,
+                height,
+                Some(&client_id),
+            )?;
+            render_dirty |= updated != snapshot;
+            render_dirty |= matches!(overlay, OverlayState::ChooseTree(_));
+            snapshot = updated;
             snapshot_dirty = false;
             last_snapshot_refresh = Instant::now();
         }
@@ -726,9 +990,10 @@ fn run_attach_loop(
                 .iter()
                 .find(|pane| pane.pane_id == copy.pane_id)
             {
-                copy.clamp_to(
+                copy.sync_viewport(
                     pane.rows_plain.len().max(1),
                     pane.rect.width.max(1) as usize,
+                    pane.scrollback,
                 );
             } else {
                 copy_mode = None;
@@ -736,7 +1001,8 @@ fn run_attach_loop(
             }
         }
 
-        match &overlay {
+        if render_dirty {
+            match &mut overlay {
             OverlayState::None => {
                 render_session(
                     stdout,
@@ -802,19 +1068,31 @@ fn run_attach_loop(
                     TerminalSize { width, height },
                 )?;
             }
+            }
+            render_dirty = false;
         }
-        status_message = None;
-
-        if !event::poll(ATTACH_FRAME_INTERVAL).context("failed to poll terminal events")? {
-            snapshot =
-                fetch_attach_snapshot(paths, &mut current_session, &mut last_size, width, height)?;
-            snapshot_dirty = false;
-            last_snapshot_refresh = Instant::now();
+        if !event::poll(ATTACH_INPUT_POLL_INTERVAL).context("failed to poll terminal events")? {
+            if snapshot_refresh_due(last_snapshot_refresh.elapsed()) {
+                let updated = fetch_attach_snapshot(
+                    paths,
+                    &mut current_session,
+                    &mut last_size,
+                    width,
+                    height,
+                    Some(&client_id),
+                )?;
+                render_dirty |= updated != snapshot;
+                render_dirty |= matches!(overlay, OverlayState::ChooseTree(_));
+                snapshot = updated;
+                snapshot_dirty = false;
+                last_snapshot_refresh = Instant::now();
+            }
             continue;
         }
 
         let mut needs_refresh = false;
-        match event::read().context("failed to read terminal event")? {
+        let mut refresh_before_next_input = false;
+        match read_attach_event(&mut pending_event, event_logger.as_deref_mut())? {
             Event::Key(key) => {
                 let current_overlay = std::mem::replace(&mut overlay, OverlayState::None);
                 match current_overlay {
@@ -823,6 +1101,9 @@ fn run_attach_loop(
                             paths,
                             &snapshot,
                             &mut current_session,
+                            &mut last_size,
+                            &mut state,
+                            config,
                             &mut prompt,
                             &mut prompt_history,
                             key,
@@ -837,10 +1118,27 @@ fn run_attach_loop(
                                 selection_anchor = None;
                                 active_selection = None;
                             }
+                            PromptResult::OpenChooseTree => {
+                                overlay = OverlayState::ChooseTree(build_choose_tree(
+                                    paths,
+                                    &current_session,
+                                )?);
+                            }
+                            PromptResult::OpenChooseBuffer => {
+                                overlay = OverlayState::ChooseBuffer(build_choose_buffer(paths)?);
+                            }
+                            PromptResult::Detach => break,
                         }
                     }
                     OverlayState::ChooseTree(mut tree) => {
-                        if handle_choose_tree_key(paths, &mut tree, key, &mut current_session)? {
+                        if handle_choose_tree_key(
+                            paths,
+                            &mut tree,
+                            key,
+                            &mut current_session,
+                            &mut last_size,
+                            &mut status_message,
+                        )? {
                             overlay = OverlayState::ChooseTree(tree);
                         } else {
                             needs_refresh = true;
@@ -863,7 +1161,20 @@ fn run_attach_loop(
                         KeyCode::Esc | KeyCode::Char('q') => {}
                         _ => overlay = OverlayState::Help,
                     },
-                    OverlayState::None => match state.handle_key(key) {
+                    OverlayState::None => {
+                        let mode_before = state.mode;
+                        let application_cursor = focused_pane(&snapshot)
+                            .map(|pane| pane.application_cursor)
+                            .unwrap_or(false);
+                        let action = state.handle_key_with_application_cursor(key, application_cursor);
+                        refresh_before_next_input = action_changes_input_target(&action);
+                        if let Some(logger) = event_logger.as_deref_mut() {
+                            logger.log_line(&format!(
+                                "handled: key={key:?} mode_before={mode_before:?} mode_after={:?} action={action:?}",
+                                state.mode
+                            ))?;
+                        }
+                        match action {
                         InputAction::Noop => {}
                         InputAction::Detach => break,
                         InputAction::EnterCopyMode => {
@@ -877,11 +1188,17 @@ fn run_attach_loop(
                             copy_mode = None;
                         }
                         InputAction::SendBytes(bytes) => {
-                            send_input_bytes(paths, &snapshot, &current_session, &bytes)?;
+                            send_input_bytes(
+                                paths,
+                                &snapshot,
+                                &current_session,
+                                &bytes,
+                                Some(&client_id),
+                            )?;
                             needs_refresh = true;
                         }
                         InputAction::SplitPane(axis) => {
-                            let _ = request_response(
+                            let response = request_response(
                                 paths,
                                 CommandRequest::SplitPane {
                                     target: current_session.clone(),
@@ -889,21 +1206,41 @@ fn run_attach_loop(
                                     command: Vec::new(),
                                 },
                             )?;
-                            needs_refresh = true;
+                            needs_refresh = handle_interactive_response(response, &mut status_message);
                         }
                         InputAction::SelectWindowIndex(index) => {
                             if let Some(window) = snapshot
                                 .windows
                                 .iter()
-                                .find(|window| window.index == index as usize)
+                                .find(|window| window.index == index as u64)
                             {
-                                let _ = request_response(
+                                if let Some(logger) = event_logger.as_deref_mut() {
+                                    logger.log_line(&format!(
+                                        "select-window-hit: requested={index} window_id={} window_index={}",
+                                        window.id, window.index
+                                    ))?;
+                                }
+                                let response = request_response(
                                     paths,
                                     CommandRequest::SelectWindow {
-                                        target: format!("{}:{}", current_session, window.id),
+                                        target: format!("{}:{}", current_session, window.index),
                                     },
                                 )?;
-                                needs_refresh = true;
+                                if let Some(logger) = event_logger.as_deref_mut() {
+                                    logger.log_line(&format!(
+                                        "select-window-response: {response:?}"
+                                    ))?;
+                                }
+                                needs_refresh = handle_interactive_response(response, &mut status_message);
+                            } else if let Some(logger) = event_logger.as_deref_mut() {
+                                logger.log_line(&format!(
+                                    "select-window-miss: requested={index} snapshot_indexes={:?}",
+                                    snapshot
+                                        .windows
+                                        .iter()
+                                        .map(|window| window.index)
+                                        .collect::<Vec<_>>()
+                                ))?;
                             }
                         }
                         InputAction::OpenPrompt => {
@@ -925,7 +1262,7 @@ fn run_attach_loop(
                             overlay = OverlayState::Help;
                         }
                         InputAction::NewWindow => {
-                            let _ = request_response(
+                            let response = request_response(
                                 paths,
                                 CommandRequest::NewWindow {
                                     session: current_session.clone(),
@@ -933,40 +1270,40 @@ fn run_attach_loop(
                                     command: Vec::new(),
                                 },
                             )?;
-                            needs_refresh = true;
+                            needs_refresh = handle_interactive_response(response, &mut status_message);
                         }
                         InputAction::NextWindow => {
-                            let _ = request_response(
+                            let response = request_response(
                                 paths,
                                 CommandRequest::CycleWindow {
                                     session: current_session.clone(),
                                     direction: CycleDirection::Next,
                                 },
                             )?;
-                            needs_refresh = true;
+                            needs_refresh = handle_interactive_response(response, &mut status_message);
                         }
                         InputAction::PrevWindow => {
-                            let _ = request_response(
+                            let response = request_response(
                                 paths,
                                 CommandRequest::CycleWindow {
                                     session: current_session.clone(),
                                     direction: CycleDirection::Prev,
                                 },
                             )?;
-                            needs_refresh = true;
+                            needs_refresh = handle_interactive_response(response, &mut status_message);
                         }
                         InputAction::FocusPane(direction) => {
-                            let _ = request_response(
+                            let response = request_response(
                                 paths,
                                 CommandRequest::SelectPane {
-                                    target: None,
+                                    target: Some(current_session.clone()),
                                     direction: Some(direction),
                                 },
                             )?;
-                            needs_refresh = true;
+                            needs_refresh = handle_interactive_response(response, &mut status_message);
                         }
                         InputAction::ResizePane(direction, amount) => {
-                            let _ = request_response(
+                            let response = request_response(
                                 paths,
                                 CommandRequest::ResizePane {
                                     target: current_session.clone(),
@@ -974,26 +1311,26 @@ fn run_attach_loop(
                                     amount,
                                 },
                             )?;
-                            needs_refresh = true;
+                            needs_refresh = handle_interactive_response(response, &mut status_message);
                         }
                         InputAction::KillPane => {
-                            let _ = request_response(
+                            let response = request_response(
                                 paths,
                                 CommandRequest::KillPane {
                                     target: current_session.clone(),
                                 },
                             )?;
-                            needs_refresh = true;
+                            needs_refresh = handle_interactive_response(response, &mut status_message);
                         }
                         InputAction::PasteTopBuffer => {
-                            let _ = request_response(
+                            let response = request_response(
                                 paths,
                                 CommandRequest::PasteBuffer {
                                     target: current_session.clone(),
                                     buffer: None,
                                 },
                             )?;
-                            needs_refresh = true;
+                            needs_refresh = handle_interactive_response(response, &mut status_message);
                         }
                         InputAction::ListBuffers => {
                             let response = request_response(paths, CommandRequest::ListBuffers)?;
@@ -1011,15 +1348,13 @@ fn run_attach_loop(
                             overlay = OverlayState::ChooseBuffer(build_choose_buffer(paths)?);
                         }
                         InputAction::ReloadConfig => {
-                            let _ = request_response(paths, CommandRequest::ReloadConfig)?;
-                            let reloaded = load_config(paths)?;
-                            state.replace_config(
-                                reloaded.keys.clone(),
-                                reloaded.behavior.resize_step,
-                            );
-                            *config = reloaded;
-                            status_message = Some("config reloaded".into());
-                            needs_refresh = true;
+                            match reload_interactive_config(paths, &mut state, config) {
+                                Ok(()) => {
+                                status_message = Some("config reloaded".into());
+                                needs_refresh = true;
+                                }
+                                Err(error) => status_message = Some(error.to_string()),
+                            }
                         }
                         InputAction::CopyMove(direction) => {
                             let pane_dims = copy_mode.as_ref().and_then(|copy| {
@@ -1051,32 +1386,57 @@ fn run_attach_loop(
                             }
                         }
                         InputAction::CopyLineEnd => {
-                            let cols = copy_mode.as_ref().and_then(|copy| {
+                            let line = copy_mode.as_ref().and_then(|copy| {
                                 snapshot
                                     .panes
                                     .iter()
                                     .find(|pane| pane.pane_id == copy.pane_id)
-                                    .map(|pane| pane.rect.width.max(1) as usize)
+                                    .and_then(|pane| {
+                                        pane.rows_plain.get(copy.cursor_row as usize).cloned()
+                                    })
                             });
-                            if let (Some(copy), Some(cols)) = (copy_mode.as_mut(), cols) {
-                                copy.move_line_end(cols);
+                            if let (Some(copy), Some(line)) = (copy_mode.as_mut(), line) {
+                                copy.move_line_end(&line);
                             }
                         }
                         InputAction::CopyTop => {
                             if let Some(copy) = copy_mode.as_mut() {
-                                copy.move_top();
+                                let response = request_response(
+                                    paths,
+                                    CommandRequest::ScrollPaneTo {
+                                        session: current_session.clone(),
+                                        window_id: Some(snapshot.active_window_id),
+                                        pane_id: Some(copy.pane_id),
+                                        position: crate::ipc::ScrollbackPosition::Top,
+                                    },
+                                )?;
+                                if handle_interactive_response(response, &mut status_message) {
+                                    copy.move_top();
+                                    needs_refresh = true;
+                                }
                             }
                         }
                         InputAction::CopyBottom => {
-                            let rows = copy_mode.as_ref().and_then(|copy| {
-                                snapshot
-                                    .panes
-                                    .iter()
-                                    .find(|pane| pane.pane_id == copy.pane_id)
-                                    .map(|pane| pane.rows_plain.len().max(1))
-                            });
-                            if let (Some(copy), Some(rows)) = (copy_mode.as_mut(), rows) {
-                                copy.move_bottom(rows);
+                            if let Some(copy) = copy_mode.as_mut() {
+                                let response = request_response(
+                                    paths,
+                                    CommandRequest::ScrollPaneTo {
+                                        session: current_session.clone(),
+                                        window_id: Some(snapshot.active_window_id),
+                                        pane_id: Some(copy.pane_id),
+                                        position: crate::ipc::ScrollbackPosition::Bottom,
+                                    },
+                                )?;
+                                if handle_interactive_response(response, &mut status_message) {
+                                    let rows = snapshot
+                                        .panes
+                                        .iter()
+                                        .find(|pane| pane.pane_id == copy.pane_id)
+                                        .map(|pane| pane.rows_plain.len().max(1))
+                                        .unwrap_or(1);
+                                    copy.move_bottom(rows);
+                                    needs_refresh = true;
+                                }
                             }
                         }
                         InputAction::CopyPageUp => {
@@ -1093,15 +1453,16 @@ fn run_attach_loop(
                                             .map(|pane| pane.rect.height.max(1) as i16)
                                             .unwrap_or(10)
                                     });
-                                let _ = request_response(
+                                let response = request_response(
                                     paths,
                                     CommandRequest::ScrollPane {
                                         session: current_session.clone(),
+                                        window_id: Some(snapshot.active_window_id),
                                         pane_id: Some(copy.pane_id),
                                         lines: -page,
                                     },
                                 )?;
-                                needs_refresh = true;
+                                needs_refresh = handle_interactive_response(response, &mut status_message);
                             }
                         }
                         InputAction::CopyPageDown => {
@@ -1118,15 +1479,16 @@ fn run_attach_loop(
                                             .map(|pane| pane.rect.height.max(1) as i16)
                                             .unwrap_or(10)
                                     });
-                                let _ = request_response(
+                                let response = request_response(
                                     paths,
                                     CommandRequest::ScrollPane {
                                         session: current_session.clone(),
+                                        window_id: Some(snapshot.active_window_id),
                                         pane_id: Some(copy.pane_id),
                                         lines: page,
                                     },
                                 )?;
-                                needs_refresh = true;
+                                needs_refresh = handle_interactive_response(response, &mut status_message);
                             }
                         }
                         InputAction::CopyStartSelection => {
@@ -1136,32 +1498,54 @@ fn run_attach_loop(
                         }
                         InputAction::CopyYank => {
                             if let Some(copy) = copy_mode.take() {
-                                let selection =
-                                    copy.selection().unwrap_or_else(|| copy.cursor_selection());
+                                let selection = copy
+                                    .history_selection()
+                                    .unwrap_or_else(|| copy.cursor_history_selection());
                                 let copied = request_response(
                                     paths,
                                     CommandRequest::CopySelection {
                                         session: current_session.clone(),
+                                        window_id: Some(snapshot.active_window_id),
                                         pane_id: Some(copy.pane_id),
-                                        start_row: selection.start_row,
-                                        start_col: selection.start_col,
-                                        end_row: selection.end_row,
-                                        end_col: selection.end_col,
+                                        start_from_bottom: selection.start.from_bottom,
+                                        start_col: selection.start.col,
+                                        end_from_bottom: selection.end.from_bottom,
+                                        end_col: selection.end.col,
                                     },
                                 )?;
                                 if let CommandResponse::SelectionCopied { text } = copied {
                                     status_message =
-                                        copy_text_to_buffer_and_clipboard(paths, stdout, &text)?;
+                                        copy_text_to_buffer_and_clipboard(
+                                            paths,
+                                            stdout,
+                                            &text,
+                                            &config.clipboard,
+                                        )?;
                                 }
                                 needs_refresh = true;
                             }
                         }
-                    },
+                        }
+                    }
                 }
             }
             Event::Paste(text) => {
-                if matches!(overlay, OverlayState::None) && copy_mode.is_none() {
-                    send_input_bytes(paths, &snapshot, &current_session, text.as_bytes())?;
+                if let OverlayState::Prompt(prompt) = &mut overlay {
+                    insert_prompt_text(prompt, &text);
+                } else if let OverlayState::ChooseTree(tree) = &mut overlay {
+                    insert_choose_tree_search_text(tree, &text);
+                } else if matches!(overlay, OverlayState::None) && copy_mode.is_none() {
+                    let mut bytes = Vec::with_capacity(text.len() + 12);
+                    bytes.extend_from_slice(b"\x1b[200~");
+                    bytes.extend_from_slice(text.as_bytes());
+                    bytes.extend_from_slice(b"\x1b[201~");
+                    send_input_bytes(
+                        paths,
+                        &snapshot,
+                        &current_session,
+                        &bytes,
+                        Some(&client_id),
+                    )?;
                     needs_refresh = true;
                 }
             }
@@ -1177,6 +1561,7 @@ fn run_attach_loop(
                         &mut selection_anchor,
                         &mut active_selection,
                         &mut resize_drag,
+                        &mut mouse_capture,
                         &mut status_message,
                     )?;
                     if local_repaint {
@@ -1200,16 +1585,21 @@ fn run_attach_loop(
             Event::FocusGained | Event::FocusLost => {}
         }
 
+        render_dirty = true;
         if needs_refresh {
             snapshot_dirty = true;
-            if last_snapshot_refresh.elapsed() >= ATTACH_FRAME_INTERVAL {
-                snapshot = fetch_attach_snapshot(
+            if refresh_before_next_input
+                || snapshot_refresh_due(last_snapshot_refresh.elapsed())
+            {
+                let updated = fetch_attach_snapshot(
                     paths,
                     &mut current_session,
                     &mut last_size,
                     width,
                     height,
+                    Some(&client_id),
                 )?;
+                snapshot = updated;
                 snapshot_dirty = false;
                 last_snapshot_refresh = Instant::now();
             }
@@ -1218,27 +1608,175 @@ fn run_attach_loop(
     Ok(())
 }
 
+fn action_changes_input_target(action: &InputAction) -> bool {
+    matches!(
+        action,
+        InputAction::SplitPane(_)
+            | InputAction::SelectWindowIndex(_)
+            | InputAction::NewWindow
+            | InputAction::NextWindow
+            | InputAction::PrevWindow
+            | InputAction::FocusPane(_)
+            | InputAction::KillPane
+    )
+}
+
+fn read_attach_event(
+    pending_event: &mut Option<Event>,
+    mut event_logger: Option<&mut EventLogger>,
+) -> Result<Event> {
+    let event = loop {
+        let event = if let Some(event) = pending_event.take() {
+            if let Some(logger) = event_logger.as_deref_mut() {
+                logger.log_event("pending", &event)?;
+            }
+            event
+        } else {
+            let event = event::read().context("failed to read terminal event")?;
+            if let Some(logger) = event_logger.as_deref_mut() {
+                logger.log_event("raw", &event)?;
+            }
+            event
+        };
+        match event {
+            Event::Key(key) if key.kind == KeyEventKind::Release => continue,
+            other => break other,
+        }
+    };
+
+    let Event::Key(key) = event else {
+        return Ok(event);
+    };
+
+    if !matches!(key.code, KeyCode::Esc) || !key.modifiers.is_empty() {
+        let event = Event::Key(key);
+        if let Some(logger) = event_logger.as_deref_mut() {
+            logger.log_event("normalized", &event)?;
+        }
+        return Ok(event);
+    }
+
+    if !event::poll(ALT_SEQUENCE_TIMEOUT).context("failed to poll terminal event")? {
+        let event = Event::Key(key);
+        if let Some(logger) = event_logger.as_deref_mut() {
+            logger.log_event("normalized", &event)?;
+        }
+        return Ok(event);
+    }
+
+    let next = event::read().context("failed to read terminal event")?;
+    if let Some(logger) = event_logger.as_deref_mut() {
+        logger.log_event("raw-followup", &next)?;
+    }
+    let event = coalesce_escape_digit_event(Event::Key(key), next, pending_event);
+    if let Some(logger) = event_logger.as_deref_mut() {
+        logger.log_event("normalized", &event)?;
+    }
+    Ok(event)
+}
+
+fn coalesce_escape_digit_event(event: Event, next: Event, pending_event: &mut Option<Event>) -> Event {
+    let Event::Key(key) = event else {
+        return event;
+    };
+    if !matches!(key.code, KeyCode::Esc) || !key.modifiers.is_empty() {
+        return Event::Key(key);
+    }
+    match next {
+        Event::Key(next_key)
+            if matches!(next_key.code, KeyCode::Char('1'..='9')) && next_key.modifiers.is_empty() =>
+        {
+            Event::Key(KeyEvent::new(next_key.code, KeyModifiers::ALT))
+        }
+        other => {
+            *pending_event = Some(other);
+            Event::Key(key)
+        }
+    }
+}
+
+impl EventLogger {
+    fn from_env(paths: &RuntimePaths) -> Result<Option<Self>> {
+        let Some(target) = std::env::var_os("ADMUX_KEY_LOG") else {
+            return Ok(None);
+        };
+        let path = if target == "1" {
+            paths.socket_dir().join("attach-events.log")
+        } else {
+            PathBuf::from(target)
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create event log directory {}", parent.display()))?;
+        }
+        let out = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("failed to open event log {}", path.display()))?;
+        let mut logger = Self { out };
+        logger.log_line(&format!("log path {}", path.display()))?;
+        Ok(Some(logger))
+    }
+
+    fn log_event(&mut self, stage: &str, event: &Event) -> Result<()> {
+        self.log_line(&format!("{stage}: {event:?}"))
+    }
+
+    fn log_line(&mut self, line: &str) -> Result<()> {
+        writeln!(self.out, "{line}").context("failed to write event log")
+    }
+
+    fn log_snapshot_summary(&mut self, session: &str, snapshot: &RenderSnapshot) -> Result<()> {
+        let active_windows = snapshot
+            .windows
+            .iter()
+            .filter(|window| window.active)
+            .map(|window| format!("id={} index={} name={}", window.id, window.index, window.name))
+            .collect::<Vec<_>>();
+        self.log_line(&format!(
+            "snapshot: session={session} windows={:?} active_windows={:?}",
+            snapshot
+                .windows
+                .iter()
+                .map(|window| (window.id, window.index, window.active))
+                .collect::<Vec<_>>(),
+            active_windows
+        ))
+    }
+}
+
 fn fetch_attach_snapshot(
     paths: &RuntimePaths,
     current_session: &mut String,
     last_size: &mut (u16, u16),
     width: u16,
     height: u16,
+    client_id: Option<&str>,
 ) -> Result<RenderSnapshot> {
     let response = request_response(
         paths,
         CommandRequest::Attach {
             session: Some(current_session.clone()),
+            viewport: client_id.map(|client_id| ClientViewport {
+                client_id: client_id.to_string(),
+                rows: height.max(1),
+                cols: width.max(1),
+            }),
         },
     )?;
     apply_attached_session(&response, current_session, last_size);
-    match response {
+    let snapshot = match response {
         CommandResponse::Attached {
             preview, snapshot, ..
-        } => Ok(snapshot.unwrap_or_else(|| fallback_snapshot(preview, width, height))),
-        CommandResponse::Error { message } => Err(anyhow!(message)),
-        other => Err(anyhow!("unexpected attach response: {other:?}")),
+        } => snapshot.unwrap_or_else(|| fallback_snapshot(preview, width, height)),
+        CommandResponse::Error { message } => return Err(anyhow!(message)),
+        other => return Err(anyhow!("unexpected attach response: {other:?}")),
+    };
+    if let Some(mut logger) = EventLogger::from_env(paths)? {
+        logger.log_snapshot_summary(current_session, &snapshot)?;
     }
+    Ok(snapshot)
 }
 
 fn load_config(paths: &RuntimePaths) -> Result<ResolvedConfig> {
@@ -1248,11 +1786,49 @@ fn load_config(paths: &RuntimePaths) -> Result<ResolvedConfig> {
     Config::load_from_path(&paths.config_path)?.resolve()
 }
 
+fn numbering_from_config(config: &ResolvedConfig) -> Numbering {
+    Numbering {
+        window_base: config.behavior.window_base,
+        pane_base: config.behavior.pane_base,
+    }
+}
+
+fn run_alias_command(paths: &RuntimePaths, args: AliasArgs) -> Result<()> {
+    match args.command {
+        AliasCommand::Add(AliasAddArgs { name, path }) => {
+            let config = load_config(paths)?;
+            let manifest = AliasRegistry::update(&paths.aliases_path, |registry| {
+                registry.add(
+                    &name,
+                    path.as_deref(),
+                    numbering_from_config(&config),
+                    crate::cli::TOP_LEVEL_COMMAND_NAMES,
+                )
+            })?;
+            println!("added alias {name} {}", manifest.display());
+        }
+        AliasCommand::List => {
+            let registry = AliasRegistry::load(&paths.aliases_path)?;
+            for (name, path) in registry.list() {
+                println!("{name} {}", path.display());
+            }
+        }
+        AliasCommand::Remove(args) => {
+            AliasRegistry::update(&paths.aliases_path, |registry| registry.remove(&args.name))?;
+            println!("removed alias {}", args.name);
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_prompt_key(
     paths: &RuntimePaths,
     snapshot: &RenderSnapshot,
     current_session: &mut String,
+    last_size: &mut (u16, u16),
+    input_state: &mut InputState,
+    config: &mut ResolvedConfig,
     prompt: &mut PromptState,
     history: &mut Vec<String>,
     key: crossterm::event::KeyEvent,
@@ -1263,32 +1839,89 @@ fn handle_prompt_key(
         KeyCode::Enter => {
             let command = prompt.buffer.trim().to_string();
             if !command.is_empty() {
-                history.push(command.clone());
-                let result = execute_prompt_command(paths, snapshot, current_session, &command)?;
-                *status_message = result;
+                match parse_command(&command) {
+                    Ok(parsed) => {
+                        if let Some(result) = prompt_overlay_command(&parsed) {
+                            history.push(command);
+                            return Ok(result);
+                        }
+                        if matches!(parsed, InteractiveCommand::ReloadConfig) {
+                            match reload_interactive_config(paths, input_state, config) {
+                                Ok(()) => {
+                                    history.push(command);
+                                    *status_message = Some("config reloaded".into());
+                                }
+                                Err(error) => {
+                                    *status_message = Some(error.to_string());
+                                    return Ok(PromptResult::KeepOpen);
+                                }
+                            }
+                        } else {
+                            match execute_prompt_command(
+                                paths,
+                                snapshot,
+                                current_session,
+                                last_size,
+                                &command,
+                            ) {
+                                Ok(result) => {
+                                    history.push(command);
+                                    *status_message = result;
+                                }
+                                Err(error) => {
+                                    *status_message = Some(error.to_string());
+                                    return Ok(PromptResult::KeepOpen);
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => match execute_prompt_command(
+                        paths,
+                        snapshot,
+                        current_session,
+                        last_size,
+                        &command,
+                    ) {
+                        Ok(result) => {
+                            history.push(command);
+                            *status_message = result;
+                        }
+                        Err(error) => {
+                            *status_message = Some(error.to_string());
+                            return Ok(PromptResult::KeepOpen);
+                        }
+                    },
+                };
             }
             return Ok(PromptResult::CloseAndClearSelection);
         }
         KeyCode::Tab => {
-            if !prompt.completions.is_empty() {
-                prompt.selected = (prompt.selected + 1) % prompt.completions.len();
-                prompt.buffer = prompt.completions[prompt.selected].clone();
-                prompt.cursor = prompt.buffer.len();
-            }
+            cycle_prompt_completion(prompt);
+            return Ok(PromptResult::KeepOpen);
         }
         KeyCode::Backspace => {
-            if prompt.cursor > 0 {
-                prompt.buffer.remove(prompt.cursor - 1);
-                prompt.cursor -= 1;
+            if let Some(previous) = previous_char_boundary(&prompt.buffer, prompt.cursor) {
+                prompt.buffer.drain(previous..prompt.cursor);
+                prompt.cursor = previous;
             }
         }
         KeyCode::Delete => {
             if prompt.cursor < prompt.buffer.len() {
-                prompt.buffer.remove(prompt.cursor);
+                let next = next_char_boundary(&prompt.buffer, prompt.cursor)
+                    .expect("cursor before string end must have a following character");
+                prompt.buffer.drain(prompt.cursor..next);
             }
         }
-        KeyCode::Left => prompt.cursor = prompt.cursor.saturating_sub(1),
-        KeyCode::Right => prompt.cursor = (prompt.cursor + 1).min(prompt.buffer.len()),
+        KeyCode::Left => {
+            if let Some(previous) = previous_char_boundary(&prompt.buffer, prompt.cursor) {
+                prompt.cursor = previous;
+            }
+        }
+        KeyCode::Right => {
+            if let Some(next) = next_char_boundary(&prompt.buffer, prompt.cursor) {
+                prompt.cursor = next;
+            }
+        }
         KeyCode::Home => prompt.cursor = 0,
         KeyCode::End => prompt.cursor = prompt.buffer.len(),
         KeyCode::Up => {
@@ -1313,26 +1946,87 @@ fn handle_prompt_key(
         }
         KeyCode::Char(ch) if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
             prompt.buffer.insert(prompt.cursor, ch);
-            prompt.cursor += 1;
+            prompt.cursor += ch.len_utf8();
         }
         _ => {}
     }
 
+    refresh_prompt_completions(prompt);
+    Ok(PromptResult::KeepOpen)
+}
+
+fn prompt_overlay_command(command: &InteractiveCommand) -> Option<PromptResult> {
+    match command {
+        InteractiveCommand::ChooseTree => Some(PromptResult::OpenChooseTree),
+        InteractiveCommand::ChooseBuffer => Some(PromptResult::OpenChooseBuffer),
+        InteractiveCommand::DetachClient => Some(PromptResult::Detach),
+        _ => None,
+    }
+}
+
+fn reload_interactive_config(
+    paths: &RuntimePaths,
+    input_state: &mut InputState,
+    config: &mut ResolvedConfig,
+) -> Result<()> {
+    match request_response(paths, CommandRequest::ReloadConfig)? {
+        CommandResponse::ConfigReloaded => {
+            let reloaded = load_config(paths)?;
+            input_state.replace_config(reloaded.keys.clone(), reloaded.behavior.resize_step);
+            *config = reloaded;
+            Ok(())
+        }
+        CommandResponse::Error { message } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected reload response: {other:?}")),
+    }
+}
+
+fn insert_prompt_text(prompt: &mut PromptState, text: &str) {
+    prompt.buffer.insert_str(prompt.cursor, text);
+    prompt.cursor += text.len();
+    prompt.history_index = None;
+    refresh_prompt_completions(prompt);
+}
+
+fn refresh_prompt_completions(prompt: &mut PromptState) {
     let prefix = prompt.buffer.split_whitespace().next().unwrap_or("");
     prompt.completions = command_completions(prefix);
     prompt.selected = 0;
-    Ok(PromptResult::KeepOpen)
+}
+
+fn cycle_prompt_completion(prompt: &mut PromptState) {
+    let Some(selected_completion) = prompt.completions.get(prompt.selected) else {
+        return;
+    };
+    if prompt.buffer == *selected_completion {
+        prompt.selected = (prompt.selected + 1) % prompt.completions.len();
+    }
+    let Some(completion) = prompt.completions.get(prompt.selected).cloned() else {
+        return;
+    };
+    prompt.buffer = completion;
+    prompt.cursor = prompt.buffer.len();
+}
+
+fn previous_char_boundary(text: &str, cursor: usize) -> Option<usize> {
+    text.get(..cursor)?.char_indices().next_back().map(|(index, _)| index)
+}
+
+fn next_char_boundary(text: &str, cursor: usize) -> Option<usize> {
+    let suffix = text.get(cursor..)?;
+    suffix.chars().next().map(|ch| cursor + ch.len_utf8())
 }
 
 fn execute_prompt_command(
     paths: &RuntimePaths,
     snapshot: &RenderSnapshot,
     current_session: &mut String,
+    last_size: &mut (u16, u16),
     input: &str,
 ) -> Result<Option<String>> {
     match parse_command(input).map_err(anyhow::Error::msg)? {
         InteractiveCommand::SplitWindow { horizontal } => {
-            let _ = request_response(
+            ensure_command_succeeded(request_response(
                 paths,
                 CommandRequest::SplitPane {
                     target: current_session.clone(),
@@ -1343,176 +2037,206 @@ fn execute_prompt_command(
                     },
                     command: Vec::new(),
                 },
-            )?;
+            )?)?;
             Ok(None)
         }
         InteractiveCommand::NewWindow => {
-            let _ = request_response(
+            ensure_command_succeeded(request_response(
                 paths,
                 CommandRequest::NewWindow {
                     session: current_session.clone(),
                     name: None,
                     command: Vec::new(),
                 },
-            )?;
+            )?)?;
             Ok(None)
         }
         InteractiveCommand::SelectWindow { target } => {
             let target = resolve_window_target(snapshot, current_session, &target);
-            let _ = request_response(paths, CommandRequest::SelectWindow { target })?;
+            ensure_command_succeeded(request_response(paths, CommandRequest::SelectWindow { target })?)?;
             Ok(None)
         }
         InteractiveCommand::NextWindow => {
-            let _ = request_response(
+            ensure_command_succeeded(request_response(
                 paths,
                 CommandRequest::CycleWindow {
                     session: current_session.clone(),
                     direction: CycleDirection::Next,
                 },
-            )?;
+            )?)?;
             Ok(None)
         }
         InteractiveCommand::PreviousWindow => {
-            let _ = request_response(
+            ensure_command_succeeded(request_response(
                 paths,
                 CommandRequest::CycleWindow {
                     session: current_session.clone(),
                     direction: CycleDirection::Prev,
                 },
-            )?;
+            )?)?;
             Ok(None)
         }
         InteractiveCommand::KillPane => {
-            let _ = request_response(
+            ensure_command_succeeded(request_response(
                 paths,
                 CommandRequest::KillPane {
                     target: current_session.clone(),
                 },
-            )?;
+            )?)?;
             Ok(None)
         }
         InteractiveCommand::KillWindow => {
             let target = format!("{}:{}", current_session, snapshot.active_window_id);
-            let _ = request_response(paths, CommandRequest::KillWindow { target })?;
+            ensure_command_succeeded(request_response(paths, CommandRequest::KillWindow { target })?)?;
             Ok(None)
         }
         InteractiveCommand::AttachSession { target }
         | InteractiveCommand::SwitchClient { target } => {
-            let _ = request_response(
+            let response = request_response(
                 paths,
                 CommandRequest::Attach {
                     session: Some(target.clone()),
+                    viewport: None,
                 },
             )?;
-            *current_session = target;
+            apply_prompt_session_switch(current_session, last_size, response)?;
             Ok(None)
         }
         InteractiveCommand::ListSessions => {
-            let response = request_response(paths, CommandRequest::ListSessions)?;
+            let response = ensure_command_succeeded(request_response(paths, CommandRequest::ListSessions)?)?;
             Ok(Some(format_list_response(response)))
         }
         InteractiveCommand::ListWindows => {
-            let response = request_response(
+            let response = ensure_command_succeeded(request_response(
                 paths,
                 CommandRequest::ListWindows {
                     session: current_session.clone(),
                 },
-            )?;
+            )?)?;
             Ok(Some(format_list_response(response)))
         }
         InteractiveCommand::ListPanes => {
-            let response = request_response(
+            let response = ensure_command_succeeded(request_response(
                 paths,
                 CommandRequest::ListPanes {
                     target: current_session.clone(),
                 },
-            )?;
+            )?)?;
             Ok(Some(format_list_response(response)))
         }
         InteractiveCommand::ListBuffers => {
-            let response = request_response(paths, CommandRequest::ListBuffers)?;
+            let response = ensure_command_succeeded(request_response(paths, CommandRequest::ListBuffers)?)?;
             Ok(Some(format_list_response(response)))
         }
         InteractiveCommand::ShowBuffer { buffer } => {
-            let response = request_response(paths, CommandRequest::ShowBuffer { buffer })?;
+            let response = ensure_command_succeeded(request_response(paths, CommandRequest::ShowBuffer { buffer })?)?;
             Ok(Some(format_list_response(response)))
         }
         InteractiveCommand::DeleteBuffer { buffer } => {
-            let response = request_response(paths, CommandRequest::DeleteBuffer { buffer })?;
+            let response = ensure_command_succeeded(request_response(paths, CommandRequest::DeleteBuffer { buffer })?)?;
             Ok(Some(format_list_response(response)))
         }
         InteractiveCommand::PasteBuffer { buffer, target } => {
-            let response = request_response(
+            let response = ensure_command_succeeded(request_response(
                 paths,
                 CommandRequest::PasteBuffer {
                     target: target.unwrap_or_else(|| current_session.clone()),
                     buffer,
                 },
-            )?;
+            )?)?;
             Ok(Some(format_list_response(response)))
         }
         InteractiveCommand::SetBuffer { buffer, data } => {
-            let response = request_response(
+            let response = ensure_command_succeeded(request_response(
                 paths,
                 CommandRequest::SetBuffer {
                     buffer,
                     data,
                     append: false,
                 },
-            )?;
+            )?)?;
             Ok(Some(format_list_response(response)))
         }
         InteractiveCommand::SaveBuffer { buffer, path } => {
-            let response = request_response(
+            let response = ensure_command_succeeded(request_response(
                 paths,
                 CommandRequest::SaveBuffer {
                     buffer,
-                    path: path.into(),
+                    path: resolve_client_path(path.into())?,
                 },
-            )?;
+            )?)?;
             Ok(Some(format_list_response(response)))
         }
         InteractiveCommand::LoadBuffer { buffer, path } => {
-            let response = request_response(
+            let response = ensure_command_succeeded(request_response(
                 paths,
                 CommandRequest::LoadBuffer {
-                    path: path.into(),
+                    path: resolve_client_path(path.into())?,
                     buffer,
                 },
-            )?;
+            )?)?;
             Ok(Some(format_list_response(response)))
         }
-        InteractiveCommand::ChooseBuffer => Ok(Some("use Ctrl-b =".into())),
-        InteractiveCommand::ChooseTree => Ok(Some("use Ctrl-b s".into())),
-        InteractiveCommand::DetachClient => Ok(Some("use Ctrl-b d".into())),
+        InteractiveCommand::ChooseBuffer
+        | InteractiveCommand::ChooseTree
+        | InteractiveCommand::DetachClient => unreachable!("handled before prompt dispatch"),
         InteractiveCommand::RenameWindow { name } => {
             let target = format!("{}:{}", current_session, snapshot.active_window_id);
-            let _ = request_response(paths, CommandRequest::RenameWindow { target, name })?;
+            ensure_command_succeeded(request_response(paths, CommandRequest::RenameWindow { target, name })?)?;
             Ok(None)
         }
         InteractiveCommand::SaveSession => {
-            let response = request_response(
+            let response = ensure_command_succeeded(request_response(
                 paths,
                 CommandRequest::SaveWorkspace {
                     session: Some(current_session.clone()),
                 },
-            )?;
+            )?)?;
             Ok(Some(format_list_response(response)))
         }
         InteractiveCommand::SendKeys { keys } => {
-            let _ = request_response(
+            ensure_command_succeeded(request_response(
                 paths,
                 CommandRequest::SendKeys {
                     target: current_session.clone(),
                     keys,
                 },
-            )?;
+            )?)?;
             Ok(None)
         }
         InteractiveCommand::ReloadConfig => {
-            let _ = request_response(paths, CommandRequest::ReloadConfig)?;
+            ensure_command_succeeded(request_response(paths, CommandRequest::ReloadConfig)?)?;
             Ok(Some("config reloaded".into()))
         }
+    }
+}
+
+fn ensure_command_succeeded(response: CommandResponse) -> Result<CommandResponse> {
+    match response {
+        CommandResponse::Error { message } => Err(anyhow!(message)),
+        response => Ok(response),
+    }
+}
+
+fn apply_prompt_session_switch(
+    current_session: &mut String,
+    last_size: &mut (u16, u16),
+    response: CommandResponse,
+) -> Result<()> {
+    match response {
+        CommandResponse::Attached { session, .. } => {
+            switch_client_session(current_session, last_size, session);
+            Ok(())
+        }
+        CommandResponse::Error { message } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected attach response: {other:?}")),
+    }
+}
+
+fn switch_client_session(current_session: &mut String, last_size: &mut (u16, u16), session: String) {
+    if *current_session != session {
+        *current_session = session;
+        *last_size = (0, 0);
     }
 }
 
@@ -1570,9 +2294,12 @@ fn command_completions(prefix: &str) -> Vec<String> {
 
 fn resolve_window_target(snapshot: &RenderSnapshot, session: &str, target: &str) -> String {
     if let Ok(index) = target.parse::<usize>()
-        && let Some(window) = snapshot.windows.iter().find(|window| window.index == index)
+        && let Some(window) = snapshot
+            .windows
+            .iter()
+            .find(|window| window.index == index as u64)
     {
-        return format!("{session}:{}", window.id);
+        return format!("{session}:{}", window.index);
     }
     if target.contains(':') {
         target.to_string()
@@ -1591,6 +2318,7 @@ fn build_choose_tree(paths: &RuntimePaths, current_session: &str) -> Result<Choo
         attached_session: current_session.to_string(),
         search_input: None,
         last_search: None,
+        preview: None,
     };
     rebuild_choose_tree(paths, &mut state)?;
     Ok(state)
@@ -1604,13 +2332,15 @@ fn build_choose_buffer(paths: &RuntimePaths) -> Result<ChooseBufferState> {
     Ok(ChooseBufferState {
         buffers,
         selected: 0,
+        preview: None,
     })
 }
 
 fn rebuild_choose_tree(paths: &RuntimePaths, state: &mut ChooseTreeState) -> Result<()> {
-    let sessions = match request_response(paths, CommandRequest::ListSessions)? {
-        CommandResponse::SessionList { sessions } => sessions,
-        other => return Err(anyhow!("unexpected session list response: {other:?}")),
+    state.preview = None;
+    let sessions = match request_response(paths, CommandRequest::ListChooseTree)? {
+        CommandResponse::ChooseTreeList { sessions } => sessions,
+        other => return Err(anyhow!("unexpected choose-tree response: {other:?}")),
     };
     let mut items = Vec::new();
     let mut lines = Vec::new();
@@ -1619,15 +2349,7 @@ fn rebuild_choose_tree(paths: &RuntimePaths, state: &mut ChooseTreeState) -> Res
         let session_name = session.name.clone();
         let expanded = state.expanded_sessions.contains(&session_name);
         items.push(ChooseItem::Session(session_name.clone()));
-        let window_count = match request_response(
-            paths,
-            CommandRequest::ListWindows {
-                session: session_name.clone(),
-            },
-        )? {
-            CommandResponse::WindowList { windows } => windows.len(),
-            _ => 0,
-        };
+        let window_count = session.windows.len();
         lines.push(TreeLine {
             depth: 0,
             label: if session_name == state.attached_session {
@@ -1648,22 +2370,14 @@ fn rebuild_choose_tree(paths: &RuntimePaths, state: &mut ChooseTreeState) -> Res
         if !expanded {
             continue;
         }
-        let windows = match request_response(
-            paths,
-            CommandRequest::ListWindows {
-                session: session_name.clone(),
-            },
-        )? {
-            CommandResponse::WindowList { windows } => windows,
-            _ => Vec::new(),
-        };
-        for window in windows {
+        for entry in session.windows {
+            let crate::ipc::ChooseTreeWindow { window, panes } = entry;
             let expanded_window = state
                 .expanded_windows
-                .contains(&(session_name.clone(), window.id));
+                .contains(&(session_name.clone(), window.index));
             items.push(ChooseItem::Window {
                 session: session_name.clone(),
-                window_id: window.id,
+                window_index: window.index,
             });
             lines.push(TreeLine {
                 depth: 1,
@@ -1675,19 +2389,10 @@ fn rebuild_choose_tree(paths: &RuntimePaths, state: &mut ChooseTreeState) -> Res
             if !expanded_window {
                 continue;
             }
-            let panes = match request_response(
-                paths,
-                CommandRequest::ListPanes {
-                    target: format!("{session_name}:{}", window.id),
-                },
-            )? {
-                CommandResponse::PaneList { panes } => panes,
-                _ => Vec::new(),
-            };
             for pane in panes {
                 items.push(ChooseItem::Pane {
                     session: session_name.clone(),
-                    window_id: window.id,
+                    window_index: window.index,
                     pane_id: pane.id,
                 });
                 lines.push(TreeLine {
@@ -1716,8 +2421,13 @@ fn rebuild_choose_tree(paths: &RuntimePaths, state: &mut ChooseTreeState) -> Res
 
 fn chooser_preview(
     paths: &RuntimePaths,
-    tree: &ChooseTreeState,
+    tree: &mut ChooseTreeState,
 ) -> Result<(String, RenderSnapshot)> {
+    if let Some((selected, title, snapshot)) = &tree.preview
+        && *selected == tree.selected
+    {
+        return Ok((title.clone(), snapshot.clone()));
+    }
     let Some(item) = tree.items.get(tree.selected) else {
         return Ok((
             "no sessions".into(),
@@ -1729,34 +2439,39 @@ fn chooser_preview(
         | ChooseItem::Window { session, .. }
         | ChooseItem::Pane { session, .. } => session.clone(),
     };
-    if matches!(item, ChooseItem::Session(_)) {
-        let snapshot = match request_response(
-            paths,
-            CommandRequest::PreviewSession {
-                session: session.clone(),
-            },
-        )? {
-            CommandResponse::SessionPreview { snapshot } => snapshot,
-            CommandResponse::Error { message } => return Err(anyhow!(message)),
-            other => return Err(anyhow!("unexpected session preview response: {other:?}")),
-        };
-        return Ok((session, snapshot));
-    }
-    let snapshot = match request_response(
+    let target = match item {
+        ChooseItem::Session(_) => None,
+        ChooseItem::Window { window_index, .. } => Some(format!("{session}:{window_index}")),
+        ChooseItem::Pane {
+            window_index,
+            pane_id,
+            ..
+        } => Some(format!("{session}:{window_index}.{pane_id}")),
+    };
+    let (title, snapshot) = match request_response(
         paths,
-        CommandRequest::Attach {
-            session: Some(session.clone()),
+        CommandRequest::PreviewSession {
+            session: session.clone(),
+            target,
         },
     )? {
-        CommandResponse::Attached {
-            preview, snapshot, ..
-        } => snapshot.unwrap_or_else(|| fallback_snapshot(preview, 80, 24)),
-        _ => fallback_snapshot(String::new(), 80, 24),
+        CommandResponse::SessionPreview { snapshot } => (session.clone(), snapshot),
+        CommandResponse::Error { message } => (
+            format!("{session} (unavailable)"),
+            fallback_snapshot(format!("preview unavailable: {message}"), 80, 24),
+        ),
+        other => return Err(anyhow!("unexpected session preview response: {other:?}")),
     };
-    Ok((session, snapshot))
+    tree.preview = Some((tree.selected, title.clone(), snapshot.clone()));
+    Ok((title, snapshot))
 }
 
-fn buffer_preview(paths: &RuntimePaths, chooser: &ChooseBufferState) -> Result<String> {
+fn buffer_preview(paths: &RuntimePaths, chooser: &mut ChooseBufferState) -> Result<String> {
+    if let Some((selected, preview)) = &chooser.preview
+        && *selected == chooser.selected
+    {
+        return Ok(preview.clone());
+    }
     let Some(buffer) = chooser.buffers.get(chooser.selected) else {
         return Ok(String::new());
     };
@@ -1766,7 +2481,10 @@ fn buffer_preview(paths: &RuntimePaths, chooser: &ChooseBufferState) -> Result<S
             buffer: Some(buffer.name.clone()),
         },
     )? {
-        CommandResponse::BufferShown { data, .. } => Ok(data),
+        CommandResponse::BufferShown { data, .. } => {
+            chooser.preview = Some((chooser.selected, data.clone()));
+            Ok(data)
+        }
         other => Err(anyhow!("unexpected buffer preview response: {other:?}")),
     }
 }
@@ -1776,6 +2494,8 @@ fn handle_choose_tree_key(
     tree: &mut ChooseTreeState,
     key: crossterm::event::KeyEvent,
     current_session: &mut String,
+    last_size: &mut (u16, u16),
+    status_message: &mut Option<String>,
 ) -> Result<bool> {
     if let Some(query) = tree.search_input.as_mut() {
         match key.code {
@@ -1840,38 +2560,70 @@ fn handle_choose_tree_key(
             if let Some(item) = tree.items.get(tree.selected).cloned() {
                 match item {
                     ChooseItem::Session(session) => {
-                        *current_session = session;
-                        tree.attached_session = current_session.clone();
+                        match request_response(
+                            paths,
+                            CommandRequest::Attach {
+                                session: Some(session),
+                                viewport: None,
+                            },
+                        )? {
+                            CommandResponse::Attached { session, .. } => {
+                                switch_client_session(current_session, last_size, session);
+                                tree.attached_session = current_session.clone();
+                            }
+                            CommandResponse::Error { message } => {
+                                *status_message = Some(message);
+                                return Ok(true);
+                            }
+                            other => {
+                                *status_message = Some(format!(
+                                    "unexpected session attach response: {other:?}"
+                                ));
+                                return Ok(true);
+                            }
+                        }
                     }
-                    ChooseItem::Window { session, window_id } => {
-                        let _ = request_response(
+                    ChooseItem::Window {
+                        session,
+                        window_index,
+                    } => {
+                        let response = request_response(
                             paths,
                             CommandRequest::SelectWindow {
-                                target: format!("{session}:{window_id}"),
+                                target: format!("{session}:{window_index}"),
                             },
                         )?;
-                        *current_session = session;
+                        if !chooser_command_succeeded(response, status_message) {
+                            return Ok(true);
+                        }
+                        switch_client_session(current_session, last_size, session);
                         tree.attached_session = current_session.clone();
                     }
                     ChooseItem::Pane {
                         session,
-                        window_id,
+                        window_index,
                         pane_id,
                     } => {
-                        let _ = request_response(
+                        let response = request_response(
                             paths,
                             CommandRequest::SelectWindow {
-                                target: format!("{session}:{window_id}"),
+                                target: format!("{session}:{window_index}"),
                             },
                         )?;
-                        let _ = request_response(
+                        if !chooser_command_succeeded(response, status_message) {
+                            return Ok(true);
+                        }
+                        let response = request_response(
                             paths,
                             CommandRequest::SelectPane {
-                                target: Some(format!("{session}:{window_id}.{pane_id}")),
+                                target: Some(format!("{session}:{window_index}.{pane_id}")),
                                 direction: None,
                             },
                         )?;
-                        *current_session = session;
+                        if !chooser_command_succeeded(response, status_message) {
+                            return Ok(true);
+                        }
+                        switch_client_session(current_session, last_size, session);
                         tree.attached_session = current_session.clone();
                     }
                 }
@@ -1882,6 +2634,16 @@ fn handle_choose_tree_key(
     }
     rebuild_choose_tree(paths, tree)?;
     Ok(true)
+}
+
+fn chooser_command_succeeded(response: CommandResponse, status_message: &mut Option<String>) -> bool {
+    match response {
+        CommandResponse::Error { message } => {
+            *status_message = Some(message);
+            false
+        }
+        _ => true,
+    }
 }
 
 fn handle_choose_buffer_key(
@@ -1946,8 +2708,11 @@ fn toggle_choose_item(tree: &mut ChooseTreeState, expand: bool) {
                     tree.expanded_sessions.remove(session);
                 }
             }
-            ChooseItem::Window { session, window_id } => {
-                let key = (session.clone(), *window_id);
+            ChooseItem::Window {
+                session,
+                window_index,
+            } => {
+                let key = (session.clone(), *window_index);
                 if expand {
                     tree.expanded_windows.insert(key);
                 } else {
@@ -1969,8 +2734,11 @@ fn toggle_choose_selected(tree: &mut ChooseTreeState) {
                     tree.expanded_sessions.insert(session.clone());
                 }
             }
-            ChooseItem::Window { session, window_id } => {
-                let key = (session.clone(), *window_id);
+            ChooseItem::Window {
+                session,
+                window_index,
+            } => {
+                let key = (session.clone(), *window_index);
                 if tree.expanded_windows.contains(&key) {
                     tree.expanded_windows.remove(&key);
                 } else {
@@ -1983,26 +2751,16 @@ fn toggle_choose_selected(tree: &mut ChooseTreeState) {
 }
 
 fn expand_all_choose_items(paths: &RuntimePaths, tree: &mut ChooseTreeState) -> Result<()> {
-    let sessions: Vec<String> = match request_response(paths, CommandRequest::ListSessions)? {
-        CommandResponse::SessionList { sessions } => {
-            sessions.into_iter().map(|session| session.name).collect()
-        }
-        other => return Err(anyhow!("unexpected session list response: {other:?}")),
+    let sessions = match request_response(paths, CommandRequest::ListChooseTree)? {
+        CommandResponse::ChooseTreeList { sessions } => sessions,
+        other => return Err(anyhow!("unexpected choose-tree response: {other:?}")),
     };
-    tree.expanded_sessions = sessions.iter().cloned().collect();
+    tree.expanded_sessions = sessions.iter().map(|session| session.name.clone()).collect();
     tree.expanded_windows.clear();
     for session in sessions {
-        let windows = match request_response(
-            paths,
-            CommandRequest::ListWindows {
-                session: session.clone(),
-            },
-        )? {
-            CommandResponse::WindowList { windows } => windows,
-            _ => Vec::new(),
-        };
-        for window in windows {
-            tree.expanded_windows.insert((session.clone(), window.id));
+        for entry in session.windows {
+            tree.expanded_windows
+                .insert((session.name.clone(), entry.window.index));
         }
     }
     Ok(())
@@ -2058,6 +2816,10 @@ fn choose_tree_status(tree: &ChooseTreeState) -> String {
     }
 }
 
+fn insert_choose_tree_search_text(tree: &mut ChooseTreeState, text: &str) {
+    tree.search_input.get_or_insert_with(String::new).push_str(text);
+}
+
 fn focused_pane(snapshot: &RenderSnapshot) -> Option<&PaneRender> {
     snapshot.panes.iter().find(|pane| pane.focused)
 }
@@ -2065,9 +2827,10 @@ fn focused_pane(snapshot: &RenderSnapshot) -> Option<&PaneRender> {
 fn copy_mode_from_pane(pane: &PaneRender) -> CopyMode {
     let cursor = pane.cursor.clone().unwrap_or(PaneCursor { row: 0, col: 0 });
     let mut mode = CopyMode::new(pane.pane_id, cursor.row, cursor.col);
-    mode.clamp_to(
+    mode.sync_viewport(
         pane.rows_plain.len().max(1),
         pane.rect.width.max(1) as usize,
+        pane.scrollback,
     );
     mode
 }
@@ -2116,6 +2879,7 @@ fn handle_mouse_event(
     selection_anchor: &mut Option<SelectionAnchor>,
     active_selection: &mut Option<PaneSelection>,
     resize_drag: &mut Option<ResizeDrag>,
+    mouse_capture: &mut Option<MouseCapture>,
     status_message: &mut Option<String>,
 ) -> Result<bool> {
     let ui = &config.ui;
@@ -2138,12 +2902,13 @@ fn handle_mouse_event(
                     direction,
                     last_row: mouse.row,
                     last_col: mouse.column,
+                    span: resize_drag_span(snapshot, direction),
                 });
             } else if let Some((pane, row, col)) =
                 pane_content_hit(snapshot, mouse.row, mouse.column)
             {
                 if config.mouse.focus_on_click {
-                    let _ = request_response(
+                    let response = request_response(
                         paths,
                         CommandRequest::SelectPane {
                             target: Some(format!(
@@ -2153,22 +2918,28 @@ fn handle_mouse_event(
                             direction: None,
                         },
                     )?;
+                    if !handle_interactive_response(response, status_message) {
+                        return Ok(true);
+                    }
                 }
                 if pane.mouse_reporting {
-                send_pane_mouse(snapshot, pane.pane_id, row, col, HelperMouseEventKind::LeftDown)
-                    .or_else(|_| {
-                        request_response(
-                            paths,
-                            CommandRequest::MousePane {
-                                session: session.to_string(),
-                                pane_id: pane.pane_id,
-                                row,
-                                col,
-                                kind: PaneMouseKind::LeftDown,
-                            },
-                        )
-                        .map(|_| ())
-                    })?;
+                    if let Err(error) = send_pane_mouse_or_daemon(
+                        paths,
+                        session,
+                        snapshot,
+                        pane.pane_id,
+                        row,
+                        col,
+                        HelperMouseEventKind::LeftDown,
+                        PaneMouseKind::LeftDown,
+                    ) {
+                        *status_message = Some(error.to_string());
+                        return Ok(true);
+                    }
+                    *mouse_capture = Some(MouseCapture {
+                        pane_id: pane.pane_id,
+                        button: MouseButton::Left,
+                    });
                     *selection_anchor = None;
                     *active_selection = None;
                     return Ok(false);
@@ -2187,40 +2958,99 @@ fn handle_mouse_event(
                 }
             }
         }
+        MouseEventKind::Down(button @ (MouseButton::Middle | MouseButton::Right)) => {
+            if let Some((pane, row, col)) = pane_content_hit(snapshot, mouse.row, mouse.column)
+                && pane.mouse_reporting
+            {
+                if config.mouse.focus_on_click {
+                    let response = request_response(
+                        paths,
+                        CommandRequest::SelectPane {
+                            target: Some(format!(
+                                "{session}:{}.{}",
+                                snapshot.active_window_id, pane.pane_id
+                            )),
+                            direction: None,
+                        },
+                    )?;
+                    if !handle_interactive_response(response, status_message) {
+                        return Ok(true);
+                    }
+                }
+                let (helper_down, _, _) = helper_mouse_kinds(button).expect("supported mouse button");
+                let (pane_down, _, _) = pane_mouse_kinds(button).expect("supported mouse button");
+                if let Err(error) = send_pane_mouse_or_daemon(
+                    paths,
+                    session,
+                    snapshot,
+                    pane.pane_id,
+                    row,
+                    col,
+                    helper_down,
+                    pane_down,
+                ) {
+                    *status_message = Some(error.to_string());
+                    return Ok(true);
+                }
+                *mouse_capture = Some(MouseCapture {
+                    pane_id: pane.pane_id,
+                    button,
+                });
+            }
+        }
         MouseEventKind::Drag(MouseButton::Left) => {
             if let Some(resize) = resize_drag.as_mut() {
                 if let Some((direction, delta)) = resize_drag_request(*resize, mouse) {
                     let target =
                         format!("{session}:{}.{}", snapshot.active_window_id, resize.pane_id);
-                    let _ = request_response(
+                    let response = request_response(
                         paths,
                         CommandRequest::ResizePane {
                             target,
                             direction,
-                            amount: delta.saturating_mul(config.behavior.resize_step.max(1)),
+                            amount: mouse_resize_amount(delta, resize.span),
                         },
                     )?;
+                    if !handle_interactive_response(response, status_message) {
+                        return Ok(true);
+                    }
                     resize.last_row = mouse.row;
                     resize.last_col = mouse.column;
+                }
+            } else if let Some(capture) = *mouse_capture
+                && capture.button == MouseButton::Left
+                && let Some((row, col)) = captured_pane_mouse_position(snapshot, capture, mouse)
+            {
+                if let Err(error) = send_pane_mouse_or_daemon(
+                    paths,
+                    session,
+                    snapshot,
+                    capture.pane_id,
+                    row,
+                    col,
+                    HelperMouseEventKind::LeftDrag,
+                    PaneMouseKind::LeftDrag,
+                ) {
+                    *status_message = Some(error.to_string());
+                    return Ok(true);
                 }
             } else if let Some((pane, row, col)) =
                 pane_content_hit(snapshot, mouse.row, mouse.column)
                 && pane.mouse_reporting
             {
-                send_pane_mouse(snapshot, pane.pane_id, row, col, HelperMouseEventKind::LeftDrag)
-                    .or_else(|_| {
-                        request_response(
-                            paths,
-                            CommandRequest::MousePane {
-                                session: session.to_string(),
-                                pane_id: pane.pane_id,
-                                row,
-                                col,
-                                kind: PaneMouseKind::LeftDrag,
-                            },
-                        )
-                        .map(|_| ())
-                    })?;
+                if let Err(error) = send_pane_mouse_or_daemon(
+                    paths,
+                    session,
+                    snapshot,
+                    pane.pane_id,
+                    row,
+                    col,
+                    HelperMouseEventKind::LeftDrag,
+                    PaneMouseKind::LeftDrag,
+                ) {
+                    *status_message = Some(error.to_string());
+                    return Ok(true);
+                }
             } else if config.mouse.selection_copy
                 && let Some(anchor) = selection_anchor.as_ref()
                 && let Some((pane, row, col)) = pane_content_hit(snapshot, mouse.row, mouse.column)
@@ -2235,23 +3065,23 @@ fn handle_mouse_event(
         }
         MouseEventKind::Up(MouseButton::Left) => {
             *resize_drag = None;
-            if let Some((pane, row, col)) = pane_content_hit(snapshot, mouse.row, mouse.column)
-                && pane.mouse_reporting
+            if mouse_capture.is_some_and(|capture| capture.button == MouseButton::Left)
+                && let Some(capture) = mouse_capture.take()
+                && let Some((row, col)) = captured_pane_mouse_position(snapshot, capture, mouse)
             {
-                send_pane_mouse(snapshot, pane.pane_id, row, col, HelperMouseEventKind::LeftUp)
-                    .or_else(|_| {
-                        request_response(
-                            paths,
-                            CommandRequest::MousePane {
-                                session: session.to_string(),
-                                pane_id: pane.pane_id,
-                                row,
-                                col,
-                                kind: PaneMouseKind::LeftUp,
-                            },
-                        )
-                        .map(|_| ())
-                    })?;
+                if let Err(error) = send_pane_mouse_or_daemon(
+                    paths,
+                    session,
+                    snapshot,
+                    capture.pane_id,
+                    row,
+                    col,
+                    HelperMouseEventKind::LeftUp,
+                    PaneMouseKind::LeftUp,
+                ) {
+                    *status_message = Some(error.to_string());
+                    return Ok(true);
+                }
                 *selection_anchor = None;
                 *active_selection = None;
                 return Ok(false);
@@ -2266,38 +3096,101 @@ fn handle_mouse_event(
                     paths,
                     CommandRequest::CopySelection {
                         session: session.to_string(),
+                        window_id: Some(snapshot.active_window_id),
                         pane_id: Some(pane.pane_id),
-                        start_row: selection.start_row,
+                        start_from_bottom: pane_row_from_bottom(pane, selection.start_row),
                         start_col: selection.start_col,
-                        end_row: selection.end_row,
+                        end_from_bottom: pane_row_from_bottom(pane, selection.end_row),
                         end_col: selection.end_col,
                     },
                 )?;
-                if let CommandResponse::SelectionCopied { text } = copied {
-                    *status_message = copy_text_to_buffer_and_clipboard(paths, stdout, &text)?;
+                match copied {
+                    CommandResponse::SelectionCopied { text } => {
+                        *status_message = copy_text_to_buffer_and_clipboard(
+                            paths,
+                            stdout,
+                            &text,
+                            &config.clipboard,
+                        )?;
+                    }
+                    CommandResponse::Error { message } => *status_message = Some(message),
+                    other => *status_message = Some(format!("unexpected copy response: {other:?}")),
                 }
             }
             *active_selection = None;
             return Ok(true);
         }
+        MouseEventKind::Drag(button @ (MouseButton::Middle | MouseButton::Right)) => {
+            if let Some(capture) = *mouse_capture
+                && capture.button == button
+                && let Some((row, col)) = captured_pane_mouse_position(snapshot, capture, mouse)
+            {
+                let (_, helper_drag, _) = helper_mouse_kinds(button).expect("supported mouse button");
+                let (_, pane_drag, _) = pane_mouse_kinds(button).expect("supported mouse button");
+                if let Err(error) = send_pane_mouse_or_daemon(
+                    paths,
+                    session,
+                    snapshot,
+                    capture.pane_id,
+                    row,
+                    col,
+                    helper_drag,
+                    pane_drag,
+                ) {
+                    *status_message = Some(error.to_string());
+                    return Ok(true);
+                }
+            }
+        }
+        MouseEventKind::Up(button @ (MouseButton::Middle | MouseButton::Right)) => {
+            if mouse_capture.is_some_and(|capture| capture.button == button)
+                && let Some(capture) = mouse_capture.take()
+                && let Some((row, col)) = captured_pane_mouse_position(snapshot, capture, mouse)
+            {
+                let (_, _, helper_up) = helper_mouse_kinds(button).expect("supported mouse button");
+                let (_, _, pane_up) = pane_mouse_kinds(button).expect("supported mouse button");
+                if let Err(error) = send_pane_mouse_or_daemon(
+                    paths,
+                    session,
+                    snapshot,
+                    capture.pane_id,
+                    row,
+                    col,
+                    helper_up,
+                    pane_up,
+                ) {
+                    *status_message = Some(error.to_string());
+                    return Ok(true);
+                }
+                return Ok(false);
+            }
+        }
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
             if !config.mouse.wheel_scroll {
                 return Ok(false);
             }
+            let Some((pane, row, col)) = pane_content_hit(snapshot, mouse.row, mouse.column) else {
+                return Ok(false);
+            };
             let direction = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
                 crate::ipc::ScrollDirection::Up
             } else {
                 crate::ipc::ScrollDirection::Down
             };
-            let _ = request_response(
+            let response = request_response(
                 paths,
                 CommandRequest::MouseScroll {
                     session: session.to_string(),
-                    row: mouse.row,
-                    col: mouse.column,
+                    window_id: snapshot.active_window_id,
+                    pane_id: pane.pane_id,
+                    row,
+                    col,
                     direction,
                 },
             )?;
+            if !handle_interactive_response(response, status_message) {
+                return Ok(true);
+            }
         }
         _ => {}
     }
@@ -2316,6 +3209,31 @@ fn pane_content_hit(
             None
         }
     })
+}
+
+fn pane_row_from_bottom(pane: &PaneRender, row: u16) -> u32 {
+    pane.scrollback.saturating_add(u32::from(
+        pane.rect.height.saturating_sub(1).saturating_sub(row),
+    ))
+}
+
+fn captured_pane_mouse_position(
+    snapshot: &RenderSnapshot,
+    capture: MouseCapture,
+    mouse: MouseEvent,
+) -> Option<(u16, u16)> {
+    let pane = snapshot
+        .panes
+        .iter()
+        .find(|pane| pane.pane_id == capture.pane_id)?;
+    let max_row = pane.rect.y.saturating_add(pane.rect.height.saturating_sub(1));
+    let max_col = pane.rect.x.saturating_add(pane.rect.width.saturating_sub(1));
+    let row = mouse.row.clamp(pane.rect.y, max_row).saturating_sub(pane.rect.y);
+    let col = mouse
+        .column
+        .clamp(pane.rect.x, max_col)
+        .saturating_sub(pane.rect.x);
+    Some((row, col))
 }
 
 fn separator_hit(
@@ -2376,6 +3294,29 @@ fn resize_drag_request(
     }
 }
 
+fn resize_drag_span(snapshot: &RenderSnapshot, direction: NavigationDirection) -> u16 {
+    let span = match direction {
+        NavigationDirection::Left | NavigationDirection::Right => snapshot
+            .panes
+            .iter()
+            .map(|pane| pane.rect.right())
+            .max(),
+        NavigationDirection::Up | NavigationDirection::Down => snapshot
+            .panes
+            .iter()
+            .map(|pane| pane.rect.bottom())
+            .max(),
+    }
+    .unwrap_or(1);
+    span.max(1)
+}
+
+fn mouse_resize_amount(delta_cells: u16, span: u16) -> u16 {
+    let span = u32::from(span.max(1));
+    let amount = (u32::from(delta_cells) * 1000).div_ceil(span);
+    u16::try_from(amount.clamp(1, 100)).expect("clamped mouse resize amount fits u16")
+}
+
 fn fallback_snapshot(preview: String, width: u16, height: u16) -> RenderSnapshot {
     let rows_plain = preview.lines().map(ToOwned::to_owned).collect::<Vec<_>>();
     RenderSnapshot {
@@ -2399,6 +3340,11 @@ fn fallback_snapshot(preview: String, width: u16, height: u16) -> RenderSnapshot
             focused: true,
             helper_socket: None,
             mouse_reporting: false,
+            application_cursor: false,
+            scrollback: 0,
+            preview: preview.clone(),
+            formatted_preview: preview.clone(),
+            formatted_cursor: String::new(),
             rows_formatted: rows_plain.clone(),
             rows_plain,
             cursor: Some(PaneCursor { row: 0, col: 0 }),
@@ -2414,26 +3360,42 @@ fn send_input_bytes(
     snapshot: &RenderSnapshot,
     session: &str,
     bytes: &[u8],
+    client_id: Option<&str>,
 ) -> Result<()> {
     if bytes.is_empty() {
         return Ok(());
     }
 
-    if let Some(pane) = focused_pane(snapshot)
-        && let Some(socket) = pane.helper_socket.clone()
-        && let Ok(process) = PaneProcess::connect(socket)
+    if bytes.iter().any(|byte| matches!(byte, b'\r' | b'\n'))
+        && let Some(client_id) = client_id
     {
-        return process.send_keys(&[String::from_utf8_lossy(bytes).into_owned()]);
+        ensure_command_succeeded(request_response(
+            paths,
+            CommandRequest::RegisterInput {
+                source: SwitchSource {
+                    session: session.to_string(),
+                    window_id: snapshot.active_window_id,
+                    pane_id: snapshot.active_pane_id,
+                },
+                client_id: client_id.to_string(),
+            },
+        )?)?;
     }
 
-    let keys = vec![String::from_utf8_lossy(bytes).into_owned()];
-    let _ = request_response(
+    if let Some(pane) = focused_pane(snapshot)
+        && let Some(socket) = pane.helper_socket.clone()
+        && PaneProcess::send_bytes_to(&socket, bytes).is_ok()
+    {
+        return Ok(());
+    }
+
+    ensure_command_succeeded(request_response(
         paths,
-        CommandRequest::SendKeys {
+        CommandRequest::SendBytes {
             target: session.to_string(),
-            keys,
+            bytes: bytes.to_vec(),
         },
-    )?;
+    )?)?;
     Ok(())
 }
 
@@ -2457,6 +3419,32 @@ fn send_pane_mouse(
     process.handle_mouse_event(kind, row, col)
 }
 
+fn send_pane_mouse_or_daemon(
+    paths: &RuntimePaths,
+    session: &str,
+    snapshot: &RenderSnapshot,
+    pane_id: u64,
+    row: u16,
+    col: u16,
+    helper_kind: HelperMouseEventKind,
+    daemon_kind: PaneMouseKind,
+) -> Result<()> {
+    send_pane_mouse(snapshot, pane_id, row, col, helper_kind).or_else(|_| {
+        ensure_command_succeeded(request_response(
+            paths,
+            CommandRequest::MousePane {
+                session: session.to_string(),
+                window_id: snapshot.active_window_id,
+                pane_id,
+                row,
+                col,
+                kind: daemon_kind,
+            },
+        )?)?;
+        Ok(())
+    })
+}
+
 fn copy_via_osc52(out: &mut impl Write, text: &str) -> Result<()> {
     let encoded = STANDARD.encode(text.as_bytes());
     write!(out, "\x1b]52;c;{encoded}\x07").context("failed to write OSC52 sequence")?;
@@ -2468,6 +3456,7 @@ fn copy_text_to_buffer_and_clipboard(
     paths: &RuntimePaths,
     out: &mut impl Write,
     text: &str,
+    clipboard: &ClipboardConfig,
 ) -> Result<Option<String>> {
     let copied_chars = text.chars().count();
     if copied_chars == 0 {
@@ -2485,10 +3474,46 @@ fn copy_text_to_buffer_and_clipboard(
         CommandResponse::Error { message } => return Err(anyhow!(message)),
         other => return Err(anyhow!("unexpected set-buffer response: {other:?}")),
     };
-    copy_via_osc52(out, text).context("failed to send OSC52 clipboard copy")?;
+    copy_to_clipboard(clipboard, out, text)?;
     Ok(Some(format!(
         "copied {copied_chars} chars to {buffer_name}"
     )))
+}
+
+fn copy_to_clipboard(
+    clipboard: &ClipboardConfig,
+    out: &mut impl Write,
+    text: &str,
+) -> Result<()> {
+    match clipboard.backend {
+        ClipboardBackend::Osc52 => {
+            copy_via_osc52(out, text).context("failed to send OSC52 clipboard copy")
+        }
+        ClipboardBackend::ExternalCommand => {
+            let (program, arguments) = clipboard
+                .command
+                .split_first()
+                .ok_or_else(|| anyhow!("clipboard.command is required for external-command"))?;
+            let mut child = Command::new(program)
+                .args(arguments)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .with_context(|| format!("failed to spawn clipboard command {program}"))?;
+            child
+                .stdin
+                .as_mut()
+                .ok_or_else(|| anyhow!("clipboard command stdin is unavailable"))?
+                .write_all(text.as_bytes())
+                .context("failed to write clipboard command stdin")?;
+            let status = child.wait().context("failed to wait for clipboard command")?;
+            if !status.success() {
+                bail!("clipboard command {program} exited with {status}");
+            }
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2496,11 +3521,17 @@ mod tests {
     use super::*;
     use crate::paths::RuntimePaths;
     use std::{
+        collections::VecDeque,
+        ffi::OsString,
+        fs,
         io::{Read, Write},
         os::unix::net::UnixListener,
     };
-    use tempfile::tempdir;
+    use tempfile::{TempDir, tempdir as make_tempdir};
 
+    fn tempdir() -> TempDir {
+        make_tempdir().expect("tempdir")
+    }
     #[test]
     fn writes_and_reads_protocol_messages() {
         let response = CommandResponse::SessionCreated {
@@ -2518,18 +3549,231 @@ mod tests {
             socket_path: "/tmp/admux-test/socket".into(),
             config_path: "/tmp/admux-test/config.toml".into(),
             state_path: "/tmp/admux-test/state.json".into(),
+            aliases_path: "/tmp/admux-test/aliases.json".into(),
         };
         assert!(paths.socket_path.ends_with("socket"));
     }
 
     #[test]
-    fn ensure_protocol_surfaces_mismatch() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn bare_unknown_subcommand_can_resolve_to_alias() {
+        let dir = tempdir();
+        let manifest = dir.path().join("admux.toml");
+        fs::write(
+            &manifest,
+            r#"
+version = 1
+
+[workspace]
+name = "demo"
+
+[[windows]]
+name = "shell"
+root = { command = ["sh"] }
+"#,
+        )
+        .expect("write manifest");
+        let aliases = dir.path().join("aliases.json");
+        fs::write(
+            &aliases,
+            format!(r#"{{"aliases":{{"demo":"{}"}}}}"#, manifest.display()),
+        )
+        .expect("write aliases");
+        let paths = RuntimePaths {
+            socket_path: dir.path().join("socket"),
+            config_path: dir.path().join("config.toml"),
+            state_path: dir.path().join("state.json"),
+            aliases_path: aliases,
+        };
+
+        let cli = try_resolve_alias_invocation(
+            &[OsString::from("admux"), OsString::from("demo")],
+            &paths,
+        )
+        .expect("resolve alias")
+        .expect("alias cli");
+
+        assert_eq!(
+            cli.command,
+            ClientCommand::Up(crate::cli::UpArgs {
+                detach: false,
+                rebuild: false,
+                path: Some(manifest.canonicalize().expect("canonical manifest")),
+            })
+        );
+    }
+
+    #[test]
+    fn should_only_try_alias_for_single_unknown_subcommand() {
+        let argv = vec![OsString::from("admux"), OsString::from("demo")];
+        let error = AdmuxCli::try_parse_from(&argv).expect_err("unknown subcommand");
+        assert!(should_try_alias(&argv, &error));
+
+        let argv = vec![
+            OsString::from("admux"),
+            OsString::from("demo"),
+            OsString::from("--detach"),
+        ];
+        let error = AdmuxCli::try_parse_from(&argv).expect_err("unknown subcommand");
+        assert!(!should_try_alias(&argv, &error));
+    }
+
+    #[test]
+    fn interactive_attachment_requires_both_terminal_streams() {
+        assert!(interactive_terminal_available_for(true, true, true));
+        assert!(!interactive_terminal_available_for(false, true, true));
+        assert!(!interactive_terminal_available_for(true, false, true));
+        assert!(!interactive_terminal_available_for(true, true, false));
+    }
+
+    #[test]
+    fn prompt_completion_starts_at_the_first_candidate_and_cycles() {
+        let mut prompt = PromptState {
+            buffer: "s".into(),
+            cursor: 1,
+            completions: vec!["send-keys".into(), "select-pane".into(), "split-window".into()],
+            selected: 0,
+            history_index: None,
+        };
+
+        cycle_prompt_completion(&mut prompt);
+        assert_eq!(prompt.buffer, "send-keys");
+        assert_eq!(prompt.selected, 0);
+
+        cycle_prompt_completion(&mut prompt);
+        assert_eq!(prompt.buffer, "select-pane");
+        assert_eq!(prompt.selected, 1);
+
+        cycle_prompt_completion(&mut prompt);
+        assert_eq!(prompt.buffer, "split-window");
+        assert_eq!(prompt.selected, 2);
+
+        cycle_prompt_completion(&mut prompt);
+        assert_eq!(prompt.buffer, "send-keys");
+        assert_eq!(prompt.selected, 0);
+    }
+
+    #[test]
+    fn prompt_command_error_responses_are_failures() {
+        let error = ensure_command_succeeded(CommandResponse::Error {
+            message: "unknown pane".into(),
+        })
+        .expect_err("daemon error must not look successful");
+        assert!(error.to_string().contains("unknown pane"));
+    }
+
+    #[test]
+    fn chooser_command_errors_keep_the_chooser_open() {
+        let mut status = None;
+        assert!(!chooser_command_succeeded(
+            CommandResponse::Error {
+                message: "unknown window".into(),
+            },
+            &mut status,
+        ));
+        assert_eq!(status.as_deref(), Some("unknown window"));
+    }
+
+    #[test]
+    fn stale_chooser_preview_uses_an_unavailable_placeholder() {
+        let dir = tempdir();
         let socket_path = dir.path().join("socket");
         let paths = RuntimePaths {
             socket_path: socket_path.clone(),
             config_path: dir.path().join("config.toml"),
             state_path: dir.path().join("state.json"),
+            aliases_path: dir.path().join("aliases.json"),
+        };
+        let listener = UnixListener::bind(&socket_path).expect("bind daemon socket");
+        let server = std::thread::spawn(move || {
+            for response in [
+                CommandResponse::HelloAck {
+                    version: crate::ipc::CURRENT_PROTOCOL_VERSION,
+                },
+                CommandResponse::Error {
+                    message: "session previous-run is not running".into(),
+                },
+            ] {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut input = Vec::new();
+                stream.read_to_end(&mut input).expect("read request");
+                let request: CommandRequest = serde_json::from_slice(&input).expect("decode request");
+                match &response {
+                    CommandResponse::HelloAck { .. } => {
+                        assert!(matches!(request, CommandRequest::Hello { .. }));
+                    }
+                    CommandResponse::Error { .. } => assert_eq!(
+                        request,
+                        CommandRequest::PreviewSession {
+                            session: "previous-run".into(),
+                            target: None,
+                        }
+                    ),
+                    _ => unreachable!(),
+                }
+                stream
+                    .write_all(&serde_json::to_vec(&response).expect("encode response"))
+                    .expect("write response");
+            }
+        });
+        let mut tree = ChooseTreeState {
+            items: vec![ChooseItem::Session("previous-run".into())],
+            lines: Vec::new(),
+            selected: 0,
+            expanded_sessions: BTreeSet::new(),
+            expanded_windows: BTreeSet::new(),
+            attached_session: "work".into(),
+            search_input: None,
+            last_search: None,
+            preview: None,
+        };
+
+        let (title, snapshot) = chooser_preview(&paths, &mut tree).expect("placeholder preview");
+
+        assert_eq!(title, "previous-run (unavailable)");
+        assert_eq!(snapshot.panes[0].preview, "preview unavailable: session previous-run is not running");
+        assert!(tree.preview.is_some());
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn prompt_overlay_commands_open_their_real_interactive_targets() {
+        assert_eq!(
+            prompt_overlay_command(&InteractiveCommand::ChooseTree),
+            Some(PromptResult::OpenChooseTree)
+        );
+        assert_eq!(
+            prompt_overlay_command(&InteractiveCommand::ChooseBuffer),
+            Some(PromptResult::OpenChooseBuffer)
+        );
+        assert_eq!(
+            prompt_overlay_command(&InteractiveCommand::DetachClient),
+            Some(PromptResult::Detach)
+        );
+    }
+
+    #[test]
+    fn focus_and_window_actions_refresh_before_following_input() {
+        assert!(action_changes_input_target(&InputAction::FocusPane(
+            NavigationDirection::Right
+        )));
+        assert!(action_changes_input_target(&InputAction::NextWindow));
+        assert!(action_changes_input_target(&InputAction::SplitPane(SplitAxis::Horizontal)));
+        assert!(!action_changes_input_target(&InputAction::SendBytes(vec![b'x'])));
+        assert!(!action_changes_input_target(&InputAction::ResizePane(
+            NavigationDirection::Right,
+            1,
+        )));
+    }
+
+    #[test]
+    fn ensure_protocol_surfaces_mismatch() {
+        let dir = tempdir();
+        let socket_path = dir.path().join("socket");
+        let paths = RuntimePaths {
+            socket_path: socket_path.clone(),
+            config_path: dir.path().join("config.toml"),
+            state_path: dir.path().join("state.json"),
+            aliases_path: dir.path().join("aliases.json"),
         };
         let listener = UnixListener::bind(&socket_path).expect("bind");
         std::thread::spawn(move || {
@@ -2547,6 +3791,131 @@ mod tests {
         let rendered = format!("{error:#}");
         assert!(rendered.contains("protocol mismatch"));
         assert!(rendered.contains("restart admuxd"));
+    }
+
+    #[test]
+    fn daemon_autostart_is_limited_to_missing_or_refused_sockets() {
+        assert!(should_autostart_daemon(&std::io::Error::from(
+            std::io::ErrorKind::NotFound,
+        )));
+        assert!(should_autostart_daemon(&std::io::Error::from(
+            std::io::ErrorKind::ConnectionRefused,
+        )));
+        assert!(!should_autostart_daemon(&std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied,
+        )));
+        assert!(!should_autostart_daemon(&std::io::Error::from(
+            std::io::ErrorKind::InvalidInput,
+        )));
+    }
+
+    #[test]
+    fn daemon_startup_log_lives_with_state_files() {
+        let dir = tempdir();
+        let paths = RuntimePaths {
+            socket_path: dir.path().join("runtime/socket"),
+            config_path: dir.path().join("config.toml"),
+            state_path: dir.path().join("state.json"),
+            aliases_path: dir.path().join("aliases.json"),
+        };
+
+        assert_eq!(
+            daemon_start_log_path(&paths),
+            dir.path().join("admuxd-startup.log")
+        );
+    }
+
+    #[test]
+    fn every_request_revalidates_the_daemon_protocol() {
+        let dir = tempdir();
+        let socket_path = dir.path().join("socket");
+        let paths = RuntimePaths {
+            socket_path: socket_path.clone(),
+            config_path: dir.path().join("config.toml"),
+            state_path: dir.path().join("state.json"),
+            aliases_path: dir.path().join("aliases.json"),
+        };
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).expect("bind");
+        let server = std::thread::spawn(move || {
+            for request_index in 0..2 {
+                for hello in [true, false] {
+                    let (mut stream, _) = listener.accept().expect("accept");
+                    let mut input = Vec::new();
+                    stream.read_to_end(&mut input).expect("read request");
+                    let request: CommandRequest = serde_json::from_slice(&input).expect("decode request");
+                    assert_eq!(hello, matches!(request, CommandRequest::Hello { .. }));
+                    let response = if hello {
+                        CommandResponse::HelloAck {
+                            version: crate::ipc::CURRENT_PROTOCOL_VERSION,
+                        }
+                    } else {
+                        assert_eq!(request, CommandRequest::ListSessions);
+                        CommandResponse::SessionList { sessions: Vec::new() }
+                    };
+                    stream
+                        .write_all(&serde_json::to_vec(&response).expect("encode response"))
+                        .expect("write response");
+                }
+                assert!(request_index < 2);
+            }
+        });
+
+        assert!(matches!(
+            request_response(&paths, CommandRequest::ListSessions).expect("first request"),
+            CommandResponse::SessionList { .. }
+        ));
+        assert!(matches!(
+            request_response(&paths, CommandRequest::ListSessions).expect("second request"),
+            CommandResponse::SessionList { .. }
+        ));
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn reload_interactive_config_refreshes_the_client_key_state() {
+        let dir = tempdir();
+        let socket_path = dir.path().join("socket");
+        let config_path = dir.path().join("config.toml");
+        fs::write(&config_path, "[behavior]\nresize_step = 7").expect("write config");
+        let paths = RuntimePaths {
+            socket_path: socket_path.clone(),
+            config_path,
+            state_path: dir.path().join("state.json"),
+            aliases_path: dir.path().join("aliases.json"),
+        };
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).expect("bind");
+        let server = std::thread::spawn(move || {
+            for hello in [true, false] {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut input = Vec::new();
+                stream.read_to_end(&mut input).expect("read request");
+                let request: CommandRequest = serde_json::from_slice(&input).expect("decode request");
+                assert_eq!(hello, matches!(request, CommandRequest::Hello { .. }));
+                let response = if hello {
+                    CommandResponse::HelloAck {
+                        version: crate::ipc::CURRENT_PROTOCOL_VERSION,
+                    }
+                } else {
+                    assert_eq!(request, CommandRequest::ReloadConfig);
+                    CommandResponse::ConfigReloaded
+                };
+                stream
+                    .write_all(&serde_json::to_vec(&response).expect("encode response"))
+                    .expect("write response");
+            }
+        });
+        let mut config = Config::default().resolve().expect("default config");
+        let mut input_state = InputState::new(config.keys.clone(), config.behavior.resize_step);
+
+        reload_interactive_config(&paths, &mut input_state, &mut config).expect("reload config");
+
+        assert_eq!(config.behavior.resize_step, 7);
+        let _ = input_state.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        assert_eq!(
+            input_state.handle_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT)),
+            InputAction::ResizePane(NavigationDirection::Right, 7)
+        );
+        server.join().expect("server thread");
     }
 
     #[test]
@@ -2568,7 +3937,7 @@ mod tests {
 
     #[test]
     fn normalize_new_args_treats_single_directory_argument_as_cwd() {
-        let dir = tempdir().expect("tempdir");
+        let dir = tempdir();
         let args = crate::cli::NewArgs {
             detach: true,
             name: Some("work".into()),
@@ -2582,17 +3951,128 @@ mod tests {
     }
 
     #[test]
+    fn normalize_new_args_makes_explicit_relative_cwd_client_relative() {
+        let args = crate::cli::NewArgs {
+            detach: true,
+            name: Some("work".into()),
+            cwd: Some(PathBuf::from("relative-project")),
+            command: Vec::new(),
+        };
+
+        let normalized = normalize_new_args(args).expect("normalize");
+        assert_eq!(
+            normalized.cwd,
+            Some(
+                std::env::current_dir()
+                    .expect("current directory")
+                    .join("relative-project")
+            )
+        );
+    }
+
+    #[test]
+    fn buffer_file_paths_are_resolved_at_the_client() {
+        assert_eq!(
+            resolve_client_path(PathBuf::from("buffers/output.txt")).expect("resolve relative"),
+            std::env::current_dir()
+                .expect("current directory")
+                .join("buffers/output.txt")
+        );
+        let absolute = PathBuf::from("/tmp/admux-buffer.txt");
+        assert_eq!(
+            resolve_client_path(absolute.clone()).expect("preserve absolute"),
+            absolute
+        );
+    }
+
+    #[test]
+    fn escape_prefixed_digit_coalesces_to_alt_digit() {
+        let mut following = VecDeque::from([Event::Key(KeyEvent::new(
+            KeyCode::Char('3'),
+            KeyModifiers::NONE,
+        ))]);
+        let mut pending = None;
+
+        let event = coalesce_escape_digit_event(
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            following.pop_front().expect("followup event"),
+            &mut pending,
+        );
+
+        assert_eq!(
+            event,
+            Event::Key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::ALT))
+        );
+        assert!(pending.is_none());
+        assert!(following.is_empty());
+    }
+
+    #[test]
+    fn escape_preserves_non_digit_followup() {
+        let mut following = VecDeque::from([Event::Key(KeyEvent::new(
+            KeyCode::Char('h'),
+            KeyModifiers::NONE,
+        ))]);
+        let mut pending = None;
+
+        let event = coalesce_escape_digit_event(
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            following.pop_front().expect("followup event"),
+            &mut pending,
+        );
+
+        assert_eq!(event, Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert_eq!(
+            pending,
+            Some(Event::Key(KeyEvent::new(
+                KeyCode::Char('h'),
+                KeyModifiers::NONE,
+            )))
+        );
+    }
+
+    #[test]
+    fn resolve_window_target_uses_public_window_index() {
+        let snapshot = RenderSnapshot {
+            sessions: Vec::new(),
+            windows: vec![
+                WindowSummary {
+                    id: 210,
+                    index: 1,
+                    name: "editor".into(),
+                    active: false,
+                    last_selected: false,
+                },
+                WindowSummary {
+                    id: 211,
+                    index: 2,
+                    name: "shell".into(),
+                    active: true,
+                    last_selected: false,
+                },
+            ],
+            panes: Vec::new(),
+            dividers: Vec::new(),
+            active_window_id: 2,
+            active_pane_id: 1,
+        };
+
+        assert_eq!(resolve_window_target(&snapshot, "work", "1"), "work:1");
+        assert_eq!(resolve_window_target(&snapshot, "work", "2"), "work:2");
+    }
+
+    #[test]
     fn choose_tree_search_moves_selection_forward() {
         let mut tree = ChooseTreeState {
             items: vec![
                 ChooseItem::Session("work".into()),
                 ChooseItem::Window {
                     session: "work".into(),
-                    window_id: 1,
+                    window_index: 1,
                 },
                 ChooseItem::Pane {
                     session: "work".into(),
-                    window_id: 1,
+                    window_index: 1,
                     pane_id: 2,
                 },
             ],
@@ -2625,6 +4105,7 @@ mod tests {
             attached_session: "work".into(),
             search_input: None,
             last_search: None,
+            preview: None,
         };
 
         apply_choose_tree_search(&mut tree, "logs", true);
@@ -2640,11 +4121,11 @@ mod tests {
                 ChooseItem::Session("work".into()),
                 ChooseItem::Window {
                     session: "work".into(),
-                    window_id: 1,
+                    window_index: 1,
                 },
                 ChooseItem::Pane {
                     session: "work".into(),
-                    window_id: 1,
+                    window_index: 1,
                     pane_id: 2,
                 },
             ],
@@ -2677,12 +4158,33 @@ mod tests {
             attached_session: "work".into(),
             search_input: None,
             last_search: Some("editor".into()),
+            preview: None,
         };
 
         repeat_choose_tree_search(&mut tree, false);
 
         assert_eq!(tree.selected, 1);
         assert!(tree.lines[1].selected);
+    }
+
+    #[test]
+    fn pasting_into_choose_tree_starts_or_extends_search_input() {
+        let mut tree = ChooseTreeState {
+            items: Vec::new(),
+            lines: Vec::new(),
+            selected: 0,
+            expanded_sessions: BTreeSet::new(),
+            expanded_windows: BTreeSet::new(),
+            attached_session: "work".into(),
+            search_input: None,
+            last_search: None,
+            preview: None,
+        };
+
+        insert_choose_tree_search_text(&mut tree, "log");
+        insert_choose_tree_search_text(&mut tree, "s");
+
+        assert_eq!(tree.search_input.as_deref(), Some("logs"));
     }
 
     #[test]
@@ -2696,6 +4198,7 @@ mod tests {
             attached_session: "work".into(),
             search_input: None,
             last_search: None,
+            preview: None,
         };
 
         collapse_all_choose_items(&mut tree);
@@ -2723,12 +4226,258 @@ mod tests {
     }
 
     #[test]
+    fn idle_snapshot_refresh_is_not_tied_to_input_poll_frequency() {
+        assert!(!snapshot_refresh_due(Duration::from_millis(99)));
+        assert!(snapshot_refresh_due(Duration::from_millis(100)));
+    }
+
+    #[test]
+    fn interactive_command_errors_become_status_messages() {
+        let mut status = None;
+        assert!(!handle_interactive_response(
+            CommandResponse::Error {
+                message: "unknown pane".into(),
+            },
+            &mut status,
+        ));
+        assert_eq!(status.as_deref(), Some("unknown pane"));
+    }
+
+    #[test]
+    fn failed_helper_input_falls_back_to_daemon_input() {
+        let dir = tempdir();
+        let socket_path = dir.path().join("socket");
+        let paths = RuntimePaths {
+            socket_path: socket_path.clone(),
+            config_path: dir.path().join("config.toml"),
+            state_path: dir.path().join("state.json"),
+            aliases_path: dir.path().join("aliases.json"),
+        };
+        let listener = UnixListener::bind(&socket_path).expect("bind daemon socket");
+        let server = std::thread::spawn(move || {
+            for hello in [true, false] {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut input = Vec::new();
+                stream.read_to_end(&mut input).expect("read request");
+                let request: CommandRequest = serde_json::from_slice(&input).expect("decode request");
+                let response = if hello {
+                    assert!(matches!(request, CommandRequest::Hello { .. }));
+                    CommandResponse::HelloAck {
+                        version: crate::ipc::CURRENT_PROTOCOL_VERSION,
+                    }
+                } else {
+                    assert_eq!(
+                        request,
+                        CommandRequest::SendBytes {
+                            target: "work".into(),
+                            bytes: b"x".to_vec(),
+                        }
+                    );
+                    CommandResponse::KeysSent
+                };
+                stream
+                    .write_all(&serde_json::to_vec(&response).expect("encode response"))
+                    .expect("write response");
+            }
+        });
+        let helper_socket = dir.path().join("helper");
+        let helper_listener = UnixListener::bind(&helper_socket).expect("bind helper socket");
+        let helper = std::thread::spawn(move || {
+            let (mut stream, _) = helper_listener.accept().expect("accept direct send request");
+            let mut input = Vec::new();
+            stream.read_to_end(&mut input).expect("read direct send request");
+            let request = serde_json::from_slice::<serde_json::Value>(&input)
+                .expect("decode direct send request");
+            assert!(request.get("SendBytes").is_some());
+            assert!(request.get("Hello").is_none());
+            // Dropping this response stream forces the direct-send failure that must fall back.
+        });
+        let mut snapshot = fallback_snapshot(String::new(), 80, 24);
+        snapshot.panes[0].helper_socket = Some(helper_socket);
+
+        send_input_bytes(&paths, &snapshot, "work", b"x", None)
+            .expect("daemon fallback");
+        helper.join().expect("helper thread");
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn submitted_input_registers_its_client_before_forwarding() {
+        let dir = tempdir();
+        let socket_path = dir.path().join("socket");
+        let paths = RuntimePaths {
+            socket_path: socket_path.clone(),
+            config_path: dir.path().join("config.toml"),
+            state_path: dir.path().join("state.json"),
+            aliases_path: dir.path().join("aliases.json"),
+        };
+        let listener = UnixListener::bind(&socket_path).expect("bind daemon socket");
+        let server = std::thread::spawn(move || {
+            for expected in [
+                CommandRequest::Hello {
+                    version: crate::ipc::CURRENT_PROTOCOL_VERSION,
+                },
+                CommandRequest::RegisterInput {
+                    source: SwitchSource {
+                        session: "work".into(),
+                        window_id: 1,
+                        pane_id: 1,
+                    },
+                    client_id: "client-1".into(),
+                },
+                CommandRequest::Hello {
+                    version: crate::ipc::CURRENT_PROTOCOL_VERSION,
+                },
+                CommandRequest::SendBytes {
+                    target: "work".into(),
+                    bytes: b"\r".to_vec(),
+                },
+            ] {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut input = Vec::new();
+                stream.read_to_end(&mut input).expect("read request");
+                let request: CommandRequest = serde_json::from_slice(&input).expect("decode request");
+                assert_eq!(request, expected);
+                let response = match request {
+                    CommandRequest::Hello { version } => CommandResponse::HelloAck { version },
+                    CommandRequest::RegisterInput { .. } => CommandResponse::InputRegistered,
+                    CommandRequest::SendBytes { .. } => CommandResponse::KeysSent,
+                    other => panic!("unexpected request: {other:?}"),
+                };
+                stream
+                    .write_all(&serde_json::to_vec(&response).expect("encode response"))
+                    .expect("write response");
+            }
+        });
+
+        let snapshot = fallback_snapshot(String::new(), 80, 24);
+        send_input_bytes(&paths, &snapshot, "work", b"\r", Some("client-1"))
+            .expect("submit input");
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn rejected_prompt_session_switch_keeps_the_current_session() {
+        let mut current_session = String::from("work");
+        let mut last_size = (24, 80);
+        assert!(apply_prompt_session_switch(
+            &mut current_session,
+            &mut last_size,
+            CommandResponse::Error {
+                message: "unknown session missing".into(),
+            },
+        )
+        .is_err());
+        assert_eq!(current_session, "work");
+        assert_eq!(last_size, (24, 80));
+    }
+
+    #[test]
+    fn prompt_session_switch_resets_viewport_for_the_new_session() {
+        let mut current_session = String::from("work");
+        let mut last_size = (24, 80);
+        apply_prompt_session_switch(
+            &mut current_session,
+            &mut last_size,
+            CommandResponse::Attached {
+                session: "logs".into(),
+                preview: String::new(),
+                formatted_preview: String::new(),
+                formatted_cursor: String::new(),
+                snapshot: None,
+            },
+        )
+        .expect("switch session");
+        assert_eq!(current_session, "logs");
+        assert_eq!(last_size, (0, 0));
+    }
+
+    #[test]
+    fn prompt_parse_errors_stay_open_and_become_status_messages() {
+        let dir = tempdir();
+        let paths = RuntimePaths {
+            socket_path: dir.path().join("socket"),
+            config_path: dir.path().join("config.toml"),
+            state_path: dir.path().join("state.json"),
+            aliases_path: dir.path().join("aliases.json"),
+        };
+        let snapshot = RenderSnapshot {
+            sessions: Vec::new(),
+            windows: Vec::new(),
+            panes: Vec::new(),
+            dividers: Vec::new(),
+            active_window_id: 0,
+            active_pane_id: 0,
+        };
+        let mut prompt = PromptState {
+            buffer: "send-keys \"unterminated".into(),
+            cursor: 24,
+            completions: Vec::new(),
+            selected: 0,
+            history_index: None,
+        };
+        let mut session = "work".into();
+        let mut last_size = (24, 80);
+        let mut config = Config::default().resolve().expect("default config");
+        let mut input_state = InputState::new(config.keys.clone(), config.behavior.resize_step);
+        let mut history = Vec::new();
+        let mut status = None;
+
+        let result = handle_prompt_key(
+            &paths,
+            &snapshot,
+            &mut session,
+            &mut last_size,
+            &mut input_state,
+            &mut config,
+            &mut prompt,
+            &mut history,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut status,
+        )
+        .expect("handle prompt key");
+
+        assert_eq!(result, PromptResult::KeepOpen);
+        assert!(status.is_some_and(|message| message.contains("unterminated")));
+        assert!(history.is_empty());
+    }
+
+    #[test]
+    fn prompt_cursor_moves_on_utf8_character_boundaries() {
+        let text = "aé🙂";
+        assert_eq!(previous_char_boundary(text, text.len()), Some(3));
+        assert_eq!(previous_char_boundary(text, 3), Some(1));
+        assert_eq!(previous_char_boundary(text, 1), Some(0));
+        assert_eq!(next_char_boundary(text, 0), Some(1));
+        assert_eq!(next_char_boundary(text, 1), Some(3));
+        assert_eq!(next_char_boundary(text, 3), Some(text.len()));
+    }
+
+    #[test]
+    fn pasting_into_the_prompt_inserts_at_the_utf8_cursor() {
+        let mut prompt = PromptState {
+            buffer: "say 🙂".into(),
+            cursor: 4,
+            completions: Vec::new(),
+            selected: 0,
+            history_index: Some(0),
+        };
+
+        insert_prompt_text(&mut prompt, "é");
+
+        assert_eq!(prompt.buffer, "say é🙂");
+        assert_eq!(prompt.cursor, 6);
+        assert!(prompt.history_index.is_none());
+    }
+
+    #[test]
     fn resize_drag_request_reverses_direction_for_leftward_motion() {
         let resize = ResizeDrag {
             pane_id: 1,
             direction: NavigationDirection::Right,
             last_row: 0,
             last_col: 10,
+            span: 80,
         };
 
         let request = resize_drag_request(
@@ -2751,6 +4500,7 @@ mod tests {
             direction: NavigationDirection::Right,
             last_row: 0,
             last_col: 10,
+            span: 80,
         };
 
         let request = resize_drag_request(
@@ -2764,5 +4514,80 @@ mod tests {
         );
 
         assert_eq!(request, Some((NavigationDirection::Left, 3)));
+    }
+
+    #[test]
+    fn mouse_resize_amount_scales_with_terminal_span() {
+        assert_eq!(mouse_resize_amount(1, 80), 13);
+        assert_eq!(mouse_resize_amount(1, 200), 5);
+        assert_eq!(mouse_resize_amount(100, 80), 100);
+        assert_eq!(mouse_resize_amount(0, 80), 1);
+    }
+
+    #[test]
+    fn mouse_capture_clamps_drag_and_release_to_the_pressed_pane() {
+        let mut snapshot = fallback_snapshot(String::new(), 80, 24);
+        snapshot.panes[0].rect = Rect {
+            x: 10,
+            y: 5,
+            width: 20,
+            height: 8,
+        };
+        let capture = MouseCapture {
+            pane_id: 1,
+            button: MouseButton::Left,
+        };
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 79,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert_eq!(
+            captured_pane_mouse_position(&snapshot, capture, mouse),
+            Some((0, 19))
+        );
+    }
+
+    #[test]
+    fn application_mouse_button_mappings_include_middle_and_right() {
+        assert_eq!(
+            helper_mouse_kinds(MouseButton::Middle),
+            Some((
+                HelperMouseEventKind::MiddleDown,
+                HelperMouseEventKind::MiddleDrag,
+                HelperMouseEventKind::MiddleUp,
+            ))
+        );
+        assert_eq!(
+            pane_mouse_kinds(MouseButton::Right),
+            Some((
+                PaneMouseKind::RightDown,
+                PaneMouseKind::RightDrag,
+                PaneMouseKind::RightUp,
+            ))
+        );
+    }
+
+    #[test]
+    fn external_clipboard_command_receives_copied_text_on_stdin() {
+        let dir = tempdir();
+        let output = dir.path().join("clipboard.txt");
+        let clipboard = ClipboardConfig {
+            backend: ClipboardBackend::ExternalCommand,
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                format!("cat > {}", output.display()),
+            ],
+        };
+        let mut terminal = Vec::new();
+
+        copy_to_clipboard(&clipboard, &mut terminal, "copied text")
+            .expect("copy through external command");
+
+        assert_eq!(fs::read_to_string(output).expect("read clipboard output"), "copied text");
+        assert!(terminal.is_empty(), "external backend must not emit OSC52");
     }
 }

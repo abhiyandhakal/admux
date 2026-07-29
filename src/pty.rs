@@ -7,20 +7,28 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs,
-    io::{Read, Write},
+    fs::{self, OpenOptions},
+    io::{self, Read, Write},
+    os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        mpsc,
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const HISTORY_LIMIT: usize = 2 * 1024 * 1024;
+const MIN_REPLAY_HISTORY_COLUMNS: u16 = 80;
+const REPLAY_HISTORY_BYTES_PER_CELL: usize = 16;
+const MAX_REPLAY_HISTORY_BYTES: usize = 64 * 1024 * 1024;
+const IPC_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_IPC_MESSAGE_BYTES: u64 = 1024 * 1024;
+const MAX_HELPER_CLIENTS: usize = 64;
+const HELPER_PROTOCOL_VERSION: u16 = 4;
 static HELPER_NAME_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct TerminalState {
@@ -34,6 +42,15 @@ struct HelperState {
     writer: Mutex<Box<dyn Write + Send>>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     child: Mutex<Box<dyn Child + Send>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReplayBoundaryState {
+    Ground,
+    Escape,
+    Csi,
+    String,
+    StringEscape,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,7 +70,9 @@ pub struct PaneSnapshot {
     pub cursor_col: u16,
     pub screen_rows: u16,
     pub screen_cols: u16,
+    pub scrollback: u32,
     pub mouse_reporting: bool,
+    pub application_cursor: bool,
     pub alive: bool,
 }
 
@@ -67,7 +86,6 @@ pub struct PanePersistentSnapshot {
     pub rows: u16,
     pub cols: u16,
     pub vt: String,
-    pub command: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,15 +111,16 @@ pub struct PaneHelperArgs {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum PaneRequest {
+    Hello { version: u16 },
     Snapshot {
         width: u16,
         height: u16,
     },
     ScreenSize,
     SelectionText {
-        start_row: u16,
+        start_from_bottom: u32,
         start_col: u16,
-        end_row: u16,
+        end_from_bottom: u32,
         end_col: u16,
     },
     Resize {
@@ -121,8 +140,13 @@ enum PaneRequest {
     Scrollback {
         lines: i16,
     },
+    ScrollbackTop,
+    ScrollbackBottom,
     SendKeys {
         keys: Vec<String>,
+    },
+    SendBytes {
+        bytes: Vec<u8>,
     },
     PersistentSnapshot {
         lines: usize,
@@ -133,6 +157,7 @@ enum PaneRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum PaneResponse {
+    HelloAck { version: u16 },
     Snapshot(PaneSnapshotWire),
     ScreenSize { rows: u16, cols: u16 },
     SelectionText { text: String },
@@ -147,7 +172,6 @@ struct PanePersistentSnapshotWire {
     rows: u16,
     cols: u16,
     vt_b64: String,
-    command: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,7 +185,10 @@ struct PaneSnapshotWire {
     cursor_col: u16,
     screen_rows: u16,
     screen_cols: u16,
+    #[serde(default)]
+    scrollback: u32,
     mouse_reporting: bool,
+    application_cursor: bool,
     alive: bool,
 }
 
@@ -170,6 +197,12 @@ pub enum HelperMouseEventKind {
     LeftDown,
     LeftDrag,
     LeftUp,
+    MiddleDown,
+    MiddleDrag,
+    MiddleUp,
+    RightDown,
+    RightDrag,
+    RightUp,
 }
 
 impl From<PaneSnapshotWire> for PaneSnapshot {
@@ -184,25 +217,27 @@ impl From<PaneSnapshotWire> for PaneSnapshot {
             cursor_col: value.cursor_col,
             screen_rows: value.screen_rows,
             screen_cols: value.screen_cols,
+            scrollback: value.scrollback,
             mouse_reporting: value.mouse_reporting,
+            application_cursor: value.application_cursor,
             alive: value.alive,
         }
     }
 }
 
-impl From<PanePersistentSnapshotWire> for PanePersistentSnapshot {
-    fn from(value: PanePersistentSnapshotWire) -> Self {
-        Self {
+impl TryFrom<PanePersistentSnapshotWire> for PanePersistentSnapshot {
+    type Error = anyhow::Error;
+
+    fn try_from(value: PanePersistentSnapshotWire) -> Result<Self> {
+        let vt_bytes = STANDARD
+            .decode(value.vt_b64)
+            .context("pane snapshot wire contains invalid base64")?;
+        let vt = String::from_utf8(vt_bytes).context("pane snapshot wire contains invalid UTF-8")?;
+        Ok(Self {
             rows: value.rows,
             cols: value.cols,
-            vt: String::from_utf8(
-                STANDARD
-                    .decode(value.vt_b64)
-                    .expect("pane snapshot wire should contain valid base64"),
-            )
-            .expect("pane snapshot wire should contain valid utf-8"),
-            command: value.command,
-        }
+            vt,
+        })
     }
 }
 
@@ -226,10 +261,8 @@ impl PaneProcess {
         helper_dir: &Path,
         restore_seed: Option<PaneRestoreSeed>,
     ) -> Result<Self> {
-        fs::create_dir_all(helper_dir).with_context(|| {
-            format!("failed to create helper directory {}", helper_dir.display())
-        })?;
-        let socket_path = helper_dir.join(unique_helper_name(admux_context));
+        ensure_private_helper_directory(helper_dir)?;
+        let socket_path = helper_dir.join(unique_helper_name());
         let helper_bin = resolve_helper_binary()?;
 
         let args = PaneHelperArgs {
@@ -243,17 +276,37 @@ impl PaneProcess {
             command: command.to_vec(),
             restore_seed,
         };
-        let payload = serde_json::to_string(&args).context("failed to encode helper args")?;
+        let args_path = write_helper_args_file(helper_dir, &args)?;
 
-        Command::new(helper_bin)
-            .arg(payload)
+        let child = Command::new(helper_bin)
+            .arg("--args-file")
+            .arg(&args_path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("failed to spawn admux-pane helper")?;
+            // Keep startup failures visible for manually supervised daemons;
+            // otherwise a helper failure surfaces only as a socket timeout.
+            .stderr(Stdio::inherit())
+            .spawn();
+        let mut child = match child {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = fs::remove_file(&args_path);
+                return Err(error).context("failed to spawn admux-pane helper");
+            }
+        };
 
-        wait_for_socket(&socket_path)?;
+        if let Err(error) = wait_for_socket(&socket_path) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(&socket_path);
+            let _ = fs::remove_file(&args_path);
+            return Err(error);
+        }
+        thread::spawn(move || {
+            if let Err(error) = child.wait() {
+                eprintln!("admux: failed to reap pane helper: {error}");
+            }
+        });
         Ok(Self { socket_path })
     }
 
@@ -262,6 +315,12 @@ impl PaneProcess {
             bail!("missing pane helper socket {}", socket_path.display());
         }
         let process = Self { socket_path };
+        process.ensure_protocol()?;
+        Ok(process)
+    }
+
+    pub fn connect_live(socket_path: PathBuf) -> Result<Self> {
+        let process = Self::connect(socket_path)?;
         if !process.is_alive() {
             bail!(
                 "pane helper at {} is not alive",
@@ -275,6 +334,16 @@ impl PaneProcess {
         &self.socket_path
     }
 
+    /// Sends bytes through one helper connection without a separate protocol
+    /// probe. This is intended for the interactive forwarding hot path; a
+    /// failed send is retried through the daemon by the caller.
+    pub fn send_bytes_to(socket_path: &Path, bytes: &[u8]) -> Result<()> {
+        Self {
+            socket_path: socket_path.to_path_buf(),
+        }
+        .send_bytes(bytes)
+    }
+
     pub fn render(&self, width: u16, height: u16) -> Result<PaneSnapshot> {
         match self.request(PaneRequest::Snapshot { width, height })? {
             PaneResponse::Snapshot(snapshot) => Ok(snapshot.into()),
@@ -283,64 +352,30 @@ impl PaneProcess {
         }
     }
 
-    pub fn preview(&self) -> String {
-        self.render_with_current_size()
-            .map(|snapshot| snapshot.preview)
-            .unwrap_or_default()
-    }
-
-    pub fn formatted_preview(&self) -> String {
-        self.render_with_current_size()
-            .map(|snapshot| snapshot.formatted_preview)
-            .unwrap_or_default()
-    }
-
-    pub fn formatted_cursor(&self) -> String {
-        self.render_with_current_size()
-            .map(|snapshot| snapshot.formatted_cursor)
-            .unwrap_or_default()
-    }
-
-    pub fn visible_rows(&self, width: u16, height: u16) -> Vec<String> {
-        self.render(width, height)
-            .map(|snapshot| snapshot.rows_plain)
-            .unwrap_or_default()
-    }
-
-    pub fn visible_rows_formatted(&self, width: u16, height: u16) -> Vec<String> {
-        self.render(width, height)
-            .map(|snapshot| snapshot.rows_formatted)
-            .unwrap_or_default()
-    }
-
-    pub fn cursor_position(&self) -> (u16, u16) {
-        self.render_with_current_size()
-            .map(|snapshot| (snapshot.cursor_row, snapshot.cursor_col))
-            .unwrap_or((0, 0))
-    }
-
-    pub fn screen_size(&self) -> (u16, u16) {
-        match self.request(PaneRequest::ScreenSize) {
-            Ok(PaneResponse::ScreenSize { rows, cols }) => (rows, cols),
-            _ => (24, 80),
+    pub fn screen_size(&self) -> Result<(u16, u16)> {
+        match self.request(PaneRequest::ScreenSize)? {
+            PaneResponse::ScreenSize { rows, cols } => Ok((rows, cols)),
+            PaneResponse::Error { message } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected pane screen-size response: {other:?}")),
         }
     }
 
     pub fn selection_text(
         &self,
-        start_row: u16,
+        start_from_bottom: u32,
         start_col: u16,
-        end_row: u16,
+        end_from_bottom: u32,
         end_col: u16,
-    ) -> String {
+    ) -> Result<String> {
         match self.request(PaneRequest::SelectionText {
-            start_row,
+            start_from_bottom,
             start_col,
-            end_row,
+            end_from_bottom,
             end_col,
-        }) {
-            Ok(PaneResponse::SelectionText { text }) => text,
-            _ => String::new(),
+        })? {
+            PaneResponse::SelectionText { text } => Ok(text),
+            PaneResponse::Error { message } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected selection text response: {other:?}")),
         }
     }
 
@@ -377,8 +412,28 @@ impl PaneProcess {
         }
     }
 
-    pub fn scroll_scrollback_by(&self, lines: i16) {
-        let _ = self.request(PaneRequest::Scrollback { lines });
+    pub fn scroll_scrollback_by(&self, lines: i16) -> Result<()> {
+        match self.request(PaneRequest::Scrollback { lines })? {
+            PaneResponse::Ok => Ok(()),
+            PaneResponse::Error { message } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected scrollback response: {other:?}")),
+        }
+    }
+
+    pub fn scroll_scrollback_to_top(&self) -> Result<()> {
+        match self.request(PaneRequest::ScrollbackTop)? {
+            PaneResponse::Ok => Ok(()),
+            PaneResponse::Error { message } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected scrollback response: {other:?}")),
+        }
+    }
+
+    pub fn scroll_scrollback_to_bottom(&self) -> Result<()> {
+        match self.request(PaneRequest::ScrollbackBottom)? {
+            PaneResponse::Ok => Ok(()),
+            PaneResponse::Error { message } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected scrollback response: {other:?}")),
+        }
     }
 
     pub fn send_keys(&self, keys: &[String]) -> Result<()> {
@@ -391,9 +446,19 @@ impl PaneProcess {
         }
     }
 
+    pub fn send_bytes(&self, bytes: &[u8]) -> Result<()> {
+        match self.request(PaneRequest::SendBytes {
+            bytes: bytes.to_vec(),
+        })? {
+            PaneResponse::Ok => Ok(()),
+            PaneResponse::Error { message } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected send bytes response: {other:?}")),
+        }
+    }
+
     pub fn kill(&self) -> Result<()> {
         match self.request(PaneRequest::Shutdown)? {
-            PaneResponse::Ok => Ok(()),
+            PaneResponse::Ok => wait_for_socket_removal(&self.socket_path),
             PaneResponse::Error { message } => Err(anyhow!(message)),
             other => Err(anyhow!("unexpected shutdown response: {other:?}")),
         }
@@ -401,7 +466,7 @@ impl PaneProcess {
 
     pub fn persistent_snapshot(&self, lines: usize) -> Result<PanePersistentSnapshot> {
         match self.request(PaneRequest::PersistentSnapshot { lines })? {
-            PaneResponse::PersistentSnapshot(snapshot) => Ok(snapshot.into()),
+            PaneResponse::PersistentSnapshot(snapshot) => snapshot.try_into(),
             PaneResponse::Error { message } => Err(anyhow!(message)),
             other => Err(anyhow!(
                 "unexpected persistent snapshot response: {other:?}"
@@ -416,11 +481,6 @@ impl PaneProcess {
         )
     }
 
-    fn render_with_current_size(&self) -> Result<PaneSnapshot> {
-        let (rows, cols) = self.screen_size();
-        self.render(cols.max(1), rows.max(1))
-    }
-
     fn request(&self, request: PaneRequest) -> Result<PaneResponse> {
         let mut stream = UnixStream::connect(&self.socket_path).with_context(|| {
             format!(
@@ -428,6 +488,7 @@ impl PaneProcess {
                 self.socket_path.display()
             )
         })?;
+        configure_ipc_stream(&stream)?;
         let payload = serde_json::to_vec(&request).context("failed to encode pane request")?;
         stream
             .write_all(&payload)
@@ -435,22 +496,55 @@ impl PaneProcess {
         stream
             .shutdown(std::net::Shutdown::Write)
             .context("failed to finish pane request")?;
-        let mut response = Vec::new();
-        stream
-            .read_to_end(&mut response)
-            .context("failed to read pane response")?;
+        let response = read_limited(&mut stream, "pane response")?;
         serde_json::from_slice(&response).context("failed to decode pane response")
     }
+
+    fn ensure_protocol(&self) -> Result<()> {
+        match self.request(PaneRequest::Hello {
+            version: HELPER_PROTOCOL_VERSION,
+        })? {
+            PaneResponse::HelloAck { version } if version == HELPER_PROTOCOL_VERSION => Ok(()),
+            PaneResponse::HelloAck { version } => bail!(
+                "pane helper protocol mismatch: daemon={}, helper={version}",
+                HELPER_PROTOCOL_VERSION
+            ),
+            PaneResponse::Error { message } => bail!("pane helper protocol rejected handshake: {message}"),
+            other => bail!("pane helper returned invalid handshake response: {other:?}"),
+        }
+    }
+}
+
+fn write_helper_args_file(helper_dir: &Path, args: &PaneHelperArgs) -> Result<PathBuf> {
+    let path = helper_dir.join(unique_helper_args_name());
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("failed to create pane helper args file {}", path.display()))?;
+        file.write_all(
+            &serde_json::to_vec(args).context("failed to encode pane helper args")?,
+        )
+        .with_context(|| format!("failed to write pane helper args file {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync pane helper args file {}", path.display()))?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).with_context(|| {
+            format!("failed to restrict pane helper args file permissions {}", path.display())
+        })?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_file(&path);
+        return Err(error);
+    }
+    Ok(path)
 }
 
 pub fn run_helper(args: PaneHelperArgs) -> Result<()> {
     if let Some(parent) = args.socket.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "failed to create pane helper directory {}",
-                parent.display()
-            )
-        })?;
+        ensure_private_helper_directory(parent)?;
     }
     if args.socket.exists() {
         fs::remove_file(&args.socket).with_context(|| {
@@ -461,26 +555,107 @@ pub fn run_helper(args: PaneHelperArgs) -> Result<()> {
         })?;
     }
 
-    let state = Arc::new(start_helper_state(&args)?);
     let listener = UnixListener::bind(&args.socket).with_context(|| {
         format!(
             "failed to bind pane helper socket {}",
             args.socket.display()
         )
     })?;
+    fs::set_permissions(&args.socket, fs::Permissions::from_mode(0o600)).with_context(|| {
+        format!(
+            "failed to restrict pane helper socket permissions {}",
+            args.socket.display()
+        )
+    })?;
+    let state = match start_helper_state(&args) {
+        Ok(state) => Arc::new(state),
+        Err(error) => {
+            let _ = fs::remove_file(&args.socket);
+            return Err(error);
+        }
+    };
 
-    for stream in listener.incoming() {
-        let mut stream = stream.context("failed to accept pane helper client")?;
-        let request = read_helper_request(&mut stream)?;
-        let shutdown = matches!(request, PaneRequest::Shutdown);
-        let response = handle_helper_request(&state, request);
-        write_helper_response(&mut stream, &response)?;
-        if shutdown {
+    listener
+        .set_nonblocking(true)
+        .context("failed to make pane helper listener nonblocking")?;
+    let active_clients = Arc::new(AtomicUsize::new(0));
+    let (shutdown_sender, shutdown_receiver) = mpsc::channel();
+
+    loop {
+        if shutdown_receiver.try_recv().is_ok() {
             break;
+        }
+
+        match listener.accept() {
+            Ok((stream, _)) => {
+                if active_clients.fetch_add(1, Ordering::AcqRel) >= MAX_HELPER_CLIENTS {
+                    active_clients.fetch_sub(1, Ordering::AcqRel);
+                    eprintln!(
+                        "admux-pane: rejecting client because {MAX_HELPER_CLIENTS} helper requests are already active"
+                    );
+                    continue;
+                }
+
+                let state = Arc::clone(&state);
+                let active_clients = Arc::clone(&active_clients);
+                let shutdown_sender = shutdown_sender.clone();
+                thread::spawn(move || {
+                    let shutdown = serve_helper_connection(stream, &state);
+                    active_clients.fetch_sub(1, Ordering::AcqRel);
+                    if shutdown {
+                        let _ = shutdown_sender.send(());
+                    }
+                });
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => {
+                eprintln!("admux-pane: failed to accept client connection: {error:#}");
+                thread::sleep(Duration::from_millis(5));
+            }
         }
     }
 
     let _ = fs::remove_file(&args.socket);
+    Ok(())
+}
+
+fn serve_helper_connection(mut stream: UnixStream, state: &Arc<HelperState>) -> bool {
+    if let Err(error) = configure_ipc_stream(&stream) {
+        eprintln!("admux-pane: failed to configure client stream: {error:#}");
+        return false;
+    }
+    let request = match read_helper_request(&mut stream) {
+        Ok(request) => request,
+        Err(error) => {
+            eprintln!("admux-pane: rejected client request: {error:#}");
+            return false;
+        }
+    };
+    let shutdown_requested = matches!(request, PaneRequest::Shutdown);
+    let response = handle_helper_request(state, request);
+    if let Err(error) = write_helper_response(&mut stream, &response) {
+        eprintln!("admux-pane: failed to write client response: {error:#}");
+        return false;
+    }
+    shutdown_requested && matches!(response, PaneResponse::Ok)
+}
+
+fn ensure_private_helper_directory(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)
+        .with_context(|| format!("failed to create pane helper directory {}", path.display()))?;
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("failed to inspect pane helper directory {}", path.display()))?;
+    if !metadata.is_dir() {
+        bail!("pane helper path {} is not a directory", path.display());
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        bail!("refusing pane helper directory not owned by the effective user: {}", path.display());
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).with_context(|| {
+        format!("failed to restrict pane helper directory permissions {}", path.display())
+    })?;
     Ok(())
 }
 
@@ -551,10 +726,9 @@ fn start_helper_state(args: &PaneHelperArgs) -> Result<HelperState> {
                 Ok(size) => {
                     if let Ok(mut terminal) = terminal_clone.lock() {
                         terminal.history.extend_from_slice(&buf[..size]);
-                        if terminal.history.len() > HISTORY_LIMIT {
-                            let drop_len = terminal.history.len() - HISTORY_LIMIT;
-                            terminal.history.drain(..drop_len);
-                        }
+                        let (_, cols) = terminal.parser.screen().size();
+                        let history_limit = replay_history_limit(terminal.scrollback_lines, cols);
+                        truncate_history_at_safe_boundary(&mut terminal.history, history_limit);
                         terminal.parser.process(&buf[..size]);
                     }
                 }
@@ -571,8 +745,73 @@ fn start_helper_state(args: &PaneHelperArgs) -> Result<HelperState> {
     })
 }
 
+fn replay_history_limit(scrollback_lines: usize, cols: u16) -> usize {
+    scrollback_lines
+        .saturating_mul(usize::from(cols.max(MIN_REPLAY_HISTORY_COLUMNS)))
+        .saturating_mul(REPLAY_HISTORY_BYTES_PER_CELL)
+        .min(MAX_REPLAY_HISTORY_BYTES)
+}
+
+fn truncate_history_at_safe_boundary(history: &mut Vec<u8>, limit: usize) {
+    if history.len() <= limit {
+        return;
+    }
+
+    let minimum_drop = history.len() - limit;
+    let mut state = ReplayBoundaryState::Ground;
+    for (index, byte) in history.iter().copied().enumerate() {
+        state = match state {
+            ReplayBoundaryState::Ground if byte == 0x1b => ReplayBoundaryState::Escape,
+            ReplayBoundaryState::Ground => ReplayBoundaryState::Ground,
+            ReplayBoundaryState::Escape if byte == b'[' => ReplayBoundaryState::Csi,
+            ReplayBoundaryState::Escape if matches!(byte, b']' | b'P' | b'^' | b'_') => {
+                ReplayBoundaryState::String
+            }
+            ReplayBoundaryState::Escape => ReplayBoundaryState::Ground,
+            ReplayBoundaryState::Csi if (0x40..=0x7e).contains(&byte) => {
+                ReplayBoundaryState::Ground
+            }
+            ReplayBoundaryState::Csi => ReplayBoundaryState::Csi,
+            ReplayBoundaryState::String if byte == 0x07 => ReplayBoundaryState::Ground,
+            ReplayBoundaryState::String if byte == 0x1b => ReplayBoundaryState::StringEscape,
+            ReplayBoundaryState::String => ReplayBoundaryState::String,
+            ReplayBoundaryState::StringEscape if byte == b'\\' => ReplayBoundaryState::Ground,
+            ReplayBoundaryState::StringEscape if byte == 0x1b => ReplayBoundaryState::StringEscape,
+            ReplayBoundaryState::StringEscape => ReplayBoundaryState::String,
+        };
+
+        let next = index + 1;
+        let starts_utf8_boundary = history
+            .get(next)
+            .is_none_or(|next_byte| !(0x80..=0xbf).contains(next_byte));
+        if next >= minimum_drop
+            && state == ReplayBoundaryState::Ground
+            && starts_utf8_boundary
+        {
+            history.drain(..next);
+            return;
+        }
+    }
+
+    // The retained history never reached a replay-safe boundary (for example,
+    // a single unterminated OSC payload). Discard it rather than replaying a
+    // partial control sequence into a fresh parser.
+    history.clear();
+}
+
 fn handle_helper_request(state: &Arc<HelperState>, request: PaneRequest) -> PaneResponse {
     match request {
+        PaneRequest::Hello { version } => {
+            if version == HELPER_PROTOCOL_VERSION {
+                PaneResponse::HelloAck { version }
+            } else {
+                PaneResponse::Error {
+                    message: format!(
+                        "pane helper protocol mismatch: daemon={version}, helper={HELPER_PROTOCOL_VERSION}"
+                    ),
+                }
+            }
+        }
         PaneRequest::Snapshot { width, height } => match helper_snapshot(state, width, height) {
             Ok(snapshot) => PaneResponse::Snapshot(snapshot),
             Err(error) => PaneResponse::Error {
@@ -584,18 +823,22 @@ fn handle_helper_request(state: &Arc<HelperState>, request: PaneRequest) -> Pane
             PaneResponse::ScreenSize { rows, cols }
         }
         PaneRequest::SelectionText {
-            start_row,
+            start_from_bottom,
             start_col,
-            end_row,
+            end_from_bottom,
             end_col,
         } => PaneResponse::SelectionText {
-            text: state
-                .terminal
-                .lock()
-                .expect("pane helper terminal lock poisoned")
-                .parser
-                .screen()
-                .contents_between(start_row, start_col, end_row, end_col),
+            text: helper_history_selection_text(
+                &mut state
+                    .terminal
+                    .lock()
+                    .expect("pane helper terminal lock poisoned")
+                    .parser,
+                start_from_bottom,
+                start_col,
+                end_from_bottom,
+                end_col,
+            ),
         },
         PaneRequest::Resize { rows, cols } => match helper_resize(state, rows, cols) {
             Ok(()) => PaneResponse::Ok,
@@ -625,7 +868,33 @@ fn handle_helper_request(state: &Arc<HelperState>, request: PaneRequest) -> Pane
             helper_scroll_scrollback(state, lines);
             PaneResponse::Ok
         }
+        PaneRequest::ScrollbackTop => {
+            state
+                .terminal
+                .lock()
+                .expect("pane helper terminal lock poisoned")
+                .parser
+                .screen_mut()
+                .set_scrollback(usize::MAX);
+            PaneResponse::Ok
+        }
+        PaneRequest::ScrollbackBottom => {
+            state
+                .terminal
+                .lock()
+                .expect("pane helper terminal lock poisoned")
+                .parser
+                .screen_mut()
+                .set_scrollback(0);
+            PaneResponse::Ok
+        }
         PaneRequest::SendKeys { keys } => match helper_send_keys(state, &keys) {
+            Ok(()) => PaneResponse::Ok,
+            Err(error) => PaneResponse::Error {
+                message: error.to_string(),
+            },
+        },
+        PaneRequest::SendBytes { bytes } => match helper_send_bytes(state, &bytes) {
             Ok(()) => PaneResponse::Ok,
             Err(error) => PaneResponse::Error {
                 message: error.to_string(),
@@ -640,12 +909,27 @@ fn handle_helper_request(state: &Arc<HelperState>, request: PaneRequest) -> Pane
             }
         }
         PaneRequest::Shutdown => {
-            let _ = state
+            let mut child = state
                 .child
                 .lock()
-                .expect("pane helper child lock poisoned")
-                .kill();
-            PaneResponse::Ok
+                .expect("pane helper child lock poisoned");
+            let shutdown = match child.try_wait() {
+                Ok(Some(_)) => Ok(()),
+                Ok(None) => match child.kill() {
+                    Ok(()) => child.wait().map(|_| ()),
+                    Err(kill_error) => match child.try_wait() {
+                        Ok(Some(_)) => Ok(()),
+                        _ => Err(kill_error),
+                    },
+                },
+                Err(error) => Err(error),
+            };
+            match shutdown {
+                Ok(()) => PaneResponse::Ok,
+                Err(error) => PaneResponse::Error {
+                    message: format!("failed to kill pane child: {error}"),
+                },
+            }
         }
         PaneRequest::IsAlive => PaneResponse::IsAlive {
             alive: state
@@ -668,6 +952,7 @@ fn helper_snapshot(state: &Arc<HelperState>, width: u16, height: u16) -> Result<
     let (screen_rows, screen_cols) = screen.size();
     let (cursor_row, cursor_col) = screen.cursor_position();
     let mouse_reporting = screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None;
+    let application_cursor = screen.application_cursor();
     let alive = state
         .child
         .lock()
@@ -689,7 +974,9 @@ fn helper_snapshot(state: &Arc<HelperState>, width: u16, height: u16) -> Result<
         cursor_col,
         screen_rows,
         screen_cols,
+        scrollback: u32::try_from(screen.scrollback()).unwrap_or(u32::MAX),
         mouse_reporting,
+        application_cursor,
         alive,
     })
 }
@@ -721,13 +1008,13 @@ fn helper_resize(state: &Arc<HelperState>, rows: u16, cols: u16) -> Result<()> {
         .terminal
         .lock()
         .expect("pane helper terminal lock poisoned");
-    if rows < current_rows || cols < current_cols {
-        terminal.parser.screen_mut().set_size(rows, cols);
-    } else {
+    if rows > current_rows || cols > current_cols {
         let history = terminal.history.clone();
         let mut parser = vt100::Parser::new(rows, cols, terminal.scrollback_lines);
         parser.process(&history);
         terminal.parser = parser;
+    } else {
+        terminal.parser.screen_mut().set_size(rows, cols);
     }
     Ok(())
 }
@@ -738,13 +1025,7 @@ fn helper_mouse_scroll(
     row: u16,
     col: u16,
 ) -> Result<()> {
-    let mouse_mode = state
-        .terminal
-        .lock()
-        .expect("pane helper terminal lock poisoned")
-        .parser
-        .screen()
-        .mouse_protocol_mode();
+    let (mouse_mode, mouse_encoding) = helper_mouse_protocol(state);
 
     if mouse_mode == vt100::MouseProtocolMode::None {
         let mut terminal = state
@@ -764,13 +1045,13 @@ fn helper_mouse_scroll(
         ScrollDirection::Up => 64,
         ScrollDirection::Down => 65,
     };
-    let sgr = format!("\x1b[<{};{};{}M", code, col + 1, row + 1);
+    let report = encode_mouse_report(mouse_encoding, code, false, false, row, col)?;
     let mut writer = state
         .writer
         .lock()
         .expect("pane helper writer lock poisoned");
     writer
-        .write_all(sgr.as_bytes())
+        .write_all(&report)
         .context("failed to write mouse scroll bytes")?;
     writer.flush().context("failed to flush PTY writer")?;
     Ok(())
@@ -782,32 +1063,103 @@ fn helper_mouse_event(
     row: u16,
     col: u16,
 ) -> Result<()> {
-    let mouse_mode = state
-        .terminal
-        .lock()
-        .expect("pane helper terminal lock poisoned")
-        .parser
-        .screen()
-        .mouse_protocol_mode();
+    let (mouse_mode, mouse_encoding) = helper_mouse_protocol(state);
     if mouse_mode == vt100::MouseProtocolMode::None {
         return Ok(());
     }
 
-    let (code, suffix) = match kind {
-        HelperMouseEventKind::LeftDown => (0, 'M'),
-        HelperMouseEventKind::LeftDrag => (32, 'M'),
-        HelperMouseEventKind::LeftUp => (0, 'm'),
+    let (button, drag, release) = match kind {
+        HelperMouseEventKind::LeftDown => (0, false, false),
+        HelperMouseEventKind::LeftDrag => (0, true, false),
+        HelperMouseEventKind::LeftUp => (0, false, true),
+        HelperMouseEventKind::MiddleDown => (1, false, false),
+        HelperMouseEventKind::MiddleDrag => (1, true, false),
+        HelperMouseEventKind::MiddleUp => (1, false, true),
+        HelperMouseEventKind::RightDown => (2, false, false),
+        HelperMouseEventKind::RightDrag => (2, true, false),
+        HelperMouseEventKind::RightUp => (2, false, true),
     };
-    let sgr = format!("\x1b[<{};{};{}{}", code, col + 1, row + 1, suffix);
+
+    if !mouse_event_is_requested(mouse_mode, drag, release) {
+        return Ok(());
+    }
+
+    let report = encode_mouse_report(mouse_encoding, button, drag, release, row, col)?;
     let mut writer = state
         .writer
         .lock()
         .expect("pane helper writer lock poisoned");
     writer
-        .write_all(sgr.as_bytes())
+        .write_all(&report)
         .context("failed to write mouse event bytes")?;
     writer.flush().context("failed to flush PTY writer")?;
     Ok(())
+}
+
+fn helper_mouse_protocol(
+    state: &Arc<HelperState>,
+) -> (vt100::MouseProtocolMode, vt100::MouseProtocolEncoding) {
+    let terminal = state
+        .terminal
+        .lock()
+        .expect("pane helper terminal lock poisoned");
+    let screen = terminal.parser.screen();
+    (
+        screen.mouse_protocol_mode(),
+        screen.mouse_protocol_encoding(),
+    )
+}
+
+fn mouse_event_is_requested(mode: vt100::MouseProtocolMode, drag: bool, release: bool) -> bool {
+    match mode {
+        vt100::MouseProtocolMode::None => false,
+        vt100::MouseProtocolMode::Press => !drag && !release,
+        vt100::MouseProtocolMode::PressRelease => !drag,
+        vt100::MouseProtocolMode::ButtonMotion | vt100::MouseProtocolMode::AnyMotion => true,
+    }
+}
+
+fn encode_mouse_report(
+    encoding: vt100::MouseProtocolEncoding,
+    button: u8,
+    drag: bool,
+    release: bool,
+    row: u16,
+    col: u16,
+) -> Result<Vec<u8>> {
+    let code = if release && encoding != vt100::MouseProtocolEncoding::Sgr {
+        3
+    } else {
+        button + u8::from(drag) * 32
+    };
+    let x = u32::from(col) + 33;
+    let y = u32::from(row) + 33;
+
+    match encoding {
+        vt100::MouseProtocolEncoding::Sgr => Ok(format!(
+            "\x1b[<{};{};{}{}",
+            code,
+            u32::from(col) + 1,
+            u32::from(row) + 1,
+            if release { 'm' } else { 'M' }
+        )
+        .into_bytes()),
+        vt100::MouseProtocolEncoding::Default => {
+            let x =
+                u8::try_from(x).context("mouse column exceeds the default xterm encoding limit")?;
+            let y =
+                u8::try_from(y).context("mouse row exceeds the default xterm encoding limit")?;
+            Ok(vec![b'\x1b', b'[', b'M', code + 32, x, y])
+        }
+        vt100::MouseProtocolEncoding::Utf8 => {
+            let x = char::from_u32(x).context("invalid UTF-8 mouse column")?;
+            let y = char::from_u32(y).context("invalid UTF-8 mouse row")?;
+            let mut bytes = vec![b'\x1b', b'[', b'M', code + 32];
+            bytes.extend(x.to_string().bytes());
+            bytes.extend(y.to_string().bytes());
+            Ok(bytes)
+        }
+    }
 }
 
 fn helper_scroll_scrollback(state: &Arc<HelperState>, lines: i16) {
@@ -824,18 +1176,129 @@ fn helper_scroll_scrollback(state: &Arc<HelperState>, lines: i16) {
     terminal.parser.screen_mut().set_scrollback(next);
 }
 
+fn helper_history_selection_text(
+    parser: &mut vt100::Parser,
+    start_from_bottom: u32,
+    start_col: u16,
+    end_from_bottom: u32,
+    end_col: u16,
+) -> String {
+    let (start_from_bottom, start_col, end_from_bottom, end_col) =
+        if (start_from_bottom, std::cmp::Reverse(start_col))
+            >= (end_from_bottom, std::cmp::Reverse(end_col))
+        {
+            (start_from_bottom, start_col, end_from_bottom, end_col)
+        } else {
+            (end_from_bottom, end_col, start_from_bottom, start_col)
+        };
+    let original_scrollback = parser.screen().scrollback();
+    let (rows, cols) = parser.screen().size();
+    if rows == 0 || cols == 0 {
+        return String::new();
+    }
+
+    parser.screen_mut().set_scrollback(usize::MAX);
+    let max_from_bottom = u32::try_from(parser.screen().scrollback()).unwrap_or(u32::MAX);
+    parser.screen_mut().set_scrollback(original_scrollback);
+    let start_from_bottom = start_from_bottom.min(max_from_bottom);
+    let end_from_bottom = end_from_bottom.min(max_from_bottom);
+
+    let mut text = String::new();
+    for from_bottom in (end_from_bottom..=start_from_bottom).rev() {
+        parser.screen_mut().set_scrollback(from_bottom as usize);
+        let row_start = if from_bottom == start_from_bottom {
+            start_col.min(cols)
+        } else {
+            0
+        };
+        let row_end = if from_bottom == end_from_bottom {
+            end_col.saturating_add(1).min(cols)
+        } else {
+            cols
+        };
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&parser.screen().contents_between(
+            rows.saturating_sub(1),
+            row_start,
+            rows.saturating_sub(1),
+            row_end,
+        ));
+    }
+    parser.screen_mut().set_scrollback(original_scrollback);
+    text
+}
+
 fn helper_send_keys(state: &Arc<HelperState>, keys: &[String]) -> Result<()> {
+    let bytes = keys.iter().flat_map(|key| encode_send_key(key)).collect::<Vec<_>>();
+    helper_send_bytes(state, &bytes)
+}
+
+fn helper_send_bytes(state: &Arc<HelperState>, bytes: &[u8]) -> Result<()> {
     let mut writer = state
         .writer
         .lock()
         .expect("pane helper writer lock poisoned");
-    for key in keys {
-        writer
-            .write_all(key.as_bytes())
-            .context("failed to write key bytes")?;
-    }
+    writer.write_all(bytes).context("failed to write key bytes")?;
     writer.flush().context("failed to flush PTY writer")?;
     Ok(())
+}
+
+/// Decode the small, tmux-compatible key vocabulary accepted by `send-keys`.
+/// Unrecognised values are deliberately written verbatim so quoted command text
+/// such as `send-keys "echo hello" Enter` keeps working.
+fn encode_send_key(key: &str) -> Vec<u8> {
+    if let Some(key) = key.strip_prefix("C-").or_else(|| key.strip_prefix("Ctrl-")) {
+        if key.len() == 1 {
+            let byte = key.as_bytes()[0];
+            return match byte {
+                b'a'..=b'z' | b'A'..=b'Z' => vec![byte.to_ascii_lowercase() - b'a' + 1],
+                b'@' | b' ' => vec![0],
+                b'['..=b'_' => vec![byte - b'@'],
+                b'?' => vec![0x7f],
+                _ => key.as_bytes().to_vec(),
+            };
+        }
+    }
+
+    if let Some(key) = key.strip_prefix("M-").or_else(|| key.strip_prefix("Alt-")) {
+        let mut sequence = vec![0x1b];
+        sequence.extend_from_slice(&encode_send_key(key));
+        return sequence;
+    }
+
+    match key {
+        "Enter" | "Return" => b"\r".to_vec(),
+        "Tab" => b"\t".to_vec(),
+        "BTab" => b"\x1b[Z".to_vec(),
+        "Escape" | "Esc" => b"\x1b".to_vec(),
+        "Space" => b" ".to_vec(),
+        "Backspace" | "BSpace" => vec![0x7f],
+        "Left" => b"\x1b[D".to_vec(),
+        "Right" => b"\x1b[C".to_vec(),
+        "Up" => b"\x1b[A".to_vec(),
+        "Down" => b"\x1b[B".to_vec(),
+        "Home" => b"\x1b[H".to_vec(),
+        "End" => b"\x1b[F".to_vec(),
+        "Insert" => b"\x1b[2~".to_vec(),
+        "Delete" | "DC" => b"\x1b[3~".to_vec(),
+        "PageUp" | "PPage" => b"\x1b[5~".to_vec(),
+        "PageDown" | "NPage" => b"\x1b[6~".to_vec(),
+        "F1" => b"\x1bOP".to_vec(),
+        "F2" => b"\x1bOQ".to_vec(),
+        "F3" => b"\x1bOR".to_vec(),
+        "F4" => b"\x1bOS".to_vec(),
+        "F5" => b"\x1b[15~".to_vec(),
+        "F6" => b"\x1b[17~".to_vec(),
+        "F7" => b"\x1b[18~".to_vec(),
+        "F8" => b"\x1b[19~".to_vec(),
+        "F9" => b"\x1b[20~".to_vec(),
+        "F10" => b"\x1b[21~".to_vec(),
+        "F11" => b"\x1b[23~".to_vec(),
+        "F12" => b"\x1b[24~".to_vec(),
+        _ => key.as_bytes().to_vec(),
+    }
 }
 
 fn helper_persistent_snapshot(
@@ -867,59 +1330,30 @@ fn helper_persistent_snapshot(
         rows,
         cols,
         vt_b64: STANDARD.encode(vt.as_bytes()),
-        command: helper_foreground_command(state).unwrap_or_default(),
     })
 }
 
-fn helper_foreground_command(state: &Arc<HelperState>) -> Option<Vec<String>> {
-    let pid = state
-        .master
-        .lock()
-        .expect("pane helper master lock poisoned")
-        .process_group_leader()?;
-    foreground_command_for_pid(pid)
-}
-
-fn foreground_command_for_pid(pid: i32) -> Option<Vec<String>> {
-    #[cfg(target_os = "linux")]
-    {
-        let path = PathBuf::from(format!("/proc/{pid}/cmdline"));
-        if let Ok(raw) = fs::read(path)
-            && !raw.is_empty()
-        {
-            let args: Vec<String> = raw
-                .split(|byte| *byte == 0)
-                .filter(|part| !part.is_empty())
-                .map(|part| String::from_utf8_lossy(part).into_owned())
-                .collect();
-            if !args.is_empty() {
-                return Some(args);
-            }
-        }
-    }
-
-    let output = Command::new("ps")
-        .args(["-o", "command=", "-p", &pid.to_string()])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if raw.is_empty() {
-        return None;
-    }
-    shell_words::split(&raw)
-        .ok()
-        .filter(|args| !args.is_empty())
-}
-
 fn read_helper_request(stream: &mut UnixStream) -> Result<PaneRequest> {
-    let mut payload = Vec::new();
-    stream
-        .read_to_end(&mut payload)
-        .context("failed to read pane helper request")?;
+    let payload = read_limited(stream, "pane helper request")?;
     serde_json::from_slice(&payload).context("failed to decode pane helper request")
+}
+
+fn configure_ipc_stream(stream: &UnixStream) -> Result<()> {
+    stream.set_read_timeout(Some(IPC_TIMEOUT))?;
+    stream.set_write_timeout(Some(IPC_TIMEOUT))?;
+    Ok(())
+}
+
+fn read_limited(stream: &mut UnixStream, kind: &str) -> Result<Vec<u8>> {
+    let mut payload = Vec::new();
+    (&mut *stream)
+        .take(MAX_IPC_MESSAGE_BYTES + 1)
+        .read_to_end(&mut payload)
+        .with_context(|| format!("failed to read {kind}"))?;
+    if payload.len() as u64 > MAX_IPC_MESSAGE_BYTES {
+        bail!("{kind} exceeds {MAX_IPC_MESSAGE_BYTES} byte limit");
+    }
+    Ok(payload)
 }
 
 fn write_helper_response(stream: &mut UnixStream, response: &PaneResponse) -> Result<()> {
@@ -966,13 +1400,32 @@ fn build_command(
 fn wait_for_socket(socket_path: &Path) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        if socket_path.exists() {
+        if socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)
+            && PaneProcess::connect(socket_path.to_path_buf()).is_ok()
+        {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(25));
     }
     Err(anyhow!(
         "timed out waiting for pane helper socket {}",
+        socket_path.display()
+    ))
+}
+
+fn wait_for_socket_removal(socket_path: &Path) -> Result<()> {
+    let deadline = Instant::now() + IPC_TIMEOUT;
+    while Instant::now() < deadline {
+        if !socket_path.exists() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    Err(anyhow!(
+        "timed out waiting for pane helper socket {} to close",
         socket_path.display()
     ))
 }
@@ -1001,65 +1454,466 @@ fn resolve_helper_binary() -> Result<PathBuf> {
     )
 }
 
-fn unique_helper_name(admux_context: Option<(&str, WindowId, PaneId)>) -> String {
+fn unique_helper_name() -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
     let pid = std::process::id();
     let counter = HELPER_NAME_COUNTER.fetch_add(1, Ordering::Relaxed);
-    match admux_context {
-        Some((session, window_id, pane_id)) => format!(
-            "{}-{}-{}-{}-{}-{}.sock",
-            sanitize_component(session),
-            window_id.0,
-            pane_id.0,
-            pid,
-            now,
-            counter
-        ),
-        None => format!("pane-{}-{}-{}.sock", pid, now, counter),
-    }
+    // Unix-domain socket paths have a small, platform-defined maximum length.
+    // Session/window/pane identity is supplied in the helper payload, so it
+    // must not be repeated in the filename. PID + timestamp + counter keeps
+    // the name unique without allowing user-controlled input to exhaust the
+    // pathname budget.
+    format!("pane-{pid}-{now}-{counter}.sock")
 }
 
-fn sanitize_component(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect()
+fn unique_helper_args_name() -> String {
+    unique_helper_name().replace(".sock", ".args")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ops::Deref;
     use std::{thread, time::Duration};
-    use tempfile::tempdir;
+    use tempfile::{TempDir, tempdir as make_tempdir};
 
-    fn helper_dir() -> tempfile::TempDir {
-        tempdir().expect("tempdir")
+    fn helper_dir() -> TempDir {
+        make_tempdir().expect("tempdir")
+    }
+
+    struct TestPane(PaneProcess);
+
+    impl Deref for TestPane {
+        type Target = PaneProcess;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl Drop for TestPane {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+        }
+    }
+
+    fn spawn_test_pane(
+        command: &[String],
+        cwd: Option<&std::path::Path>,
+        admux_context: Option<(&str, WindowId, PaneId)>,
+        default_shell: Option<&str>,
+        scrollback_lines: usize,
+        helper_dir: &std::path::Path,
+        restore_seed: Option<PaneRestoreSeed>,
+    ) -> Result<TestPane> {
+        PaneProcess::spawn(
+            command,
+            cwd,
+            admux_context,
+            default_shell,
+            scrollback_lines,
+            helper_dir,
+            restore_seed,
+        )
+        .map(TestPane)
+    }
+
+    #[test]
+    fn send_keys_decodes_control_and_named_key_tokens() {
+        assert_eq!(encode_send_key("C-l"), vec![0x0c]);
+        assert_eq!(encode_send_key("Ctrl-c"), vec![0x03]);
+        assert_eq!(encode_send_key("M-x"), b"\x1bx".to_vec());
+        assert_eq!(encode_send_key("Enter"), b"\r".to_vec());
+        assert_eq!(encode_send_key("PageDown"), b"\x1b[6~".to_vec());
+        assert_eq!(encode_send_key("F5"), b"\x1b[15~".to_vec());
+    }
+
+    #[test]
+    fn send_keys_preserves_literal_text() {
+        assert_eq!(encode_send_key("echo hello"), b"echo hello".to_vec());
+    }
+
+    #[test]
+    fn test_pane_guard_shuts_down_its_helper() {
+        let dir = helper_dir();
+        let socket = {
+            let pane = spawn_test_pane(
+                &["sh".into(), "-lc".into(), "sleep 1".into()],
+                None,
+                None,
+                None,
+                10_000,
+                dir.path(),
+                None,
+            )
+            .expect("spawn pane");
+            pane.socket_path().to_path_buf()
+        };
+
+        assert!(!socket.exists());
+    }
+
+    #[test]
+    fn mouse_reports_honor_requested_encoding() {
+        assert_eq!(
+            encode_mouse_report(vt100::MouseProtocolEncoding::Default, 1, false, false, 2, 4,)
+                .expect("default mouse report"),
+            b"\x1b[M!%#"
+        );
+        assert_eq!(
+            encode_mouse_report(vt100::MouseProtocolEncoding::Default, 1, false, true, 2, 4,)
+                .expect("default release report"),
+            b"\x1b[M#%#"
+        );
+        assert_eq!(
+            encode_mouse_report(vt100::MouseProtocolEncoding::Utf8, 2, true, false, 300, 400,)
+                .expect("UTF-8 mouse report"),
+            format!(
+                "\x1b[M{}{}{}",
+                66u8 as char,
+                char::from_u32(433).unwrap(),
+                char::from_u32(333).unwrap()
+            )
+            .into_bytes()
+        );
+        assert_eq!(
+            encode_mouse_report(vt100::MouseProtocolEncoding::Sgr, 2, false, true, 2, 4,)
+                .expect("SGR release report"),
+            b"\x1b[<2;5;3m"
+        );
+    }
+
+    #[test]
+    fn mouse_reports_honor_requested_motion_mode() {
+        assert!(mouse_event_is_requested(
+            vt100::MouseProtocolMode::Press,
+            false,
+            false
+        ));
+        assert!(!mouse_event_is_requested(
+            vt100::MouseProtocolMode::Press,
+            true,
+            false
+        ));
+        assert!(!mouse_event_is_requested(
+            vt100::MouseProtocolMode::PressRelease,
+            true,
+            false
+        ));
+        assert!(mouse_event_is_requested(
+            vt100::MouseProtocolMode::PressRelease,
+            false,
+            true
+        ));
+        assert!(mouse_event_is_requested(
+            vt100::MouseProtocolMode::ButtonMotion,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn default_mouse_encoding_rejects_unrepresentable_coordinates() {
+        let error = encode_mouse_report(
+            vt100::MouseProtocolEncoding::Default,
+            0,
+            false,
+            false,
+            0,
+            223,
+        )
+        .expect_err("default encoding must not wrap coordinates");
+        assert!(error.to_string().contains("column exceeds"));
+    }
+
+    #[test]
+    fn connect_rejects_incompatible_helper_protocol() {
+        let dir = helper_dir();
+        let socket = dir.path().join("helper");
+        let listener = UnixListener::bind(&socket).expect("bind helper socket");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept handshake");
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).expect("read handshake");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&request).expect("decode handshake"),
+                serde_json::json!({"Hello":{"version":HELPER_PROTOCOL_VERSION}}),
+            );
+            stream
+                .write_all(br#"{"HelloAck":{"version":999}}"#)
+                .expect("write mismatched handshake");
+        });
+
+        let error = PaneProcess::connect(socket).expect_err("incompatible helper must fail");
+        assert!(error.to_string().contains("protocol mismatch"));
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn history_selection_spans_scrollback_and_restores_the_viewport() {
+        let mut parser = vt100::Parser::new(2, 20, 20);
+        parser.process(b"first\r\nsecond\r\nthird\r\nfourth");
+        parser.screen_mut().set_scrollback(1);
+        let original_scrollback = parser.screen().scrollback();
+        let (_, cols) = parser.screen().size();
+        let mut expected_rows = Vec::new();
+        for from_bottom in (0..=2).rev() {
+            parser.screen_mut().set_scrollback(from_bottom);
+            expected_rows.push(
+                parser
+                    .screen()
+                    .rows(0, cols)
+                    .last()
+                    .expect("bottom visible row"),
+            );
+        }
+        parser.screen_mut().set_scrollback(original_scrollback);
+
+        let selection = helper_history_selection_text(&mut parser, 2, 0, 0, cols - 1);
+
+        assert_eq!(selection, expected_rows.join("\n"));
+        assert_eq!(parser.screen().scrollback(), original_scrollback);
+    }
+
+    #[test]
+    fn history_selection_clamps_untrusted_positions_to_retained_scrollback() {
+        let mut parser = vt100::Parser::new(2, 20, 20);
+        parser.process(b"first\r\nsecond\r\nthird\r\nfourth");
+        parser.screen_mut().set_scrollback(1);
+        let original_scrollback = parser.screen().scrollback();
+        let (_, cols) = parser.screen().size();
+        parser.screen_mut().set_scrollback(usize::MAX);
+        let oldest = parser.screen().scrollback();
+        let expected = parser
+            .screen()
+            .rows(0, cols)
+            .last()
+            .expect("bottom visible row");
+        parser.screen_mut().set_scrollback(original_scrollback);
+
+        let selection = helper_history_selection_text(
+            &mut parser,
+            u32::MAX,
+            0,
+            u32::MAX,
+            cols - 1,
+        );
+
+        assert!(oldest > 0);
+        assert_eq!(selection, expected);
+        assert_eq!(parser.screen().scrollback(), original_scrollback);
+    }
+
+    #[test]
+    fn pane_process_can_move_to_scrollback_bounds() {
+        let dir = helper_dir();
+        let pane = spawn_test_pane(
+            &[
+                "sh".into(),
+                "-lc".into(),
+                "sleep 0.1; printf 'one\\ntwo\\nthree\\nfour\\n'; sleep 1".into(),
+            ],
+            None,
+            None,
+            None,
+            100,
+            dir.path(),
+            None,
+        )
+        .expect("spawn pane");
+        pane.resize(2, 20).expect("shrink pane");
+        let _ = wait_for_preview(&pane, "four");
+
+        pane.scroll_scrollback_to_top()
+            .expect("scroll to top of history");
+        let top = pane.render(20, 2).expect("render top history");
+        assert!(top.scrollback > 0);
+
+        pane.scroll_scrollback_to_bottom()
+            .expect("scroll to bottom of history");
+        let bottom = pane.render(20, 2).expect("render live screen");
+        assert_eq!(bottom.scrollback, 0);
+        assert!(bottom.preview.contains("four"));
+        pane.kill().expect("clean up pane");
+    }
+
+    #[test]
+    fn screen_size_reports_helper_transport_or_protocol_failures() {
+        let dir = helper_dir();
+        let socket = dir.path().join("helper");
+        let listener = UnixListener::bind(&socket).expect("bind helper socket");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept handshake");
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).expect("read handshake");
+            assert_eq!(
+                serde_json::from_slice::<PaneRequest>(&request).expect("decode handshake"),
+                PaneRequest::Hello {
+                    version: HELPER_PROTOCOL_VERSION
+                }
+            );
+            stream
+                .write_all(
+                    &serde_json::to_vec(&PaneResponse::HelloAck {
+                        version: HELPER_PROTOCOL_VERSION,
+                    })
+                    .expect("encode handshake response"),
+                )
+                .expect("write handshake response");
+            drop(stream);
+
+            let (mut stream, _) = listener.accept().expect("accept screen-size request");
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).expect("read screen-size request");
+            assert_eq!(
+                serde_json::from_slice::<PaneRequest>(&request).expect("decode screen-size request"),
+                PaneRequest::ScreenSize
+            );
+            stream
+                .write_all(
+                    &serde_json::to_vec(&PaneResponse::Error {
+                        message: "helper unavailable".into(),
+                    })
+                    .expect("encode error response"),
+                )
+                .expect("write error response");
+            drop(stream);
+        });
+
+        let pane = PaneProcess::connect(socket).expect("connect compatible helper");
+        let error = pane
+            .screen_size()
+            .expect_err("helper error must not become a default size");
+        assert!(error.to_string().contains("helper unavailable"));
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn stalled_helper_client_does_not_block_other_requests() {
+        let dir = helper_dir();
+        let pane = spawn_test_pane(
+            &["sh".into(), "-lc".into(), "sleep 2".into()],
+            None,
+            None,
+            None,
+            10_000,
+            dir.path(),
+            None,
+        )
+        .expect("spawn pane");
+        let mut stalled = UnixStream::connect(pane.socket_path()).expect("connect stalled peer");
+        stalled.write_all(b"{").expect("start incomplete request");
+        thread::sleep(Duration::from_millis(50));
+
+        let started = Instant::now();
+        assert_eq!(pane.screen_size().expect("independent request succeeds"), (24, 80));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a stalled peer must not consume the helper listener"
+        );
+
+        stalled
+            .shutdown(std::net::Shutdown::Write)
+            .expect("finish stalled request");
+        pane.kill().expect("clean up pane");
+    }
+
+    #[test]
+    fn invalid_persistent_snapshot_wire_is_an_error_not_a_panic() {
+        let invalid_base64 = PanePersistentSnapshotWire {
+            rows: 24,
+            cols: 80,
+            vt_b64: "not base64!".into(),
+        };
+        assert!(PanePersistentSnapshot::try_from(invalid_base64).is_err());
+
+        let invalid_utf8 = PanePersistentSnapshotWire {
+            rows: 24,
+            cols: 80,
+            vt_b64: STANDARD.encode([0xff]),
+        };
+        assert!(PanePersistentSnapshot::try_from(invalid_utf8).is_err());
+    }
+
+    #[test]
+    fn helper_startup_failure_removes_its_prebound_socket() {
+        let dir = helper_dir();
+        let socket = dir.path().join("helper.sock");
+        let error = run_helper(PaneHelperArgs {
+            socket: socket.clone(),
+            cwd: None,
+            session_name: None,
+            window_id: None,
+            pane_id: None,
+            default_shell: None,
+            scrollback_lines: 10_000,
+            command: vec!["/definitely/not/an-admux-command".into()],
+            restore_seed: None,
+        })
+        .expect_err("invalid command should fail helper startup");
+
+        assert!(error.to_string().contains("failed to spawn pane command"));
+        assert!(!socket.exists(), "failed helper startup must remove its socket");
+    }
+
+    #[test]
+    fn history_truncation_never_starts_inside_utf8_or_csi() {
+        let mut history = b"12345678\xc3\xa9abcdef\x1b[38;2;255;0;0mgreen".to_vec();
+
+        truncate_history_at_safe_boundary(&mut history, 12);
+
+        assert!(std::str::from_utf8(&history).is_ok());
+        assert!(
+            !history.starts_with(b"\x1b[") && history.starts_with(b"green"),
+            "history should resume after the completed CSI sequence"
+        );
+    }
+
+    #[test]
+    fn history_truncation_discards_unterminated_control_strings() {
+        let mut history = b"prefix\x1b]0;unterminated-title".to_vec();
+
+        truncate_history_at_safe_boundary(&mut history, 5);
+
+        assert!(history.is_empty());
+    }
+
+    #[test]
+    fn replay_history_limit_tracks_scrollback_instead_of_a_fixed_two_mebibytes() {
+        let default_limit = replay_history_limit(10_000, 80);
+        assert!(default_limit > 2 * 1024 * 1024);
+        assert_eq!(default_limit, 12_800_000);
+        assert_eq!(
+            replay_history_limit(usize::MAX, u16::MAX),
+            MAX_REPLAY_HISTORY_BYTES
+        );
+    }
+
+    fn pane_preview(pane: &PaneProcess) -> String {
+        let (rows, cols) = pane.screen_size().expect("query pane screen size");
+        pane.render(cols.max(1), rows.max(1))
+            .expect("render pane")
+            .preview
     }
 
     fn wait_for_preview(pane: &PaneProcess, needle: &str) -> String {
         for _ in 0..50 {
-            let preview = pane.preview();
+            let preview = pane_preview(pane);
             if preview.contains(needle) {
                 return preview;
             }
             thread::sleep(Duration::from_millis(20));
         }
-        pane.preview()
+        pane_preview(pane)
     }
 
     #[test]
     fn pane_process_captures_command_output() {
         let dir = helper_dir();
-        let pane = PaneProcess::spawn(
+        let pane = spawn_test_pane(
             &["sh".into(), "-lc".into(), "printf 'hello from pane'".into()],
             None,
             None,
@@ -1074,9 +1928,33 @@ mod tests {
     }
 
     #[test]
+    fn pane_process_accepts_restore_data_larger_than_a_command_argument() {
+        let dir = helper_dir();
+        let pane = spawn_test_pane(
+            &["sh".into(), "-lc".into(), "sleep 1".into()],
+            None,
+            None,
+            None,
+            10_000,
+            dir.path(),
+            Some(PaneRestoreSeed {
+                rows: 24,
+                cols: 80,
+                // Linux rejects a single argv element above MAX_ARG_STRLEN
+                // (normally 128 KiB); startup data must not use argv.
+                vt: "x".repeat(256 * 1024),
+            }),
+        )
+        .expect("spawn pane with large restore seed");
+
+        assert_eq!(pane.screen_size().expect("query pane size"), (24, 80));
+        pane.kill().expect("clean up pane");
+    }
+
+    #[test]
     fn pane_process_handles_clear_screen_sequences() {
         let dir = helper_dir();
-        let pane = PaneProcess::spawn(
+        let pane = spawn_test_pane(
             &[
                 "sh".into(),
                 "-lc".into(),
@@ -1097,9 +1975,42 @@ mod tests {
     }
 
     #[test]
+    fn pane_snapshot_reports_application_cursor_mode() {
+        let dir = helper_dir();
+        let pane = spawn_test_pane(
+            &[
+                "sh".into(),
+                "-lc".into(),
+                "printf '\\033[?1h'; sleep 1".into(),
+            ],
+            None,
+            None,
+            None,
+            10_000,
+            dir.path(),
+            None,
+        )
+        .expect("spawn pane");
+
+        let mut application_cursor = false;
+        for _ in 0..50 {
+            application_cursor = pane
+                .render(80, 24)
+                .expect("render pane")
+                .application_cursor;
+            if application_cursor {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(application_cursor);
+        pane.kill().expect("clean up pane");
+    }
+
+    #[test]
     fn pane_process_restores_history_after_expanding() {
         let dir = helper_dir();
-        let pane = PaneProcess::spawn(
+        let pane = spawn_test_pane(
             &[
                 "sh".into(),
                 "-lc".into(),
@@ -1116,20 +2027,80 @@ mod tests {
 
         let _ = wait_for_preview(&pane, "one two");
         pane.resize(24, 10).expect("resize pane");
-        let shrunk = pane.preview();
+        let shrunk = pane_preview(&pane);
         assert!(shrunk.contains("one two"));
 
         pane.resize(24, 80).expect("resize pane");
 
-        let preview = pane.preview();
+        let preview = pane_preview(&pane);
         assert!(preview.contains("three"));
         assert!(preview.contains("seven"));
     }
 
     #[test]
+    fn pane_process_replays_history_when_one_resize_axis_expands() {
+        let dir = helper_dir();
+        let pane = spawn_test_pane(
+            &[
+                "sh".into(),
+                "-lc".into(),
+                "printf 'one two three four five six seven eight nine ten'; sleep 1".into(),
+            ],
+            None,
+            None,
+            None,
+            10_000,
+            dir.path(),
+            None,
+        )
+        .expect("spawn pane");
+
+        let _ = wait_for_preview(&pane, "one two");
+        pane.resize(20, 10).expect("shrink pane width");
+        pane.resize(10, 80)
+            .expect("expand width while shrinking height");
+
+        assert!(
+            pane_preview(&pane).contains("one two three four five six seven"),
+            "an expanding axis must replay history even when the other shrinks"
+        );
+    }
+
+    #[test]
+    fn pane_resize_retains_scrollback_beyond_the_legacy_history_cap() {
+        let dir = helper_dir();
+        let pane = spawn_test_pane(
+            &[
+                "sh".into(),
+                "-lc".into(),
+                "i=0; while [ \"$i\" -lt 30000 ]; do printf '%099d\\n' \"$i\"; i=$((i + 1)); done; sleep 1".into(),
+            ],
+            None,
+            None,
+            None,
+            30_000,
+            dir.path(),
+            None,
+        )
+        .expect("spawn pane");
+
+        let last_line = format!("{:099}", 29_999);
+        let _ = wait_for_preview(&pane, &last_line);
+        pane.resize(24, 100).expect("expand pane width");
+        pane.scroll_scrollback_by(-30_000)
+            .expect("scroll to the oldest retained output");
+
+        assert!(
+            pane_preview(&pane).contains(&format!("{:099}", 0)),
+            "resize replay must retain lines beyond the former 2 MiB raw-history cap"
+        );
+        pane.kill().expect("clean up pane");
+    }
+
+    #[test]
     fn pane_process_can_reconnect_to_existing_helper() {
         let dir = helper_dir();
-        let pane = PaneProcess::spawn(
+        let pane = spawn_test_pane(
             &[
                 "sh".into(),
                 "-lc".into(),
@@ -1150,9 +2121,55 @@ mod tests {
     }
 
     #[test]
+    fn scrollback_reports_helper_transport_failures() {
+        let dir = helper_dir();
+        let pane = spawn_test_pane(
+            &["sh".into(), "-lc".into(), "sleep 1".into()],
+            None,
+            None,
+            None,
+            10_000,
+            dir.path(),
+            None,
+        )
+        .expect("spawn pane");
+        let socket = pane.socket_path().to_path_buf();
+        let hidden = socket.with_extension("hidden");
+        fs::rename(&socket, &hidden).expect("hide helper socket");
+
+        assert!(pane.scroll_scrollback_by(1).is_err());
+
+        fs::rename(&hidden, &socket).expect("restore helper socket");
+        pane.kill().expect("clean up helper");
+    }
+
+    #[test]
+    fn selection_text_reports_helper_transport_failures() {
+        let dir = helper_dir();
+        let pane = spawn_test_pane(
+            &["sh".into(), "-lc".into(), "printf selected; sleep 1".into()],
+            None,
+            None,
+            None,
+            10_000,
+            dir.path(),
+            None,
+        )
+        .expect("spawn pane");
+        let socket = pane.socket_path().to_path_buf();
+        let hidden = socket.with_extension("hidden");
+        fs::rename(&socket, &hidden).expect("hide helper socket");
+
+        assert!(pane.selection_text(0, 0, 0, 7).is_err());
+
+        fs::rename(&hidden, &socket).expect("restore helper socket");
+        pane.kill().expect("clean up helper");
+    }
+
+    #[test]
     fn pane_process_can_restore_persistent_snapshot() {
         let dir = helper_dir();
-        let pane = PaneProcess::spawn(
+        let pane = spawn_test_pane(
             &[
                 "sh".into(),
                 "-lc".into(),
@@ -1168,7 +2185,7 @@ mod tests {
         .expect("spawn pane");
         assert!(wait_for_preview(&pane, "snapshot-two").contains("snapshot-two"));
         let snapshot = pane.persistent_snapshot(500).expect("persistent snapshot");
-        let restored = PaneProcess::spawn(
+        let restored = spawn_test_pane(
             &["sh".into(), "-lc".into(), "sleep 1".into()],
             None,
             None,
@@ -1184,10 +2201,10 @@ mod tests {
     }
 
     #[test]
-    fn persistent_snapshot_prefers_foreground_command() {
+    fn persistent_snapshot_does_not_include_runtime_command_metadata() {
         let dir = helper_dir();
-        let pane = PaneProcess::spawn(
-            &["sh".into(), "-lc".into(), "exec sleep 1".into()],
+        let pane = spawn_test_pane(
+            &["sh".into(), "-lc".into(), "exec sleep 3".into()],
             None,
             None,
             None,
@@ -1196,8 +2213,71 @@ mod tests {
             None,
         )
         .expect("spawn pane");
-        thread::sleep(Duration::from_millis(50));
         let snapshot = pane.persistent_snapshot(500).expect("persistent snapshot");
-        assert_eq!(snapshot.command.first().map(String::as_str), Some("sleep"));
+        assert_eq!(snapshot.rows, 24);
+        assert_eq!(snapshot.cols, 80);
+        assert!(!snapshot.vt.is_empty());
+        pane.kill().expect("clean up pane");
+    }
+
+    #[test]
+    fn helper_socket_names_are_bounded_and_unique() {
+        let dir = helper_dir();
+        let first = unique_helper_name();
+        let second = unique_helper_name();
+
+        assert!(
+            first.len() < 80,
+            "socket filename should preserve pathname budget"
+        );
+        assert!(
+            dir.path().join(&first).as_os_str().len() < 100,
+            "full helper socket path should fit typical Unix-domain socket limits"
+        );
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn helper_directory_and_socket_are_private() {
+        let dir = helper_dir();
+        let helper_root = dir.path().join("helpers");
+        ensure_private_helper_directory(&helper_root).expect("create private helper directory");
+        assert_eq!(
+            fs::metadata(&helper_root).expect("directory metadata").mode() & 0o777,
+            0o700
+        );
+
+        let pane = spawn_test_pane(
+            &["sh".into(), "-lc".into(), "sleep 1".into()],
+            None,
+            None,
+            None,
+            10_000,
+            &helper_root,
+            None,
+        )
+        .expect("spawn pane");
+        assert_eq!(
+            fs::metadata(pane.socket_path())
+                .expect("socket metadata")
+                .mode()
+                & 0o777,
+            0o600
+        );
+        pane.kill().expect("clean up pane");
+    }
+
+    #[test]
+    fn helper_directory_restricts_insecure_existing_permissions() {
+        let dir = helper_dir();
+        let helper_root = dir.path().join("insecure");
+        fs::create_dir(&helper_root).expect("create helper directory");
+        fs::set_permissions(&helper_root, fs::Permissions::from_mode(0o755))
+            .expect("make directory insecure");
+        ensure_private_helper_directory(&helper_root).expect("restrict helper directory");
+        assert_eq!(
+            fs::metadata(&helper_root).expect("directory metadata").mode() & 0o777,
+            0o700
+        );
     }
 }

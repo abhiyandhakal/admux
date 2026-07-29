@@ -3,16 +3,17 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 
 use crate::{
     config::WindowDefaults,
     ipc::{
         NavigationDirection, PaneCursor, PaneMouseKind, PaneRender, PaneSummary, RenderSnapshot,
-        ScrollDirection,
+        ScrollDirection, ScrollbackPosition,
     },
     layout::{Direction, LayoutTree, SplitAxis},
-    pane::{PaneId, PaneSnapshot, Rect, WindowId},
+    numbering::Numbering,
+    pane::{PaneId, Rect, WindowId},
     persistence::PersistedSession,
     pty::{PanePersistentSnapshot, PaneProcess, PaneRestoreSeed},
     window::WindowSummary,
@@ -34,6 +35,7 @@ pub struct Session {
     pub last_window: Option<WindowId>,
     pub default_shell: Option<String>,
     pub scrollback_lines: usize,
+    pub numbering: Numbering,
     pub window_defaults: WindowDefaults,
     pub helper_dir: PathBuf,
 }
@@ -79,6 +81,7 @@ impl Session {
         window_id: WindowId,
         default_shell: Option<String>,
         scrollback_lines: usize,
+        numbering: Numbering,
         window_defaults: WindowDefaults,
         helper_dir: PathBuf,
     ) -> Result<Self> {
@@ -90,6 +93,7 @@ impl Session {
             window_id,
             default_shell,
             scrollback_lines,
+            numbering,
             window_defaults,
             helper_dir,
             None,
@@ -104,6 +108,7 @@ impl Session {
         window_id: WindowId,
         default_shell: Option<String>,
         scrollback_lines: usize,
+        numbering: Numbering,
         window_defaults: WindowDefaults,
         helper_dir: PathBuf,
         restore_seed: Option<PaneRestoreSeed>,
@@ -139,10 +144,18 @@ impl Session {
             last_window: None,
             default_shell,
             scrollback_lines,
+            numbering,
             window_defaults,
             helper_dir,
         };
-        session.sync_pane_sizes()?;
+        if let Err(error) = session.sync_pane_sizes() {
+            return match session.kill() {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(error.context(format!(
+                    "additionally failed to clean up initial session pane: {cleanup_error}"
+                ))),
+            };
+        }
         Ok(session)
     }
 
@@ -150,9 +163,11 @@ impl Session {
         persisted: &PersistedSession,
         default_shell: Option<String>,
         scrollback_lines: usize,
+        numbering: Numbering,
         window_defaults: WindowDefaults,
         helper_dir: PathBuf,
     ) -> Result<Self> {
+        let persisted = persisted.normalized()?;
         let mut windows = BTreeMap::new();
         for window_id in &persisted.window_order {
             let persisted_window = persisted
@@ -160,25 +175,52 @@ impl Session {
                 .get(window_id)
                 .ok_or_else(|| anyhow!("missing persisted window {}", window_id.0))?;
             let mut panes = BTreeMap::new();
+            let mut layout = persisted_window.layout.clone();
             for pane_id in persisted_window.layout.panes() {
-                let persisted_pane = persisted_window
-                    .panes
-                    .get(&pane_id)
-                    .ok_or_else(|| anyhow!("missing persisted pane {}", pane_id.0))?;
-                let socket_path = persisted_pane
-                    .socket_path
-                    .clone()
-                    .ok_or_else(|| anyhow!("persisted pane {} has no helper socket", pane_id.0))?;
-                panes.insert(
-                    pane_id,
-                    PaneRuntime {
-                        id: pane_id,
-                        title: persisted_pane.title.clone(),
-                        cwd: persisted_pane.cwd.clone(),
-                        command: persisted_pane.command.clone(),
-                        process: PaneProcess::connect(socket_path)?,
-                    },
+                let Some(persisted_pane) = persisted_window.panes.get(&pane_id) else {
+                    continue;
+                };
+                let Some(socket_path) = persisted_pane.socket_path.clone() else {
+                    eprintln!(
+                        "admuxd: could not recover pane {} in session {}: no helper socket",
+                        pane_id.0, persisted.name
+                    );
+                    continue;
+                };
+                match PaneProcess::connect_live(socket_path) {
+                    Ok(process) => {
+                        panes.insert(
+                            pane_id,
+                            PaneRuntime {
+                                id: pane_id,
+                                title: persisted_pane.title.clone(),
+                                cwd: persisted_pane.cwd.clone(),
+                                command: persisted_pane.command.clone(),
+                                process,
+                            },
+                        );
+                    }
+                    Err(error) => eprintln!(
+                        "admuxd: could not recover pane {} in session {}: {error:#}",
+                        pane_id.0, persisted.name
+                    ),
+                }
+            }
+            for pane_id in persisted_window.layout.panes() {
+                if !panes.contains_key(&pane_id) {
+                    if layout.panes().len() == 1 {
+                        panes.clear();
+                        break;
+                    }
+                    let _ = layout.remove_pane(pane_id);
+                }
+            }
+            if panes.is_empty() {
+                eprintln!(
+                    "admuxd: could not recover window {} in session {}: no live panes",
+                    window_id.0, persisted.name
                 );
+                continue;
             }
             windows.insert(
                 *window_id,
@@ -186,12 +228,29 @@ impl Session {
                     id: persisted_window.id,
                     name: persisted_window.name.clone(),
                     cwd: persisted_window.cwd.clone(),
-                    layout: persisted_window.layout.clone(),
+                    layout,
                     next_pane_id: persisted_window.next_pane_id,
                     panes,
                 },
             );
         }
+
+        let window_order: Vec<_> = persisted
+            .window_order
+            .iter()
+            .copied()
+            .filter(|window_id| windows.contains_key(window_id))
+            .collect();
+        let active_window = if windows.contains_key(&persisted.active_window) {
+            persisted.active_window
+        } else {
+            *window_order
+                .first()
+                .ok_or_else(|| anyhow!("persisted session {} has no recoverable panes", persisted.name))?
+        };
+        let last_window = persisted
+            .last_window
+            .filter(|window_id| windows.contains_key(window_id) && *window_id != active_window);
 
         let mut session = Self {
             name: persisted.name.clone(),
@@ -201,11 +260,12 @@ impl Session {
             rows: persisted.rows,
             cols: persisted.cols,
             windows,
-            window_order: persisted.window_order.clone(),
-            active_window: persisted.active_window,
-            last_window: persisted.last_window,
+            window_order,
+            active_window,
+            last_window,
             default_shell,
             scrollback_lines,
+            numbering,
             window_defaults,
             helper_dir,
         };
@@ -221,55 +281,23 @@ impl Session {
         self.windows.get_mut(&self.active_window)
     }
 
-    pub fn active_pane_preview(&self) -> String {
-        self.active_window()
-            .and_then(|window| window.active_pane())
-            .map(|pane| pane.process.preview())
-            .unwrap_or_default()
-    }
-
-    pub fn active_pane_formatted_preview(&self) -> String {
-        self.active_window()
-            .and_then(|window| window.active_pane())
-            .map(|pane| pane.process.formatted_preview())
-            .unwrap_or_default()
-    }
-
-    pub fn active_pane_formatted_cursor(&self) -> String {
-        self.active_window()
-            .and_then(|window| window.active_pane())
-            .map(|pane| pane.process.formatted_cursor())
-            .unwrap_or_default()
-    }
-
-    pub fn active_pane_selection_text(
+    pub fn pane_selection_text(
         &self,
-        pane_id: Option<PaneId>,
-        start_row: u16,
+        window_id: Option<u64>,
+        pane_id: Option<u64>,
+        start_from_bottom: u32,
         start_col: u16,
-        end_row: u16,
+        end_from_bottom: u32,
         end_col: u16,
-    ) -> String {
-        self.active_window()
-            .and_then(|window| {
-                let pane_id = pane_id.unwrap_or(window.layout.active);
-                window.panes.get(&pane_id)
-            })
-            .map(|pane| {
-                pane.process
-                    .selection_text(start_row, start_col, end_row, end_col)
-            })
-            .unwrap_or_default()
-    }
-
-    pub fn active_pane_snapshot(&self) -> Option<PaneSnapshot> {
-        self.active_window()
-            .and_then(|window| window.active_pane())
-            .map(|pane| PaneSnapshot {
-                id: pane.id,
-                title: pane.title.clone(),
-                preview: pane.process.preview(),
-            })
+    ) -> Result<String> {
+        let window = self.window_for_public_id(window_id)?;
+        let pane_id = self.pane_id_from_public(pane_id, window.layout.active)?;
+        let pane = window
+            .panes
+            .get(&pane_id)
+            .ok_or_else(|| anyhow!("pane is unavailable"))?;
+        pane.process
+            .selection_text(start_from_bottom, start_col, end_from_bottom, end_col)
     }
 
     pub fn render_snapshot(&self, size: Rect) -> Option<RenderSnapshot> {
@@ -282,20 +310,7 @@ impl Session {
             .filter_map(|pane_id| {
                 let pane = window.panes.get(&pane_id)?;
                 let rect = *rects.get(&pane_id)?;
-                let render = pane.process.render(rect.width, rect.height).ok()?;
-                let cursor = clamp_cursor(rect, render.cursor_row, render.cursor_col);
-
-                Some(PaneRender {
-                    pane_id: pane.id.0,
-                    title: pane.title.clone(),
-                    rect,
-                    focused: pane_id == window.layout.active,
-                    helper_socket: Some(pane.process.socket_path().to_path_buf()),
-                    mouse_reporting: render.mouse_reporting,
-                    rows_plain: render.rows_plain,
-                    rows_formatted: render.rows_formatted,
-                    cursor,
-                })
+                self.render_pane(pane, rect, pane_id == window.layout.active)
             })
             .collect();
 
@@ -304,8 +319,51 @@ impl Session {
             windows: self.list_windows(),
             panes,
             dividers: window.layout.divider_cells(size),
-            active_window_id: window.id.0,
-            active_pane_id: window.layout.active.0,
+            active_window_id: self
+                .numbering
+                .public_window_id(window.id, &self.window_order)
+                .ok()?,
+            active_pane_id: self.numbering.public_pane_number(window.layout.active).ok()?,
+        })
+    }
+
+    pub fn render_window_preview(
+        &self,
+        window_id: WindowId,
+        pane_id: Option<PaneId>,
+        size: Rect,
+    ) -> Option<RenderSnapshot> {
+        let window = self.windows.get(&window_id)?;
+        let active_pane = pane_id.unwrap_or(window.layout.active);
+        if !window.panes.contains_key(&active_pane) {
+            return None;
+        }
+        let rects = window.layout.pane_rects(size);
+        let panes = window
+            .layout
+            .panes()
+            .into_iter()
+            .filter_map(|pane_id| {
+                let pane = window.panes.get(&pane_id)?;
+                let rect = *rects.get(&pane_id)?;
+                self.render_pane(pane, rect, pane_id == active_pane)
+            })
+            .collect();
+        let mut windows = self.list_windows();
+        for summary in &mut windows {
+            summary.active = summary.id == window.id.0;
+        }
+
+        Some(RenderSnapshot {
+            sessions: Vec::new(),
+            windows,
+            panes,
+            dividers: window.layout.divider_cells(size),
+            active_window_id: self
+                .numbering
+                .public_window_id(window.id, &self.window_order)
+                .ok()?,
+            active_pane_id: self.numbering.public_pane_number(active_pane).ok()?,
         })
     }
 
@@ -337,19 +395,11 @@ impl Session {
             for pane_id in window.layout.panes() {
                 let pane = window.panes.get(&pane_id)?;
                 let rect = *rects.get(&pane_id)?;
-                let render = pane.process.render(rect.width, rect.height).ok()?;
-                let cursor = clamp_cursor(rect, render.cursor_row, render.cursor_col);
-                panes.push(PaneRender {
-                    pane_id: pane.id.0,
-                    title: pane.title.clone(),
+                panes.push(self.render_pane(
+                    pane,
                     rect,
-                    focused: pane_id == window.layout.active && *window_id == self.active_window,
-                    helper_socket: Some(pane.process.socket_path().to_path_buf()),
-                    mouse_reporting: render.mouse_reporting,
-                    rows_plain: render.rows_plain,
-                    rows_formatted: render.rows_formatted,
-                    cursor,
-                });
+                    pane_id == window.layout.active && *window_id == self.active_window,
+                )?);
             }
             dividers.extend(window.layout.divider_cells(window_rect));
             offset_y = offset_y.saturating_add(window_height);
@@ -360,12 +410,54 @@ impl Session {
             windows: self.list_windows(),
             panes,
             dividers,
-            active_window_id: self.active_window.0,
+            active_window_id: self
+                .numbering
+                .public_window_id(self.active_window, &self.window_order)
+                .ok()?,
             active_pane_id: self
                 .active_window()
-                .map(|window| window.layout.active.0)
+                .and_then(|window| self.numbering.public_pane_number(window.layout.active).ok())
                 .unwrap_or(0),
         })
+    }
+
+    fn render_pane(&self, pane: &PaneRuntime, rect: Rect, focused: bool) -> Option<PaneRender> {
+        let pane_id = self.numbering.public_pane_number(pane.id).ok()?;
+        let helper_socket = Some(pane.process.socket_path().to_path_buf());
+        match pane.process.render(rect.width, rect.height) {
+            Ok(render) => Some(PaneRender {
+                pane_id,
+                title: pane.title.clone(),
+                rect,
+                focused,
+                helper_socket,
+                mouse_reporting: render.mouse_reporting,
+                application_cursor: render.application_cursor,
+                scrollback: render.scrollback,
+                preview: render.preview,
+                formatted_preview: render.formatted_preview,
+                formatted_cursor: render.formatted_cursor,
+                rows_plain: render.rows_plain,
+                rows_formatted: render.rows_formatted,
+                cursor: clamp_cursor(rect, render.cursor_row, render.cursor_col),
+            }),
+            Err(_) => Some(PaneRender {
+                pane_id,
+                title: format!("{} (unavailable)", pane.title),
+                rect,
+                focused,
+                helper_socket,
+                mouse_reporting: false,
+                application_cursor: false,
+                scrollback: 0,
+                preview: "[admux: pane helper unavailable]".into(),
+                formatted_preview: "[admux: pane helper unavailable]".into(),
+                formatted_cursor: String::new(),
+                rows_plain: vec!["[admux: pane helper unavailable]".into()],
+                rows_formatted: vec!["[admux: pane helper unavailable]".into()],
+                cursor: None,
+            }),
+        }
     }
 
     pub fn list_windows(&self) -> Vec<WindowSummary> {
@@ -376,7 +468,7 @@ impl Session {
                 let window = self.windows.get(id)?;
                 Some(WindowSummary::new(
                     *id,
-                    index,
+                    self.numbering.public_window_number(index).ok()?,
                     window.name.clone(),
                     *id == self.active_window,
                     Some(*id) == self.last_window,
@@ -395,14 +487,17 @@ impl Session {
                     .panes()
                     .into_iter()
                     .map(|pane_id| PaneSummary {
-                        id: pane_id.0,
+                        id: self.numbering.public_pane_number(pane_id).unwrap_or(pane_id.0),
                         title: window
                             .panes
                             .get(&pane_id)
                             .map(|pane| pane.title.clone())
                             .unwrap_or_else(|| "pane".into()),
                         active: pane_id == window.layout.active,
-                        window_id: window.id.0,
+                        window_id: self
+                            .numbering
+                            .public_window_id(window.id, &self.window_order)
+                            .unwrap_or(window.id.0),
                     })
                     .collect()
             })
@@ -438,32 +533,60 @@ impl Session {
         Ok(())
     }
 
+    pub fn send_bytes(
+        &self,
+        window_id: Option<WindowId>,
+        pane_id: Option<PaneId>,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let window = self
+            .window(window_id)
+            .ok_or_else(|| anyhow!("unknown window"))?;
+        let pane_id = pane_id.unwrap_or(window.layout.active);
+        let pane = window
+            .panes
+            .get(&pane_id)
+            .ok_or_else(|| anyhow!("unknown pane"))?;
+        pane.process.send_bytes(bytes)
+    }
+
     pub fn set_viewport(&mut self, rows: u16, cols: u16) -> Result<()> {
-        self.rows = rows.max(1);
-        self.cols = cols.max(1);
-        self.sync_pane_sizes()
+        let rows = rows.max(1);
+        let cols = cols.max(1);
+        let next_area = self.pane_area_for(rows, cols);
+        self.resize_window_panes(self.active_window, next_area)?;
+        self.rows = rows;
+        self.cols = cols;
+        Ok(())
     }
 
     pub fn pane_area(&self) -> Rect {
+        self.pane_area_for(self.rows, self.cols)
+    }
+
+    pub fn pane_area_for_viewport(&self, rows: u16, cols: u16) -> Rect {
+        self.pane_area_for(rows, cols)
+    }
+
+    fn pane_area_for(&self, rows: u16, cols: u16) -> Rect {
         Rect {
             x: 0,
             y: 0,
-            width: self.cols.max(1),
-            height: self.rows.saturating_sub(1).max(1),
+            width: cols.max(1),
+            height: rows.saturating_sub(1).max(1),
         }
     }
 
     pub fn handle_mouse_scroll(
         &self,
-        pane_id: Option<PaneId>,
+        window_id: Option<u64>,
+        pane_id: Option<u64>,
         direction: ScrollDirection,
         row: u16,
         col: u16,
     ) -> Result<()> {
-        let window = self
-            .active_window()
-            .ok_or_else(|| anyhow!("unknown window"))?;
-        let pane_id = pane_id.unwrap_or(window.layout.active);
+        let window = self.window_for_public_id(window_id)?;
+        let pane_id = self.pane_id_from_public(pane_id, window.layout.active)?;
         let pane = window
             .panes
             .get(&pane_id)
@@ -474,15 +597,14 @@ impl Session {
 
     pub fn handle_pane_mouse(
         &self,
-        pane_id: Option<PaneId>,
+        window_id: Option<u64>,
+        pane_id: Option<u64>,
         kind: PaneMouseKind,
         row: u16,
         col: u16,
     ) -> Result<()> {
-        let window = self
-            .active_window()
-            .ok_or_else(|| anyhow!("unknown window"))?;
-        let pane_id = pane_id.unwrap_or(window.layout.active);
+        let window = self.window_for_public_id(window_id)?;
+        let pane_id = self.pane_id_from_public(pane_id, window.layout.active)?;
         let pane = window
             .panes
             .get(&pane_id)
@@ -492,6 +614,12 @@ impl Session {
                 PaneMouseKind::LeftDown => crate::pty::HelperMouseEventKind::LeftDown,
                 PaneMouseKind::LeftDrag => crate::pty::HelperMouseEventKind::LeftDrag,
                 PaneMouseKind::LeftUp => crate::pty::HelperMouseEventKind::LeftUp,
+                PaneMouseKind::MiddleDown => crate::pty::HelperMouseEventKind::MiddleDown,
+                PaneMouseKind::MiddleDrag => crate::pty::HelperMouseEventKind::MiddleDrag,
+                PaneMouseKind::MiddleUp => crate::pty::HelperMouseEventKind::MiddleUp,
+                PaneMouseKind::RightDown => crate::pty::HelperMouseEventKind::RightDown,
+                PaneMouseKind::RightDrag => crate::pty::HelperMouseEventKind::RightDrag,
+                PaneMouseKind::RightUp => crate::pty::HelperMouseEventKind::RightUp,
             },
             row,
             col,
@@ -499,17 +627,37 @@ impl Session {
         Ok(())
     }
 
-    pub fn scroll_pane(&self, pane_id: Option<PaneId>, lines: i16) -> Result<()> {
-        let window = self
-            .active_window()
-            .ok_or_else(|| anyhow!("unknown window"))?;
-        let pane_id = pane_id.unwrap_or(window.layout.active);
+    pub fn scroll_pane(
+        &self,
+        window_id: Option<u64>,
+        pane_id: Option<u64>,
+        lines: i16,
+    ) -> Result<()> {
+        let window = self.window_for_public_id(window_id)?;
+        let pane_id = self.pane_id_from_public(pane_id, window.layout.active)?;
         let pane = window
             .panes
             .get(&pane_id)
             .ok_or_else(|| anyhow!("unknown pane"))?;
-        pane.process.scroll_scrollback_by(lines);
-        Ok(())
+        pane.process.scroll_scrollback_by(lines)
+    }
+
+    pub fn scroll_pane_to(
+        &self,
+        window_id: Option<u64>,
+        pane_id: Option<u64>,
+        position: ScrollbackPosition,
+    ) -> Result<()> {
+        let window = self.window_for_public_id(window_id)?;
+        let pane_id = self.pane_id_from_public(pane_id, window.layout.active)?;
+        let pane = window
+            .panes
+            .get(&pane_id)
+            .ok_or_else(|| anyhow!("unknown pane"))?;
+        match position {
+            ScrollbackPosition::Top => pane.process.scroll_scrollback_to_top(),
+            ScrollbackPosition::Bottom => pane.process.scroll_scrollback_to_bottom(),
+        }
     }
 
     pub fn split_active_pane(
@@ -517,7 +665,16 @@ impl Session {
         axis: SplitAxis,
         command: &[String],
     ) -> Result<SplitResult> {
-        let cwd = self.cwd.clone();
+        let cwd = self
+            .active_window()
+            .and_then(|window| {
+                window
+                    .panes
+                    .get(&window.layout.active)
+                    .and_then(|pane| pane.cwd.clone())
+                    .or_else(|| window.cwd.clone())
+            })
+            .or_else(|| self.cwd.clone());
         self.split_pane_in_window(self.active_window, None, axis, 500, cwd, command)
     }
 
@@ -561,7 +718,15 @@ impl Session {
             .get_mut(&window_id)
             .ok_or_else(|| anyhow!("unknown window"))?;
         let target_pane = target_pane.unwrap_or(window.layout.active);
-        let pane_id = window.allocate_pane_id();
+        if !window.panes.contains_key(&target_pane) || !window.layout.panes().contains(&target_pane)
+        {
+            return Err(anyhow!("unknown pane"));
+        }
+        let pane_id = PaneId(window.next_pane_id);
+        let next_pane_id = window
+            .next_pane_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("pane id space exhausted"))?;
         let process = PaneProcess::spawn(
             &default_command,
             cwd.as_deref(),
@@ -578,11 +743,33 @@ impl Session {
             command: default_command.clone(),
             process,
         };
+        window.next_pane_id = next_pane_id;
         window.panes.insert(pane_id, pane);
-        if !window.layout.split_pane(target_pane, axis, ratio, pane_id) {
-            return Err(anyhow!("unknown pane"));
+        debug_assert!(window.layout.split_pane(target_pane, axis, ratio, pane_id));
+        if let Err(error) = self.sync_pane_sizes() {
+            let cleanup = self
+                .windows
+                .get(&window_id)
+                .and_then(|window| window.panes.get(&pane_id))
+                .expect("new pane was inserted before resize")
+                .process
+                .kill();
+            return match cleanup {
+                Ok(()) => {
+                    let window = self
+                        .windows
+                        .get_mut(&window_id)
+                        .expect("window was validated before resize");
+                    window.panes.remove(&pane_id);
+                    let _ = window.layout.remove_pane(pane_id);
+                    window.next_pane_id = pane_id.0;
+                    Err(error)
+                }
+                Err(cleanup_error) => Err(error.context(format!(
+                    "failed to roll back new pane {pane_id:?}; it remains in the session: {cleanup_error}"
+                ))),
+            };
         }
-        self.sync_pane_sizes()?;
         Ok(SplitResult { window_id, pane_id })
     }
 
@@ -631,10 +818,31 @@ impl Session {
             restore_seed,
         )?;
         let pane_id = window.layout.active;
+        let previous_active = self.active_window;
+        let previous_last = self.last_window;
         self.windows.insert(window_id, window);
         self.window_order.push(window_id);
         self.remember_window_switch(window_id);
-        self.sync_pane_sizes()?;
+        if let Err(error) = self.sync_pane_sizes() {
+            let cleanup = self
+                .windows
+                .get(&window_id)
+                .expect("new window was inserted before resize")
+                .kill();
+            return match cleanup {
+                Ok(()) => {
+                    self.windows.remove(&window_id);
+                    self.window_order.retain(|id| *id != window_id);
+                    self.active_window = previous_active;
+                    self.last_window = previous_last;
+                    Err(error)
+                }
+                Err(cleanup_error) => Err(error.context(format!(
+                    "failed to roll back new window {}; it remains in the session: {cleanup_error}",
+                    window_id.0
+                ))),
+            };
+        }
         Ok(WindowCreation { window_id, pane_id })
     }
 
@@ -656,24 +864,46 @@ impl Session {
     }
 
     pub fn select_pane(&mut self, window_id: Option<WindowId>, pane_id: PaneId) -> Result<()> {
-        let window = self
-            .window_mut(window_id)
-            .ok_or_else(|| anyhow!("unknown window"))?;
-        if window.panes.contains_key(&pane_id) {
-            window.layout.active = pane_id;
-            Ok(())
-        } else {
-            Err(anyhow!("unknown pane"))
+        let window_id = window_id.unwrap_or(self.active_window);
+        let previous_pane = {
+            let window = self
+                .windows
+                .get(&window_id)
+                .ok_or_else(|| anyhow!("unknown window"))?;
+            if !window.panes.contains_key(&pane_id) {
+                return Err(anyhow!("unknown pane"));
+            }
+            window.layout.active
+        };
+        let previous_window = self.active_window;
+        let previous_last = self.last_window;
+        self.windows
+            .get_mut(&window_id)
+            .expect("window was checked above")
+            .layout
+            .active = pane_id;
+        self.remember_window_switch(window_id);
+        if let Err(error) = self.sync_pane_sizes() {
+            self.windows
+                .get_mut(&window_id)
+                .expect("window was checked above")
+                .layout
+                .active = previous_pane;
+            self.active_window = previous_window;
+            self.last_window = previous_last;
+            return Err(error);
         }
+        Ok(())
     }
 
     pub fn move_focus(&mut self, direction: NavigationDirection, area: Rect) -> Result<()> {
         let window = self
             .active_window_mut()
             .ok_or_else(|| anyhow!("unknown window"))?;
-        let _ = window
+        window
             .layout
-            .select_direction(convert_direction(direction), area);
+            .select_direction(convert_direction(direction), area)
+            .ok_or_else(|| anyhow!("no pane in that direction"))?;
         Ok(())
     }
 
@@ -684,21 +914,53 @@ impl Session {
         direction: NavigationDirection,
         amount: u16,
     ) -> Result<()> {
+        let window_id = window_id.unwrap_or(self.active_window);
         let window = self
-            .window_mut(window_id)
+            .windows
+            .get_mut(&window_id)
             .ok_or_else(|| anyhow!("unknown window"))?;
+        let previous_layout = window.layout.clone();
         if let Some(pane_id) = pane_id {
+            if !window.panes.contains_key(&pane_id) {
+                return Err(anyhow!("unknown pane"));
+            }
             window.layout.active = pane_id;
-        }
-        let _ = window
+            if !window
+                .layout
+                .resize_active(convert_direction(direction), amount)
+            {
+                window.layout = previous_layout;
+                return Err(anyhow!("no resizable split in that direction"));
+            }
+        } else if !window
             .layout
-            .resize_active(convert_direction(direction), amount);
-        self.sync_pane_sizes()
+            .resize_active(convert_direction(direction), amount)
+        {
+            return Err(anyhow!("no resizable split in that direction"));
+        }
+        if window_id != self.active_window {
+            return Ok(());
+        }
+        if let Err(error) = self.sync_pane_sizes() {
+            self.windows
+                .get_mut(&window_id)
+                .expect("window was validated before resizing")
+                .layout = previous_layout;
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn select_window(&mut self, window_id: WindowId) -> Result<()> {
         if self.windows.contains_key(&window_id) {
+            let previous_active = self.active_window;
+            let previous_last = self.last_window;
             self.remember_window_switch(window_id);
+            if let Err(error) = self.sync_pane_sizes() {
+                self.active_window = previous_active;
+                self.last_window = previous_last;
+                return Err(error);
+            }
             Ok(())
         } else {
             Err(anyhow!("unknown window"))
@@ -717,8 +979,7 @@ impl Session {
         } else {
             (current + len - 1) % len
         };
-        self.remember_window_switch(self.window_order[next_index]);
-        Ok(())
+        self.select_window(self.window_order[next_index])
     }
 
     pub fn kill_pane(
@@ -727,20 +988,27 @@ impl Session {
         pane_id: Option<PaneId>,
     ) -> Result<Option<KillResult>> {
         let window_id = window_id.unwrap_or(self.active_window);
-        let window = match self.windows.get_mut(&window_id) {
+        let window = match self.windows.get(&window_id) {
             Some(window) => window,
             None => return Err(anyhow!("unknown window")),
         };
         let pane_id = pane_id.unwrap_or(window.layout.active);
         let pane = window
             .panes
-            .remove(&pane_id)
+            .get(&pane_id)
             .ok_or_else(|| anyhow!("unknown pane"))?;
         pane.process.kill()?;
+        let window = self
+            .windows
+            .get_mut(&window_id)
+            .expect("window was validated before pane shutdown");
+        window.panes.remove(&pane_id);
         if window.panes.is_empty() {
             self.windows.remove(&window_id);
             self.window_order.retain(|id| *id != window_id);
-            if let Some(next_window) = self.window_order.last().copied() {
+            if self.active_window == window_id
+                && let Some(next_window) = self.window_order.last().copied()
+            {
                 self.remember_window_after_removal(window_id, next_window);
             }
             return Ok(None);
@@ -753,13 +1021,43 @@ impl Session {
     pub fn kill_window(&mut self, window_id: WindowId) -> Result<bool> {
         let window = self
             .windows
-            .remove(&window_id)
+            .get(&window_id)
             .ok_or_else(|| anyhow!("unknown window"))?;
-        for pane in window.panes.into_values() {
-            pane.process.kill()?;
+        let mut stopped = Vec::new();
+        let mut failures = Vec::new();
+        for (pane_id, pane) in &window.panes {
+            match pane.process.kill() {
+                Ok(()) => stopped.push(*pane_id),
+                Err(error) => failures.push(format!("pane {}: {error}", pane_id.0)),
+            }
         }
+
+        if !failures.is_empty() {
+            let window = self
+                .windows
+                .get_mut(&window_id)
+                .expect("window was validated before pane shutdown");
+            for pane_id in stopped {
+                window.panes.remove(&pane_id);
+                if !window.panes.is_empty() {
+                    let _ = window.layout.remove_pane(pane_id);
+                }
+            }
+            if let Err(error) = self.sync_pane_sizes() {
+                failures.push(format!("resize after partial shutdown: {error}"));
+            }
+            return Err(anyhow!(
+                "failed to shut down every pane in window {}: {}",
+                window_id.0,
+                failures.join("; ")
+            ));
+        }
+
+        self.windows.remove(&window_id);
         self.window_order.retain(|id| *id != window_id);
-        if let Some(next_window) = self.window_order.last().copied() {
+        if self.active_window == window_id
+            && let Some(next_window) = self.window_order.last().copied()
+        {
             self.remember_window_after_removal(window_id, next_window);
         }
         if !self.window_order.is_empty() {
@@ -776,11 +1074,17 @@ impl Session {
         Ok(())
     }
 
-    pub fn kill(self) -> Result<()> {
-        for window in self.windows.into_values() {
-            for pane in window.panes.into_values() {
-                pane.process.kill()?;
+    pub fn kill(&self) -> Result<()> {
+        let mut failures = Vec::new();
+        for (window_id, window) in &self.windows {
+            for (pane_id, pane) in &window.panes {
+                if let Err(error) = pane.process.kill() {
+                    failures.push(format!("window {} pane {}: {error}", window_id.0, pane_id.0));
+                }
             }
+        }
+        if !failures.is_empty() {
+            bail!("failed to shut down session panes: {}", failures.join("; "));
         }
         Ok(())
     }
@@ -838,13 +1142,73 @@ impl Session {
     }
 
     fn sync_pane_sizes(&mut self) -> Result<()> {
-        let area = self.pane_area();
-        for window in self.windows.values() {
-            let rects = window.layout.pane_rects(area);
-            for (pane_id, pane) in &window.panes {
-                let rect = rects.get(pane_id).copied().unwrap_or(area);
-                pane.process.resize(rect.height.max(1), rect.width.max(1))?;
+        self.resize_window_panes(self.active_window, self.pane_area())
+    }
+
+    fn window_for_public_id(&self, window_id: Option<u64>) -> Result<&WindowRuntime> {
+        let window_id = match window_id {
+            Some(window_id) => self
+                .numbering
+                .parse_public_window_id(window_id, &self.window_order)?,
+            None => self.active_window,
+        };
+        self.windows
+            .get(&window_id)
+            .ok_or_else(|| anyhow!("unknown window"))
+    }
+
+    fn pane_id_from_public(&self, pane_id: Option<u64>, default: PaneId) -> Result<PaneId> {
+        pane_id
+            .map(|pane_id| self.numbering.parse_public_pane_number(pane_id))
+            .transpose()
+            .map(|pane_id| pane_id.unwrap_or(default))
+    }
+
+    fn resize_window_panes(&self, window_id: WindowId, area: Rect) -> Result<()> {
+        let window = self
+            .windows
+            .get(&window_id)
+            .ok_or_else(|| anyhow!("unknown window {}", window_id.0))?;
+        let rects = window.layout.pane_rects(area);
+        let mut resizes = Vec::with_capacity(window.panes.len());
+        for (pane_id, pane) in &window.panes {
+            let rect = rects.get(pane_id).copied().unwrap_or(area);
+            let (rows, cols) = pane
+                .process
+                .screen_size()
+                .with_context(|| format!("failed to inspect pane {} before resize", pane_id.0))?;
+            resizes.push((
+                *pane_id,
+                pane,
+                (rows, cols),
+                (rect.height.max(1), rect.width.max(1)),
+            ));
+        }
+
+        let mut resized: Vec<(PaneId, &PaneRuntime, (u16, u16))> =
+            Vec::with_capacity(resizes.len());
+        for (pane_id, pane, previous, target) in resizes {
+            if let Err(error) = pane.process.resize(target.0, target.1) {
+                let rollback_failures = resized
+                    .into_iter()
+                    .rev()
+                    .filter_map(|(pane_id, pane, previous)| {
+                        pane.process
+                            .resize(previous.0, previous.1)
+                            .err()
+                            .map(|rollback_error| format!("pane {}: {rollback_error}", pane_id.0))
+                    })
+                    .collect::<Vec<_>>();
+                if rollback_failures.is_empty() {
+                    return Err(error.context(format!("failed to resize pane {}", pane_id.0)));
+                }
+                return Err(error.context(format!(
+                    "failed to resize pane {}; additionally failed to restore already resized panes: {}",
+                    pane_id.0,
+                    rollback_failures.join("; ")
+                )));
             }
+            resized.push((pane_id, pane, previous));
         }
         Ok(())
     }
@@ -865,6 +1229,19 @@ impl Session {
 }
 
 impl WindowRuntime {
+    fn kill(&self) -> Result<()> {
+        let mut failures = Vec::new();
+        for (pane_id, pane) in &self.panes {
+            if let Err(error) = pane.process.kill() {
+                failures.push(format!("pane {}: {error}", pane_id.0));
+            }
+        }
+        if !failures.is_empty() {
+            bail!("failed to shut down window panes: {}", failures.join("; "));
+        }
+        Ok(())
+    }
+
     fn new(
         id: WindowId,
         name: String,
@@ -907,16 +1284,6 @@ impl WindowRuntime {
         })
     }
 
-    fn allocate_pane_id(&mut self) -> PaneId {
-        let pane_id = PaneId(self.next_pane_id);
-        self.next_pane_id += 1;
-        pane_id
-    }
-
-    fn active_pane(&self) -> Option<&PaneRuntime> {
-        self.panes.get(&self.layout.active)
-    }
-
     fn prune_dead(&mut self) {
         let dead: Vec<_> = self
             .panes
@@ -924,6 +1291,15 @@ impl WindowRuntime {
             .filter_map(|(pane_id, pane)| (!pane.process.is_alive()).then_some(*pane_id))
             .collect();
         for pane_id in dead {
+            let Some(pane) = self.panes.get(&pane_id) else {
+                continue;
+            };
+            // A dead child does not make its helper exit on its own. Do not
+            // discard the only control handle until helper shutdown succeeds:
+            // transport failures are retried on a later prune pass.
+            if pane.process.kill().is_err() {
+                continue;
+            }
             self.panes.remove(&pane_id);
             if !self.panes.is_empty() {
                 let _ = self.layout.remove_pane(pane_id);
@@ -971,11 +1347,17 @@ fn clamp_cursor(content: Rect, row: u16, col: u16) -> Option<PaneCursor> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
+    use crate::numbering::Numbering;
+    use std::{fs, thread, time::Duration};
+    use tempfile::{TempDir, tempdir as make_tempdir};
+
+    fn tempdir() -> TempDir {
+        make_tempdir().expect("tempdir")
+    }
 
     #[test]
     fn new_window_uses_full_viewport_width_for_pty() {
-        let helper_dir = tempdir().expect("tempdir");
+        let helper_dir = tempdir();
         let mut session = Session::new(
             "work".into(),
             None,
@@ -984,6 +1366,10 @@ mod tests {
             WindowId(1),
             None,
             10_000,
+            Numbering {
+                window_base: 0,
+                pane_base: 0,
+            },
             WindowDefaults::default(),
             helper_dir.path().to_path_buf(),
         )
@@ -996,10 +1382,439 @@ mod tests {
 
         let window = session.windows.get(&created.window_id).expect("window");
         let pane = window.panes.get(&created.pane_id).expect("pane");
-        let (rows, cols) = pane.process.screen_size();
+        let (rows, cols) = pane.process.screen_size().expect("query pane size");
 
         assert_eq!(rows, 29);
         assert_eq!(cols, 120);
+    }
+
+    #[test]
+    fn resizing_the_active_window_does_not_contact_hidden_windows() {
+        let helper_dir = tempdir();
+        let mut session = Session::new(
+            "work".into(),
+            None,
+            None,
+            vec!["sh".into()],
+            WindowId(1),
+            None,
+            10_000,
+            Numbering {
+                window_base: 0,
+                pane_base: 0,
+            },
+            WindowDefaults::default(),
+            helper_dir.path().to_path_buf(),
+        )
+        .expect("create session");
+        session
+            .new_window(WindowId(2), Some("hidden".into()), &["sh".into()])
+            .expect("create hidden window");
+        session.select_window(WindowId(1)).expect("select visible window");
+        let hidden_socket = session
+            .windows
+            .get(&WindowId(2))
+            .expect("hidden window")
+            .panes
+            .get(&PaneId(0))
+            .expect("hidden pane")
+            .process
+            .socket_path()
+            .to_path_buf();
+        let hidden_path = hidden_socket.with_extension("hidden");
+        fs::rename(&hidden_socket, &hidden_path).expect("hide helper socket");
+
+        session.set_viewport(40, 120).expect("resize active window");
+        let visible = session
+            .windows
+            .get(&WindowId(1))
+            .expect("visible window")
+            .panes
+            .get(&PaneId(0))
+            .expect("visible pane");
+        assert_eq!(
+            visible.process.screen_size().expect("query visible pane size"),
+            (39, 120)
+        );
+
+        fs::rename(&hidden_path, &hidden_socket).expect("restore helper socket");
+        session.kill().expect("clean up session");
+    }
+
+    #[test]
+    fn resizing_an_inactive_window_does_not_contact_its_hidden_helpers() {
+        let helper_dir = tempdir();
+        let mut session = Session::new(
+            "work".into(),
+            None,
+            None,
+            vec!["sh".into()],
+            WindowId(1),
+            None,
+            10_000,
+            Numbering {
+                window_base: 0,
+                pane_base: 0,
+            },
+            WindowDefaults::default(),
+            helper_dir.path().to_path_buf(),
+        )
+        .expect("create session");
+        session
+            .new_window(WindowId(2), Some("hidden".into()), &["sh".into()])
+            .expect("create hidden window");
+        session
+            .split_active_pane(SplitAxis::Horizontal, &["sh".into()])
+            .expect("split hidden window");
+        session.select_window(WindowId(1)).expect("select visible window");
+        let original_layout = session
+            .windows
+            .get(&WindowId(2))
+            .expect("hidden window")
+            .layout
+            .clone();
+        let hidden_socket = session
+            .windows
+            .get(&WindowId(2))
+            .expect("hidden window")
+            .panes
+            .get(&PaneId(1))
+            .expect("hidden pane")
+            .process
+            .socket_path()
+            .to_path_buf();
+        let moved_socket = hidden_socket.with_extension("hidden");
+        fs::rename(&hidden_socket, &moved_socket).expect("hide helper socket");
+
+        session
+            .resize_active_pane(
+                Some(WindowId(2)),
+                None,
+                NavigationDirection::Up,
+                50,
+            )
+            .expect("hidden resize updates layout without contacting the helper");
+        assert_ne!(
+            session
+                .windows
+                .get(&WindowId(2))
+                .expect("hidden window")
+                .layout,
+            original_layout
+        );
+
+        fs::rename(&moved_socket, &hidden_socket).expect("restore helper socket");
+        session.kill().expect("clean up session");
+    }
+
+    #[test]
+    fn pane_requests_resolve_public_window_and_pane_ids_without_using_active_window() {
+        let helper_dir = tempdir();
+        let mut session = Session::new(
+            "work".into(),
+            None,
+            None,
+            vec!["sh".into()],
+            WindowId(1),
+            None,
+            10_000,
+            Numbering {
+                window_base: 1,
+                pane_base: 10,
+            },
+            WindowDefaults::default(),
+            helper_dir.path().to_path_buf(),
+        )
+        .expect("create session");
+        session
+            .new_window(WindowId(2), Some("target".into()), &["sh".into()])
+            .expect("create target window");
+        session.select_window(WindowId(1)).expect("select source window");
+        let target_socket = session
+            .windows
+            .get(&WindowId(2))
+            .expect("target window")
+            .panes
+            .get(&PaneId(0))
+            .expect("target pane")
+            .process
+            .socket_path()
+            .to_path_buf();
+        let hidden_socket = target_socket.with_extension("hidden");
+        fs::rename(&target_socket, &hidden_socket).expect("hide target helper socket");
+
+        let error = session
+            .scroll_pane(Some(2), Some(10), 1)
+            .expect_err("request must target the hidden second window, not the active first window");
+        assert!(error.to_string().contains("failed to connect pane helper"));
+
+        fs::rename(&hidden_socket, &target_socket).expect("restore target helper socket");
+        session.kill().expect("clean up session");
+    }
+
+    #[test]
+    fn mouse_scroll_resolves_public_window_and_pane_ids() {
+        let helper_dir = tempdir();
+        let session = Session::new(
+            "work".into(),
+            None,
+            None,
+            vec!["sh".into()],
+            WindowId(1),
+            None,
+            10_000,
+            Numbering {
+                window_base: 1,
+                pane_base: 10,
+            },
+            WindowDefaults::default(),
+            helper_dir.path().to_path_buf(),
+        )
+        .expect("create session");
+        let socket = session
+            .active_window()
+            .expect("active window")
+            .panes
+            .get(&PaneId(0))
+            .expect("root pane")
+            .process
+            .socket_path()
+            .to_path_buf();
+        let hidden_socket = socket.with_extension("hidden");
+        fs::rename(&socket, &hidden_socket).expect("hide root helper socket");
+
+        let error = session
+            .handle_mouse_scroll(Some(1), Some(10), ScrollDirection::Up, 3, 5)
+            .expect_err("public pane number must resolve to the root helper");
+        assert!(error.to_string().contains("failed to connect pane helper"));
+
+        fs::rename(&hidden_socket, &socket).expect("restore root helper socket");
+        session.kill().expect("clean up session");
+    }
+
+    #[test]
+    fn failed_split_resize_rolls_back_the_new_helper_and_model_entry() {
+        let helper_dir = tempdir();
+        let mut session = Session::new(
+            "work".into(),
+            None,
+            None,
+            vec!["sh".into()],
+            WindowId(1),
+            None,
+            10_000,
+            Numbering {
+                window_base: 0,
+                pane_base: 0,
+            },
+            WindowDefaults::default(),
+            helper_dir.path().to_path_buf(),
+        )
+        .expect("create session");
+        let socket = session
+            .active_window()
+            .expect("active window")
+            .panes
+            .get(&PaneId(0))
+            .expect("root pane")
+            .process
+            .socket_path()
+            .to_path_buf();
+        let hidden_socket = socket.with_extension("hidden");
+        fs::rename(&socket, &hidden_socket).expect("hide root helper socket");
+
+        let error = match session.split_active_pane(SplitAxis::Horizontal, &["sh".into()]) {
+            Ok(_) => panic!("resize must fail through the hidden root helper"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("failed to connect pane helper"));
+        let window = session.active_window().expect("active window");
+        assert_eq!(window.panes.len(), 1);
+        assert_eq!(window.layout.panes(), vec![PaneId(0)]);
+        assert_eq!(window.next_pane_id, 1);
+        assert!(
+            fs::read_dir(helper_dir.path())
+                .expect("read helper directory")
+                .all(|entry| entry.expect("helper directory entry").path().extension() != Some("sock".as_ref())),
+            "the rolled-back helper socket must not remain"
+        );
+
+        fs::rename(&hidden_socket, &socket).expect("restore root helper socket");
+        session.kill().expect("clean up session");
+    }
+
+    #[test]
+    fn failed_pane_resize_preserves_layout_and_existing_pane_sizes() {
+        let helper_dir = tempdir();
+        let mut session = Session::new(
+            "work".into(),
+            None,
+            None,
+            vec!["sh".into()],
+            WindowId(1),
+            None,
+            10_000,
+            Numbering {
+                window_base: 0,
+                pane_base: 0,
+            },
+            WindowDefaults::default(),
+            helper_dir.path().to_path_buf(),
+        )
+        .expect("create session");
+        session
+            .split_active_pane(SplitAxis::Horizontal, &["sh".into()])
+            .expect("split pane");
+        let original_layout = session
+            .active_window()
+            .expect("active window")
+            .layout
+            .clone();
+        let first_size = session
+            .active_window()
+            .expect("active window")
+            .panes
+            .get(&PaneId(0))
+            .expect("first pane")
+            .process
+            .screen_size()
+            .expect("query first pane size");
+        let second_socket = session
+            .active_window()
+            .expect("active window")
+            .panes
+            .get(&PaneId(1))
+            .expect("second pane")
+            .process
+            .socket_path()
+            .to_path_buf();
+        let hidden_socket = second_socket.with_extension("hidden");
+        fs::rename(&second_socket, &hidden_socket).expect("hide second helper socket");
+
+        let error = session
+            .resize_active_pane(None, None, NavigationDirection::Up, 50)
+            .expect_err("resize must fail through the hidden second helper");
+        assert!(
+            format!("{error:#}").contains("failed to inspect pane 1 before resize"),
+            "unexpected resize error: {error:#}"
+        );
+        let window = session.active_window().expect("active window");
+        assert_eq!(window.layout, original_layout, "layout must be restored");
+        assert_eq!(
+            window
+                .panes
+                .get(&PaneId(0))
+                .expect("first pane")
+                .process
+                .screen_size()
+                .expect("query first pane size"),
+            first_size,
+            "a failed peer probe must leave earlier panes untouched"
+        );
+
+        fs::rename(&hidden_socket, &second_socket).expect("restore second helper socket");
+        session.kill().expect("clean up session");
+    }
+
+    #[test]
+    fn selected_window_preview_does_not_mutate_the_live_selection() {
+        let helper_dir = tempdir();
+        let mut session = Session::new(
+            "work".into(),
+            None,
+            None,
+            vec!["sh".into()],
+            WindowId(1),
+            None,
+            10_000,
+            Numbering {
+                window_base: 0,
+                pane_base: 0,
+            },
+            WindowDefaults::default(),
+            helper_dir.path().to_path_buf(),
+        )
+        .expect("create session");
+        let created = session
+            .new_window(WindowId(2), Some("logs".into()), &["sh".into()])
+            .expect("create window");
+        session.select_window(WindowId(1)).expect("select original window");
+        let original_window = session.active_window;
+
+        let preview = session
+            .render_window_preview(
+                created.window_id,
+                Some(created.pane_id),
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 80,
+                    height: 24,
+                },
+            )
+            .expect("render selected window preview");
+
+        assert_eq!(preview.active_window_id, 1);
+        assert_eq!(preview.active_pane_id, 0);
+        assert_eq!(session.active_window, original_window);
+        assert!(preview.panes.iter().all(|pane| pane.focused));
+        session.kill().expect("clean up session");
+    }
+
+    #[test]
+    fn recovery_salvages_live_panes_when_a_sibling_helper_is_missing() {
+        let helper_dir = tempdir();
+        let original = Session::new(
+            "work".into(),
+            None,
+            None,
+            vec!["sh".into()],
+            WindowId(1),
+            None,
+            10_000,
+            Numbering {
+                window_base: 0,
+                pane_base: 0,
+            },
+            WindowDefaults::default(),
+            helper_dir.path().to_path_buf(),
+        )
+        .expect("create session");
+        let mut persisted = PersistedSession::from_live(&original);
+        let window = persisted
+            .windows
+            .get_mut(&WindowId(1))
+            .expect("persisted window");
+        window.layout.split_active(SplitAxis::Vertical, PaneId(1));
+        window.next_pane_id = 2;
+        window.panes.insert(
+            PaneId(1),
+            crate::persistence::PersistedPane {
+                id: PaneId(1),
+                title: "missing".into(),
+                cwd: None,
+                command: vec!["sh".into()],
+                socket_path: Some(helper_dir.path().join("missing-helper.sock")),
+            },
+        );
+
+        let recovered = Session::from_persisted(
+            &persisted,
+            None,
+            10_000,
+            Numbering {
+                window_base: 0,
+                pane_base: 0,
+            },
+            WindowDefaults::default(),
+            helper_dir.path().to_path_buf(),
+        )
+        .expect("recover live sibling");
+
+        let window = recovered.windows.get(&WindowId(1)).expect("recovered window");
+        assert_eq!(window.panes.len(), 1);
+        assert_eq!(window.layout.panes(), vec![PaneId(0)]);
+        recovered.kill().expect("clean up helper");
     }
 
     #[test]
@@ -1021,8 +1836,58 @@ mod tests {
     }
 
     #[test]
+    fn render_snapshot_keeps_a_placeholder_for_an_unreachable_helper() {
+        let helper_dir = tempdir();
+        let session = Session::new(
+            "work".into(),
+            None,
+            None,
+            vec!["sh".into()],
+            WindowId(1),
+            None,
+            10_000,
+            Numbering {
+                window_base: 0,
+                pane_base: 0,
+            },
+            WindowDefaults::default(),
+            helper_dir.path().to_path_buf(),
+        )
+        .expect("create session");
+        let pane = session
+            .windows
+            .get(&WindowId(1))
+            .expect("window")
+            .panes
+            .get(&PaneId(0))
+            .expect("pane");
+        let socket = pane.process.socket_path().to_path_buf();
+        let hidden = socket.with_extension("hidden");
+        fs::rename(&socket, &hidden).expect("hide helper socket");
+
+        let snapshot = session
+            .render_snapshot(Rect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 23,
+            })
+            .expect("render snapshot");
+        assert_eq!(snapshot.panes.len(), 1);
+        assert!(snapshot.panes[0].focused);
+        assert!(snapshot.panes[0].title.ends_with("(unavailable)"));
+        assert_eq!(
+            snapshot.panes[0].rows_plain,
+            vec!["[admux: pane helper unavailable]"]
+        );
+
+        fs::rename(&hidden, &socket).expect("restore helper socket");
+        session.kill().expect("clean up pane");
+    }
+
+    #[test]
     fn selecting_window_tracks_last_window() {
-        let helper_dir = tempdir().expect("tempdir");
+        let helper_dir = tempdir();
         let mut session = Session::new(
             "work".into(),
             None,
@@ -1031,6 +1896,10 @@ mod tests {
             WindowId(1),
             None,
             10_000,
+            Numbering {
+                window_base: 0,
+                pane_base: 0,
+            },
             WindowDefaults::default(),
             helper_dir.path().to_path_buf(),
         )
@@ -1055,7 +1924,7 @@ mod tests {
 
     #[test]
     fn pane_ids_are_window_local_and_stable() {
-        let helper_dir = tempdir().expect("tempdir");
+        let helper_dir = tempdir();
         let mut session = Session::new(
             "work".into(),
             None,
@@ -1064,6 +1933,10 @@ mod tests {
             WindowId(1),
             None,
             10_000,
+            Numbering {
+                window_base: 0,
+                pane_base: 0,
+            },
             WindowDefaults::default(),
             helper_dir.path().to_path_buf(),
         )
@@ -1089,5 +1962,230 @@ mod tests {
         let remaining = session.list_panes(Some(WindowId(1)));
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].id, 1);
+    }
+
+    #[test]
+    fn splitting_inherits_the_active_pane_cwd() {
+        let helper_dir = tempdir();
+        let session_cwd = helper_dir.path().join("session");
+        let pane_cwd = helper_dir.path().join("pane");
+        std::fs::create_dir_all(&session_cwd).expect("create session cwd");
+        std::fs::create_dir_all(&pane_cwd).expect("create pane cwd");
+        let mut session = Session::new(
+            "work".into(),
+            None,
+            Some(session_cwd),
+            vec!["sh".into()],
+            WindowId(1),
+            None,
+            10_000,
+            Numbering {
+                window_base: 0,
+                pane_base: 0,
+            },
+            WindowDefaults::default(),
+            helper_dir.path().to_path_buf(),
+        )
+        .expect("create session");
+        session
+            .windows
+            .get_mut(&WindowId(1))
+            .expect("root window")
+            .panes
+            .get_mut(&PaneId(0))
+            .expect("root pane")
+            .cwd = Some(pane_cwd.clone());
+
+        let split = session
+            .split_active_pane(SplitAxis::Vertical, &["sh".into()])
+            .expect("split pane");
+        let created = session
+            .windows
+            .get(&split.window_id)
+            .expect("window")
+            .panes
+            .get(&split.pane_id)
+            .expect("created pane");
+        assert_eq!(created.cwd.as_deref(), Some(pane_cwd.as_path()));
+        session.kill().expect("clean up session");
+    }
+
+    #[test]
+    fn selecting_a_pane_in_another_window_activates_that_window() {
+        let helper_dir = tempdir();
+        let mut session = Session::new(
+            "work".into(),
+            None,
+            None,
+            vec!["sh".into()],
+            WindowId(1),
+            None,
+            10_000,
+            Numbering {
+                window_base: 0,
+                pane_base: 0,
+            },
+            WindowDefaults::default(),
+            helper_dir.path().to_path_buf(),
+        )
+        .expect("create session");
+        session
+            .new_window(WindowId(2), Some("logs".into()), &["sh".into()])
+            .expect("create second window");
+        session.select_window(WindowId(1)).expect("select first window");
+
+        session
+            .select_pane(Some(WindowId(2)), PaneId(0))
+            .expect("select pane in second window");
+
+        assert_eq!(session.active_window, WindowId(2));
+    }
+
+    #[test]
+    fn focus_and_resize_reject_noop_or_invalid_targets() {
+        let helper_dir = tempdir();
+        let mut session = Session::new(
+            "work".into(),
+            None,
+            None,
+            vec!["sh".into()],
+            WindowId(1),
+            None,
+            10_000,
+            Numbering {
+                window_base: 0,
+                pane_base: 0,
+            },
+            WindowDefaults::default(),
+            helper_dir.path().to_path_buf(),
+        )
+        .expect("create session");
+
+        assert!(session
+            .move_focus(NavigationDirection::Left, session.pane_area())
+            .is_err());
+        assert!(session
+            .resize_active_pane(
+                None,
+                Some(PaneId(99)),
+                NavigationDirection::Left,
+                10,
+            )
+            .is_err());
+        assert_eq!(
+            session
+                .windows
+                .get(&WindowId(1))
+                .expect("window")
+                .layout
+                .active,
+            PaneId(0)
+        );
+    }
+
+    #[test]
+    fn pruning_an_exited_pane_shuts_down_its_helper() {
+        let helper_dir = tempdir();
+        let mut session = Session::new(
+            "work".into(),
+            None,
+            None,
+            vec!["sh".into(), "-lc".into(), "exit 0".into()],
+            WindowId(1),
+            None,
+            10_000,
+            Numbering {
+                window_base: 0,
+                pane_base: 0,
+            },
+            WindowDefaults::default(),
+            helper_dir.path().to_path_buf(),
+        )
+        .expect("create session");
+        let socket = session
+            .windows
+            .get(&WindowId(1))
+            .expect("window")
+            .panes
+            .get(&PaneId(0))
+            .expect("pane")
+            .process
+            .socket_path()
+            .to_path_buf();
+
+        for _ in 0..50 {
+            if !session.is_alive() {
+                session.prune_dead();
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(!session.is_alive());
+        for _ in 0..20 {
+            if !socket.exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !socket.exists(),
+            "helper socket should be removed after pruning"
+        );
+    }
+
+    #[test]
+    fn pruning_keeps_a_dead_pane_when_helper_shutdown_fails() {
+        let helper_dir = tempdir();
+        let mut session = Session::new(
+            "work".into(),
+            None,
+            None,
+            vec!["sh".into(), "-lc".into(), "exit 0".into()],
+            WindowId(1),
+            None,
+            10_000,
+            Numbering {
+                window_base: 0,
+                pane_base: 0,
+            },
+            WindowDefaults::default(),
+            helper_dir.path().to_path_buf(),
+        )
+        .expect("create session");
+        let socket = session
+            .windows
+            .get(&WindowId(1))
+            .expect("window")
+            .panes
+            .get(&PaneId(0))
+            .expect("pane")
+            .process
+            .socket_path()
+            .to_path_buf();
+
+        for _ in 0..50 {
+            if !session.is_alive() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let hidden_socket = socket.with_extension("hidden");
+        std::fs::rename(&socket, &hidden_socket)
+            .expect("hide helper socket to force cleanup failure");
+
+        assert!(session.prune_dead());
+        assert_eq!(
+            session
+                .windows
+                .get(&WindowId(1))
+                .expect("window remains")
+                .panes
+                .len(),
+            1
+        );
+        std::fs::rename(&hidden_socket, &socket).expect("restore helper socket");
+        assert!(!session.prune_dead());
+        assert!(!socket.exists(), "helper should be cleaned up after retry");
     }
 }

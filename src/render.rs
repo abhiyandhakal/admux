@@ -1,14 +1,16 @@
 use std::io::Write;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crossterm::{
-    cursor::{MoveTo, Show},
+    cursor::{Hide, MoveTo, Show},
     queue,
     style::{Attribute, Color, Print, SetAttribute, SetBackgroundColor, SetForegroundColor},
     terminal::{BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate},
 };
 
 use crate::{
-    config::{DividerCharset, ResolvedUiConfig, StatusPosition, StyleConfig},
+    config::{DividerCharset, OverlayConfig, ResolvedUiConfig, StatusPosition, StatusStyle, StyleConfig},
     copy_mode::Selection,
     ipc::{BufferSummary, PaneRender, RenderSnapshot},
     pane::Rect,
@@ -103,6 +105,7 @@ pub fn render_session<W: Write>(
     queue!(
         out,
         BeginSynchronizedUpdate,
+        Hide,
         Clear(ClearType::All),
         MoveTo(0, 0)
     )?;
@@ -110,6 +113,7 @@ pub fn render_session<W: Write>(
     for pane in &snapshot.panes {
         render_pane(out, pane, ui)?;
     }
+    render_pane_labels(out, snapshot, ui)?;
     render_split_separators(out, snapshot, ui)?;
     if let Some(selection) = selection {
         render_selection_overlay(out, snapshot, selection, ui)?;
@@ -144,13 +148,21 @@ pub fn render_choose_tree<W: Write>(
 
     let body_height = size.height.saturating_sub(1);
     let body_start = body_start_row(ui);
-    let list_height = body_height.min((lines.len() as u16).saturating_add(1).min(8));
+    let list_height = body_height.min(
+        u16::try_from(lines.len())
+            .unwrap_or(u16::MAX)
+            .min(8),
+    );
+    let selected = lines.iter().position(|line| line.selected).unwrap_or(0);
+    let viewport_start = chooser_viewport_start(selected, lines.len(), usize::from(list_height));
 
-    for (index, line) in lines.iter().enumerate() {
-        if index as u16 >= list_height {
-            break;
-        }
-        let row = body_start + index as u16;
+    for (index, line) in lines
+        .iter()
+        .skip(viewport_start)
+        .take(usize::from(list_height))
+        .enumerate()
+    {
+        let row = body_start + u16::try_from(index).expect("list height bounds index");
         let prefix = if line.has_children {
             if line.expanded { "-" } else { "+" }
         } else {
@@ -169,24 +181,17 @@ pub fn render_choose_tree<W: Write>(
         }
     }
 
-    queue_style(out, &ui.theme.chooser_border)?;
-    queue!(
-        out,
-        MoveTo(0, body_start + list_height),
-        Print(fit_width(
-            &format!(
-                " {preview_title} {}",
-                "-".repeat(size.width.saturating_sub(preview_title.len() as u16 + 2) as usize)
-            ),
-            size.width,
-        ))
-    )?;
-    reset_style(out)?;
+    let separator = overlay_heading(preview_title, &ui.chooser, size.width);
+    if let Some(separator) = &separator {
+        queue_style(out, &ui.theme.chooser_border)?;
+        queue!(out, MoveTo(0, body_start + list_height), Print(separator))?;
+        reset_style(out)?;
+    }
     let preview_area = Rect {
         x: 0,
-        y: body_start + list_height.saturating_add(1),
+        y: body_start + list_height + u16::from(separator.is_some()),
         width: size.width,
-        height: body_height.saturating_sub(list_height.saturating_add(1)),
+        height: body_height.saturating_sub(list_height + u16::from(separator.is_some())),
     };
     if preview_area.height > 0 {
         render_preview_snapshot(out, preview_snapshot, preview_area, ui)?;
@@ -223,14 +228,22 @@ pub fn render_help_overlay<W: Write>(
     let body_height = size.height.saturating_sub(1);
     let body_start = body_start_row(ui);
 
-    for (index, line) in lines.iter().enumerate() {
-        if index as u16 >= body_height {
-            break;
-        }
+    let heading = overlay_heading("help", &ui.help, size.width);
+    if let Some(heading) = &heading {
+        queue_style(out, &ui.theme.chooser_border)?;
+        queue!(out, MoveTo(0, body_start), Print(heading))?;
+        reset_style(out)?;
+    }
+    let line_start = body_start + u16::from(heading.is_some());
+    let line_height = body_height.saturating_sub(u16::from(heading.is_some()));
+    for (index, line) in lines.iter().take(usize::from(line_height)).enumerate() {
         queue_style(out, &ui.theme.help)?;
         queue!(
             out,
-            MoveTo(0, body_start + index as u16),
+            MoveTo(
+                0,
+                line_start + u16::try_from(index).expect("body height bounds index"),
+            ),
             Print(fit_width(line, size.width))
         )?;
         reset_style(out)?;
@@ -268,13 +281,20 @@ pub fn render_buffer_chooser<W: Write>(
     )?;
     let body_height = size.height.saturating_sub(1);
     let body_start = body_start_row(ui);
-    let list_height = body_height.min((buffers.len() as u16).saturating_add(1).min(8));
+    let list_height = body_height.min(
+        u16::try_from(buffers.len())
+            .unwrap_or(u16::MAX)
+            .min(8),
+    );
+    let viewport_start = chooser_viewport_start(selected, buffers.len(), usize::from(list_height));
 
-    for (index, buffer) in buffers.iter().enumerate() {
-        if index as u16 >= list_height {
-            break;
-        }
-        let row = body_start + index as u16;
+    for (index, buffer) in buffers
+        .iter()
+        .skip(viewport_start)
+        .take(usize::from(list_height))
+        .enumerate()
+    {
+        let row = body_start + u16::try_from(index).expect("list height bounds index");
         let content = format!("{} ({}) {}", buffer.name, buffer.bytes, buffer.preview);
         queue!(out, MoveTo(0, row))?;
         if index == selected {
@@ -288,24 +308,23 @@ pub fn render_buffer_chooser<W: Write>(
         }
     }
 
-    queue_style(out, &ui.theme.chooser_border)?;
-    queue!(
-        out,
-        MoveTo(0, body_start + list_height),
-        Print(fit_width(
-            &format!(
-                " buffers {}",
-                "-".repeat(size.width.saturating_sub(9) as usize)
-            ),
-            size.width,
-        ))
-    )?;
-    reset_style(out)?;
-    for (offset, line) in preview.lines().enumerate() {
-        let row = body_start + list_height.saturating_add(1) + offset as u16;
-        if row >= body_start + body_height {
-            break;
-        }
+    let separator = overlay_heading("buffers", &ui.chooser, size.width);
+    if let Some(separator) = &separator {
+        queue_style(out, &ui.theme.chooser_border)?;
+        queue!(out, MoveTo(0, body_start + list_height), Print(separator))?;
+        reset_style(out)?;
+    }
+    let separator_height = u16::from(separator.is_some());
+    let preview_height = body_height.saturating_sub(list_height + separator_height);
+    for (offset, line) in preview
+        .lines()
+        .take(usize::from(preview_height))
+        .enumerate()
+    {
+        let row = body_start
+            + list_height
+            + separator_height
+            + u16::try_from(offset).expect("preview height bounds offset");
         queue_style(out, &ui.theme.help)?;
         queue!(out, MoveTo(0, row), Print(fit_width(line, size.width)))?;
         reset_style(out)?;
@@ -330,16 +349,56 @@ fn render_pane<W: Write>(
     pane: &PaneRender,
     ui: &ResolvedUiConfig,
 ) -> std::io::Result<()> {
-    for (offset, row) in pane.rows_formatted.iter().enumerate() {
-        if offset as u16 >= pane.rect.height {
-            break;
-        }
+    for (offset, row) in pane
+        .rows_formatted
+        .iter()
+        .take(usize::from(pane.rect.height))
+        .enumerate()
+    {
         queue!(
             out,
-            MoveTo(pane.rect.x, offset_row(pane.rect.y + offset as u16, ui))
+            MoveTo(
+                pane.rect.x,
+                offset_row(
+                    pane.rect.y + u16::try_from(offset).expect("pane height bounds offset"),
+                    ui,
+                )
+            )
         )?;
         out.write_all(row.as_bytes())?;
         out.write_all(b"\x1b[0m")?;
+    }
+    Ok(())
+}
+
+fn render_pane_labels<W: Write>(
+    out: &mut W,
+    snapshot: &RenderSnapshot,
+    ui: &ResolvedUiConfig,
+) -> std::io::Result<()> {
+    if !ui.show_pane_labels {
+        return Ok(());
+    }
+    for pane in &snapshot.panes {
+        if pane.rect.width == 0 || pane.rect.height == 0 {
+            continue;
+        }
+        let style = if pane.focused {
+            &ui.theme.active_window
+        } else {
+            &ui.theme.inactive_window
+        };
+        let label = fit_width(
+            &format!(" {}:{} ", pane.pane_id, pane.title),
+            pane.rect.width,
+        );
+        queue_style(out, style)?;
+        queue!(
+            out,
+            MoveTo(pane.rect.x, offset_row(pane.rect.y, ui)),
+            Print(label)
+        )?;
+        reset_style(out)?;
     }
     Ok(())
 }
@@ -433,13 +492,17 @@ fn render_preview_snapshot<W: Write>(
             .rows_plain
             .iter()
             .zip(pane.rows_formatted.iter())
+            .take(usize::from(content.height))
             .enumerate()
         {
-            if offset as u16 >= content.height {
-                break;
-            }
-            queue!(out, MoveTo(content.x, content.y + offset as u16))?;
-            if plain_row.chars().count() <= content.width as usize {
+            queue!(
+                out,
+                MoveTo(
+                    content.x,
+                    content.y + u16::try_from(offset).expect("content height bounds offset"),
+                )
+            )?;
+            if display_width(plain_row) <= content.width as usize {
                 out.write_all(formatted_row.as_bytes())?;
             } else {
                 queue_style(out, &ui.theme.help)?;
@@ -457,6 +520,22 @@ fn render_preview_snapshot<W: Write>(
     }
 
     Ok(())
+}
+
+fn overlay_heading(title: &str, overlay: &OverlayConfig, width: u16) -> Option<String> {
+    if !overlay.border && !overlay.title {
+        return None;
+    }
+    let mut heading = if overlay.title {
+        format!(" {} ", terminal_safe(title))
+    } else {
+        String::new()
+    };
+    if overlay.border {
+        let heading_width = u16::try_from(display_width(&heading)).unwrap_or(u16::MAX);
+        heading.push_str(&"─".repeat(width.saturating_sub(heading_width) as usize));
+    }
+    Some(fit_width(&heading, width))
 }
 
 fn scale_rect(source: Rect, area: Rect, source_width: u16, source_height: u16) -> Rect {
@@ -550,17 +629,21 @@ fn render_bottom_bar<W: Write>(
     let row = status_row(ui, size);
     let content = match bottom_bar {
         BottomBar::Status { message } => {
-            if message.is_none()
+            if matches!(ui.status_style, StatusStyle::TmuxPlus)
+                && message.is_none()
                 && let Some(zones) = build_tmux_status_zones(session, snapshot, ui, size.width)
             {
-                render_status_zones(out, row, &zones, size.width)?;
+                render_status_zones(out, row, &zones, ui, size.width)?;
                 return Ok(None);
             }
             render_status_line(session, snapshot, message, ui, size.width)
         }
-        BottomBar::CopyMode => vec![StatusSegment::message(
-            "[copy-mode] h/j/k/l move  0/$ line  g/G top/bottom  PgUp/PgDn scroll  Space select  y copy  q quit",
-        )],
+        BottomBar::CopyMode => vec![StatusSegment::message(if ui.copy_mode.show_hints {
+            "[copy-mode] h/j/k/l move  0/$ line  g/G top/bottom  PgUp/PgDn scroll  Space select  y copy  q quit"
+        } else {
+            "[copy-mode]"
+        })
+        .styled(&ui.theme.copy_mode)],
         BottomBar::Prompt {
             buffer,
             completions,
@@ -568,6 +651,7 @@ fn render_bottom_bar<W: Write>(
             cursor,
         } => {
             let line = render_prompt_line(buffer, completions, selected, size.width);
+            queue_style(out, &ui.theme.prompt)?;
             queue!(
                 out,
                 MoveTo(0, row),
@@ -576,12 +660,13 @@ fn render_bottom_bar<W: Write>(
                 SetAttribute(Attribute::Reset)
             )?;
             return Ok(Some(
-                (1 + cursor).min(size.width.saturating_sub(1) as usize) as u16,
+                (1 + display_width(&buffer[..cursor.min(buffer.len())]))
+                    .min(size.width.saturating_sub(1) as usize) as u16,
             ));
         }
     };
 
-    render_status_segments(out, row, &content, size.width)?;
+    render_status_segments(out, row, &content, &ui.theme.status, size.width)?;
     Ok(None)
 }
 
@@ -635,14 +720,15 @@ fn render_selection_overlay<W: Write>(
             pane.rect.width.saturating_sub(1)
         };
         for col in start_col..=end_col.min(pane.rect.width.saturating_sub(1)) {
-            let ch = line
-                .and_then(|line| line.chars().nth(col as usize))
-                .unwrap_or(' ');
+            let cell = line
+                .and_then(|line| terminal_cell_at(line, col as usize))
+                .unwrap_or(" ");
+            queue_style(out, &ui.theme.selection)?;
             queue!(
                 out,
                 MoveTo(pane.rect.x + col, offset_row(pane.rect.y + row, ui)),
                 SetAttribute(Attribute::Reverse),
-                Print(ch)
+                Print(cell)
             )?;
         }
     }
@@ -654,6 +740,7 @@ fn render_selection_overlay<W: Write>(
 struct StatusSegment {
     text: String,
     attrs: Vec<Attribute>,
+    style: StyleConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -670,6 +757,7 @@ impl StatusSegment {
         Self {
             text: text.into(),
             attrs: vec![Attribute::Reverse, Attribute::Bold],
+            style: StyleConfig::default(),
         }
     }
 
@@ -677,6 +765,7 @@ impl StatusSegment {
         Self {
             text: text.into(),
             attrs: vec![Attribute::Reverse],
+            style: StyleConfig::default(),
         }
     }
 
@@ -684,6 +773,7 @@ impl StatusSegment {
         Self {
             text: text.into(),
             attrs: vec![Attribute::Reverse, Attribute::Bold],
+            style: StyleConfig::default(),
         }
     }
 
@@ -691,11 +781,17 @@ impl StatusSegment {
         Self {
             text: text.into(),
             attrs: vec![Attribute::Reverse, Attribute::Bold],
+            style: StyleConfig::default(),
         }
     }
 
+    fn styled(mut self, style: &StyleConfig) -> Self {
+        self.style = style.clone();
+        self
+    }
+
     fn len(&self) -> usize {
-        self.text.chars().count()
+        display_width(&self.text)
     }
 }
 
@@ -707,19 +803,51 @@ fn render_status_line(
     width: u16,
 ) -> Vec<StatusSegment> {
     if let Some(message) = message {
-        return vec![StatusSegment::message(fit_width(message, width))];
+        return vec![StatusSegment::message(fit_width(message, width)).styled(&ui.theme.message)];
     }
 
-    let Some(zones) = build_tmux_status_zones(session, snapshot, ui, width) else {
-        return Vec::new();
-    };
-    let mut result = zones.left;
-    result.extend(zones.center);
-    result.extend(zones.right);
-    result
+    match ui.status_style {
+        StatusStyle::TmuxPlus => {
+            let Some(zones) = build_tmux_status_zones(session, snapshot, ui, width) else {
+                return Vec::new();
+            };
+            let mut result = zones.left;
+            result.extend(zones.center);
+            result.extend(zones.right);
+            result
+        }
+        StatusStyle::Minimal => build_minimal_status(session, snapshot, ui),
+    }
 }
 
-fn render_window_segment(window: &crate::window::WindowSummary) -> StatusSegment {
+fn build_minimal_status(
+    session: &str,
+    snapshot: &RenderSnapshot,
+    ui: &ResolvedUiConfig,
+) -> Vec<StatusSegment> {
+    let mut segments = vec![StatusSegment::session(format!("[{session}] "))
+        .styled(&ui.theme.current_session)];
+    if ui.status_show_pane {
+        if let Some(pane) = snapshot
+            .panes
+            .iter()
+            .find(|pane| pane.pane_id == snapshot.active_pane_id)
+        {
+            segments.push(StatusSegment::plain(format!(
+                " pane:{}:{} ",
+                pane.pane_id,
+                terminal_safe(&pane.title)
+            ))
+            .styled(&ui.theme.active_window));
+        }
+    }
+    segments
+}
+
+fn render_window_segment(
+    window: &crate::window::WindowSummary,
+    ui: &ResolvedUiConfig,
+) -> StatusSegment {
     let marker = if window.active {
         "*"
     } else if window.last_selected {
@@ -729,8 +857,13 @@ fn render_window_segment(window: &crate::window::WindowSummary) -> StatusSegment
     };
     if window.active {
         StatusSegment::active(format!(" {}:{}{} ", window.index, window.name, marker))
+            .styled(&ui.theme.active_window)
+    } else if window.last_selected {
+        StatusSegment::plain(format!(" {}:{}{} ", window.index, window.name, marker))
+            .styled(&ui.theme.last_window)
     } else {
         StatusSegment::plain(format!(" {}:{}{} ", window.index, window.name, marker))
+            .styled(&ui.theme.inactive_window)
     }
 }
 
@@ -741,15 +874,29 @@ fn build_tmux_status_zones(
     width: u16,
 ) -> Option<StatusZones> {
     let mut left = if ui.status.show_sessions {
-        build_session_segments(session, snapshot)
+        build_session_segments(session, snapshot, ui)
     } else {
-        vec![StatusSegment::session(format!("[{session}] "))]
+        vec![StatusSegment::session(format!("[{session}] ")).styled(&ui.theme.current_session)]
     };
+    if ui.status_show_pane {
+        if let Some(pane) = snapshot
+            .panes
+            .iter()
+            .find(|pane| pane.pane_id == snapshot.active_pane_id)
+        {
+            left.push(StatusSegment::plain(format!(
+                " pane:{}:{} ",
+                pane.pane_id,
+                terminal_safe(&pane.title)
+            ))
+            .styled(&ui.theme.active_window));
+        }
+    }
     let mut center = if ui.status.show_window_list {
         snapshot
             .windows
             .iter()
-            .map(render_window_segment)
+            .map(|window| render_window_segment(window, ui))
             .collect::<Vec<_>>()
     } else {
         Vec::new()
@@ -759,12 +906,12 @@ fn build_tmux_status_zones(
         if ui.status.show_host
             && let Some(host) = short_hostname()
         {
-            segments.push(StatusSegment::plain(format!("{host} ")));
+            segments.push(StatusSegment::plain(format!("{host} ")).styled(&ui.theme.right_status));
         }
         if ui.status.show_clock
             && let Some(clock) = local_clock()
         {
-            segments.push(StatusSegment::plain(clock));
+            segments.push(StatusSegment::plain(clock).styled(&ui.theme.right_status));
         }
         segments
     } else {
@@ -847,9 +994,13 @@ fn fit_tmux_status_layout(
     }
 }
 
-fn build_session_segments(session: &str, snapshot: &RenderSnapshot) -> Vec<StatusSegment> {
+fn build_session_segments(
+    session: &str,
+    snapshot: &RenderSnapshot,
+    ui: &ResolvedUiConfig,
+) -> Vec<StatusSegment> {
     if snapshot.sessions.is_empty() {
-        return vec![StatusSegment::session(format!("[{}] ", session))];
+        return vec![StatusSegment::session(format!("[{}] ", session)).styled(&ui.theme.current_session)];
     }
 
     snapshot
@@ -862,9 +1013,9 @@ fn build_session_segments(session: &str, snapshot: &RenderSnapshot) -> Vec<Statu
                 summary.name.clone()
             };
             if summary.name == session {
-                StatusSegment::session(format!("[{}] ", label))
+                StatusSegment::session(format!("[{}] ", label)).styled(&ui.theme.current_session)
             } else {
-                StatusSegment::plain(format!("{} ", label))
+                StatusSegment::plain(format!("{} ", label)).styled(&ui.theme.other_session)
             }
         })
         .collect()
@@ -899,8 +1050,8 @@ fn shorten_window_segment(segment: &mut StatusSegment) -> bool {
     };
     let marker = rest.chars().last().filter(|ch| matches!(ch, '*' | '-'));
     let name = rest.trim_end_matches(['*', '-']);
-    if name.chars().count() > 1 {
-        let shortened = truncate(name, (name.chars().count().saturating_sub(1)) as u16);
+    if display_width(name) > 1 {
+        let shortened = truncate(name, display_width(name).saturating_sub(1) as u16);
         let marker = marker.map(|ch| ch.to_string()).unwrap_or_default();
         segment.text = format!(" {}:{}{} ", index, shortened, marker);
         return true;
@@ -925,7 +1076,7 @@ fn simplify_clock_segment(segment: &mut StatusSegment) -> bool {
 fn shorten_non_active_session_segment(segment: &mut StatusSegment) -> bool {
     let trimmed = segment.text.trim();
     let label = trimmed.trim_end_matches('?');
-    let label_len = label.chars().count();
+    let label_len = display_width(label);
     if label_len <= 1 {
         return false;
     }
@@ -942,7 +1093,7 @@ fn shorten_non_active_session_segment(segment: &mut StatusSegment) -> bool {
 fn shorten_active_session_segment(segment: &mut StatusSegment) -> bool {
     let trimmed = segment.text.trim();
     let name = trimmed.trim_matches(['[', ']']);
-    let name_len = name.chars().count();
+    let name_len = display_width(name);
     if name_len <= 1 {
         return false;
     }
@@ -967,12 +1118,16 @@ fn render_status_segments<W: Write>(
     out: &mut W,
     row: u16,
     segments: &[StatusSegment],
+    base_style: &StyleConfig,
     width: u16,
 ) -> std::io::Result<()> {
-    queue!(out, MoveTo(0, row), SetAttribute(Attribute::Reverse))?;
+    queue!(out, MoveTo(0, row))?;
+    queue_style(out, base_style)?;
+    queue!(out, SetAttribute(Attribute::Reverse))?;
     let mut written = 0usize;
     for segment in segments {
         queue!(out, SetAttribute(Attribute::Reset))?;
+        queue_style(out, &segment.style)?;
         for attr in &segment.attrs {
             queue!(out, SetAttribute(*attr))?;
         }
@@ -981,7 +1136,7 @@ fn render_status_segments<W: Write>(
             break;
         }
         let text = truncate(&segment.text, remaining as u16);
-        written += text.chars().count();
+        written += display_width(&text);
         queue!(out, Print(text))?;
     }
     if written < width as usize {
@@ -999,11 +1154,13 @@ fn render_status_zones<W: Write>(
     out: &mut W,
     row: u16,
     zones: &StatusZones,
+    ui: &ResolvedUiConfig,
     width: u16,
 ) -> std::io::Result<()> {
+    queue!(out, MoveTo(0, row))?;
+    queue_style(out, &ui.theme.status)?;
     queue!(
         out,
-        MoveTo(0, row),
         SetAttribute(Attribute::Reverse),
         Print(" ".repeat(width as usize)),
         SetAttribute(Attribute::Reset)
@@ -1031,12 +1188,13 @@ fn render_status_segments_at<W: Write>(
             MoveTo(written as u16, row),
             SetAttribute(Attribute::Reset)
         )?;
+        queue_style(out, &segment.style)?;
         for attr in &segment.attrs {
             queue!(out, SetAttribute(*attr))?;
         }
         let remaining = width as usize - written;
         let text = truncate(&segment.text, remaining as u16);
-        written += text.chars().count();
+        written += display_width(&text);
         queue!(out, Print(text), SetAttribute(Attribute::Reset))?;
     }
     Ok(())
@@ -1106,9 +1264,19 @@ fn render_prompt_line(buffer: &str, completions: &[String], selected: usize, wid
     fit_width(&line, width)
 }
 
+fn chooser_viewport_start(selected: usize, item_count: usize, visible: usize) -> usize {
+    if visible == 0 || item_count <= visible {
+        return 0;
+    }
+    selected
+        .saturating_sub(visible / 2)
+        .min(item_count.saturating_sub(visible))
+}
+
 fn fit_width(value: &str, width: u16) -> String {
-    let mut fitted: String = value.chars().take(width as usize).collect();
-    let current = fitted.chars().count();
+    let safe = terminal_safe(value);
+    let mut fitted = truncate_display_width(&safe, width as usize);
+    let current = display_width(&fitted);
     if current < width as usize {
         fitted.push_str(&" ".repeat(width as usize - current));
     }
@@ -1116,7 +1284,52 @@ fn fit_width(value: &str, width: u16) -> String {
 }
 
 fn truncate(value: &str, width: u16) -> String {
-    value.chars().take(width as usize).collect()
+    truncate_display_width(&terminal_safe(value), width as usize)
+}
+
+fn display_width(value: &str) -> usize {
+    UnicodeWidthStr::width(value)
+}
+
+fn truncate_display_width(value: &str, width: usize) -> String {
+    let mut out = String::new();
+    let mut used: usize = 0;
+    for grapheme in UnicodeSegmentation::graphemes(value, true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if grapheme_width > 0 && used.saturating_add(grapheme_width) > width {
+            break;
+        }
+        out.push_str(grapheme);
+        used = used.saturating_add(grapheme_width);
+    }
+    out
+}
+
+fn terminal_cell_at(line: &str, column: usize) -> Option<&str> {
+    let mut start: usize = 0;
+    for grapheme in UnicodeSegmentation::graphemes(line, true) {
+        let width = UnicodeWidthStr::width(grapheme);
+        if width == 0 {
+            continue;
+        }
+        if (start..start.saturating_add(width)).contains(&column) {
+            return (column == start).then_some(grapheme).or(Some(" "));
+        }
+        start = start.saturating_add(width);
+    }
+    None
+}
+
+fn terminal_safe(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|ch| match ch {
+            '\x00'..='\x1f' => vec!['^', char::from_u32(ch as u32 + 0x40).unwrap_or('?')],
+            '\x7f' => vec!['^', '?'],
+            ch if ch.is_control() => vec!['�'],
+            ch => vec![ch],
+        })
+        .collect()
 }
 
 fn truncate_ansi_preserving_style(value: &str, width: usize) -> String {
@@ -1125,34 +1338,47 @@ fn truncate_ansi_preserving_style(value: &str, width: usize) -> String {
     }
 
     let mut out = String::new();
-    let mut chars = value.chars().peekable();
     let mut visible = 0usize;
+    let mut rest = value;
 
-    while let Some(ch) = chars.next() {
-        if ch == '\x1b' {
-            out.push(ch);
-            if let Some(next) = chars.next() {
-                out.push(next);
-                if next == '[' {
-                    for esc in chars.by_ref() {
-                        out.push(esc);
-                        if ('@'..='~').contains(&esc) {
-                            break;
-                        }
-                    }
-                }
-            }
+    while !rest.is_empty() {
+        if rest.starts_with('\x1b') {
+            let sequence_len = ansi_sequence_len(rest);
+            out.push_str(&rest[..sequence_len]);
+            rest = &rest[sequence_len..];
             continue;
         }
 
-        if visible >= width {
+        let grapheme = UnicodeSegmentation::graphemes(rest, true)
+            .next()
+            .expect("nonempty text has a grapheme");
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if grapheme_width > 0 && visible.saturating_add(grapheme_width) > width {
             break;
         }
-        out.push(ch);
-        visible += 1;
+        out.push_str(grapheme);
+        visible = visible.saturating_add(grapheme_width);
+        rest = &rest[grapheme.len()..];
     }
 
     if visible == 0 { String::new() } else { out }
+}
+
+fn ansi_sequence_len(value: &str) -> usize {
+    let mut chars = value.char_indices();
+    let _ = chars.next();
+    let Some((_, next)) = chars.next() else {
+        return value.len();
+    };
+    if next != '[' {
+        return 1 + next.len_utf8();
+    }
+    for (index, ch) in chars {
+        if ('@'..='~').contains(&ch) {
+            return index + ch.len_utf8();
+        }
+    }
+    value.len()
 }
 
 #[cfg(test)]
@@ -1160,13 +1386,57 @@ mod tests {
     use super::*;
     use crate::config::{
         DividerCharset, DividerConfig, ModeBarConfig, OverlayConfig, ResolvedUiConfig,
-        StatusConfig, StatusPosition, ThemeConfig,
+        StatusConfig, StatusPosition, ThemeColor, ThemeConfig,
     };
     use crate::ipc::{PaneCursor, PaneRender, RenderSnapshot};
     use crate::layout::{LayoutTree, SplitAxis};
     use crate::pane::PaneId;
     use crate::pane::Rect;
     use crate::window::WindowSummary;
+
+    #[test]
+    fn chooser_viewport_keeps_selection_visible_past_eight_items() {
+        assert_eq!(chooser_viewport_start(0, 12, 8), 0);
+        assert_eq!(chooser_viewport_start(8, 12, 8), 4);
+        assert_eq!(chooser_viewport_start(11, 12, 8), 4);
+    }
+
+    #[test]
+    fn overlay_heading_honors_border_and_title_configuration() {
+        assert_eq!(
+            overlay_heading(
+                "buffers",
+                &OverlayConfig {
+                    border: false,
+                    title: false,
+                },
+                20,
+            ),
+            None
+        );
+        let title = overlay_heading(
+            "buffers",
+            &OverlayConfig {
+                border: false,
+                title: true,
+            },
+            20,
+        )
+        .expect("title heading");
+        assert_eq!(display_width(&title), 20);
+        assert!(title.starts_with(" buffers "));
+        let border = overlay_heading(
+            "buffers",
+            &OverlayConfig {
+                border: true,
+                title: false,
+            },
+            20,
+        )
+        .expect("border heading");
+        assert_eq!(display_width(&border), 20);
+        assert!(!border.contains("buffers"));
+    }
 
     fn sample_snapshot() -> RenderSnapshot {
         RenderSnapshot {
@@ -1199,6 +1469,11 @@ mod tests {
                 focused: true,
                 helper_socket: None,
                 mouse_reporting: false,
+                application_cursor: false,
+                scrollback: 0,
+                preview: "hello".into(),
+                formatted_preview: "\u{1b}[31mhello\u{1b}[0m".into(),
+                formatted_cursor: String::new(),
                 rows_plain: vec!["hello".into()],
                 rows_formatted: vec!["\u{1b}[31mhello\u{1b}[0m".into()],
                 cursor: Some(PaneCursor { row: 0, col: 2 }),
@@ -1212,7 +1487,9 @@ mod tests {
     fn sample_ui() -> ResolvedUiConfig {
         ResolvedUiConfig {
             status_position: StatusPosition::Bottom,
+            status_style: StatusStyle::TmuxPlus,
             show_pane_labels: true,
+            status_show_pane: true,
             status: StatusConfig::default(),
             dividers: DividerConfig {
                 charset: DividerCharset::Unicode,
@@ -1253,8 +1530,51 @@ mod tests {
     }
 
     #[test]
+    fn pane_labels_follow_the_ui_setting() {
+        let mut snapshot = sample_snapshot();
+        snapshot.panes[0].title = "pane-label".into();
+        let mut ui = sample_ui();
+        ui.status_show_pane = false;
+
+        let mut shown = Vec::new();
+        render_session(
+            &mut shown,
+            "work",
+            &snapshot,
+            BottomBar::Status { message: None },
+            None,
+            &ui,
+            TerminalSize {
+                width: 40,
+                height: 6,
+            },
+        )
+        .expect("render labels");
+        assert!(String::from_utf8_lossy(&shown).contains("1:pane-label"));
+
+        ui.show_pane_labels = false;
+        let mut hidden = Vec::new();
+        render_session(
+            &mut hidden,
+            "work",
+            &snapshot,
+            BottomBar::Status { message: None },
+            None,
+            &ui,
+            TerminalSize {
+                width: 40,
+                height: 6,
+            },
+        )
+        .expect("render without labels");
+        assert!(!String::from_utf8_lossy(&hidden).contains("pane-label"));
+    }
+
+    #[test]
     fn render_highlights_selected_text() {
         let mut buf = Vec::new();
+        let mut ui = sample_ui();
+        ui.theme.selection.fg = Some(ThemeColor::Red);
         render_session(
             &mut buf,
             "work",
@@ -1264,7 +1584,7 @@ mod tests {
                 pane_id: 1,
                 selection: Selection::new(0, 1, 0, 3),
             }),
-            &sample_ui(),
+            &ui,
             TerminalSize {
                 width: 20,
                 height: 6,
@@ -1274,7 +1594,81 @@ mod tests {
         let rendered = String::from_utf8_lossy(&buf);
 
         assert!(rendered.contains("\u{1b}[7m"));
+        assert!(rendered.contains("\u{1b}[31m"));
         assert!(rendered.contains("\u{1b}[1;2H"));
+    }
+
+    #[test]
+    fn render_hides_a_stale_cursor_when_no_pane_cursor_is_available() {
+        let mut snapshot = sample_snapshot();
+        snapshot.panes[0].cursor = None;
+        let mut buf = Vec::new();
+        render_session(
+            &mut buf,
+            "work",
+            &snapshot,
+            BottomBar::Status { message: None },
+            None,
+            &sample_ui(),
+            TerminalSize {
+                width: 20,
+                height: 6,
+            },
+        )
+        .expect("render session");
+        let rendered = String::from_utf8_lossy(&buf);
+
+        assert!(rendered.contains("\u{1b}[?25l"));
+        assert!(!rendered.contains("\u{1b}[?25h"));
+    }
+
+    #[test]
+    fn copy_mode_hints_follow_the_ui_configuration() {
+        let mut ui = sample_ui();
+        ui.copy_mode.show_hints = false;
+        let mut buf = Vec::new();
+        render_session(
+            &mut buf,
+            "work",
+            &sample_snapshot(),
+            BottomBar::CopyMode,
+            None,
+            &ui,
+            TerminalSize {
+                width: 100,
+                height: 6,
+            },
+        )
+        .expect("render copy mode");
+        let rendered = String::from_utf8_lossy(&buf);
+
+        assert!(rendered.contains("[copy-mode]"));
+        assert!(!rendered.contains("h/j/k/l move"));
+    }
+
+    #[test]
+    fn ui_text_escapes_terminal_control_sequences() {
+        assert_eq!(terminal_safe("name\x1b[31m\n"), "name^[[31m^J");
+        assert_eq!(truncate("x\x07y", 4), "x^Gy");
+    }
+
+    #[test]
+    fn width_helpers_use_terminal_cells_not_unicode_scalar_counts() {
+        assert_eq!(display_width("界e\u{301}"), 3);
+        assert_eq!(fit_width("界", 4), "界  ");
+        assert_eq!(truncate("a界b", 2), "a");
+        assert_eq!(truncate("a界b", 3), "a界");
+        assert_eq!(truncate("e\u{301}x", 1), "e\u{301}");
+        assert_eq!(truncate_ansi_preserving_style("\x1b[31m界x\x1b[0m", 2), "\x1b[31m界");
+    }
+
+    #[test]
+    fn selection_cells_follow_wide_character_columns() {
+        assert_eq!(terminal_cell_at("a界b", 0), Some("a"));
+        assert_eq!(terminal_cell_at("a界b", 1), Some("界"));
+        assert_eq!(terminal_cell_at("a界b", 2), Some(" "));
+        assert_eq!(terminal_cell_at("a界b", 3), Some("b"));
+        assert_eq!(terminal_cell_at("e\u{301}", 0), Some("e\u{301}"));
     }
 
     #[test]
@@ -1292,6 +1686,11 @@ mod tests {
             focused: false,
             helper_socket: None,
             mouse_reporting: false,
+            application_cursor: false,
+            scrollback: 0,
+            preview: "world".into(),
+            formatted_preview: "world".into(),
+            formatted_cursor: String::new(),
             rows_formatted: vec!["world".into()],
             rows_plain: vec!["world".into()],
             cursor: None,
@@ -1456,6 +1855,63 @@ mod tests {
             .collect::<String>();
         assert!(joined.contains("copied 5 chars"));
         assert!(!joined.contains("shell"));
+    }
+
+    #[test]
+    fn status_pane_segment_honors_ui_configuration() {
+        let snapshot = sample_snapshot();
+        let shown = build_tmux_status_zones("work", &snapshot, &sample_ui(), 80)
+            .expect("status zones")
+            .left
+            .into_iter()
+            .map(|segment| segment.text)
+            .collect::<String>();
+        assert!(shown.contains("pane:1:shell"));
+
+        let mut ui = sample_ui();
+        ui.status_show_pane = false;
+        let hidden = build_tmux_status_zones("work", &snapshot, &ui, 80)
+            .expect("status zones")
+            .left
+            .into_iter()
+            .map(|segment| segment.text)
+            .collect::<String>();
+        assert!(!hidden.contains("pane:1:shell"));
+    }
+
+    #[test]
+    fn status_segments_use_the_configured_theme_styles() {
+        let mut ui = sample_ui();
+        ui.theme.current_session.fg = Some(ThemeColor::Red);
+        ui.theme.other_session.fg = Some(ThemeColor::Blue);
+        ui.theme.active_window.bg = Some(ThemeColor::Green);
+        ui.theme.right_status.dim = true;
+
+        let zones = build_tmux_status_zones("work", &sample_snapshot(), &ui, 120)
+            .expect("status zones");
+
+        assert_eq!(zones.left[0].style.fg, Some(ThemeColor::Red));
+        assert_eq!(zones.left[1].style.fg, Some(ThemeColor::Blue));
+        assert_eq!(zones.left[2].style.bg, Some(ThemeColor::Green));
+        assert!(zones.right.iter().all(|segment| segment.style.dim));
+    }
+
+    #[test]
+    fn minimal_status_style_omits_window_and_host_zones() {
+        let mut ui = sample_ui();
+        ui.status_style = StatusStyle::Minimal;
+        let zones = build_tmux_status_zones("work", &sample_snapshot(), &ui, 80)
+            .expect("tmux-style zones remain constructible");
+        assert!(!zones.center.is_empty());
+
+        let segments = render_status_line("work", &sample_snapshot(), None, &ui, 80);
+        let text = segments
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<String>();
+        assert!(text.contains("[work]"));
+        assert!(text.contains("pane:1:shell"));
+        assert!(!text.contains("1:shell*"));
     }
 
     #[test]

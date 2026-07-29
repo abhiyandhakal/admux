@@ -6,18 +6,26 @@ use crossterm::{
 use serde::{Deserialize, Deserializer, Serialize};
 use std::{collections::BTreeMap, fs, path::Path};
 
+use crate::clipboard::{ClipboardBackend, ClipboardConfig};
+
+const MAX_SCROLLBACK_LINES: usize = 50_000;
+const MAX_WORKSPACE_SNAPSHOT_LINES: usize = 10_000;
+const MAX_RESIZE_STEP: u16 = 1_000;
+const MAX_COPY_PAGE_SIZE: u16 = 10_000;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub ui: UiConfig,
     pub keys: KeyConfig,
     pub mouse: MouseConfig,
+    pub clipboard: ClipboardConfig,
     pub behavior: BehaviorConfig,
     pub defaults: DefaultsConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct UiConfig {
     pub status_position: StatusPosition,
     pub show_pane_labels: bool,
@@ -35,7 +43,7 @@ pub struct UiConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct StatusConfig {
     pub show_sessions: bool,
     pub show_window_list: bool,
@@ -44,27 +52,27 @@ pub struct StatusConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DividerConfig {
     pub charset: DividerCharset,
     pub highlight_active: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct OverlayConfig {
     pub border: bool,
     pub title: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ModeBarConfig {
     pub show_hints: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ThemeConfig {
     pub status: StyleConfig,
     pub current_session: StyleConfig,
@@ -85,7 +93,7 @@ pub struct ThemeConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct StyleConfig {
     pub fg: Option<ThemeColor>,
     pub bg: Option<ThemeColor>,
@@ -105,7 +113,7 @@ pub struct KeyConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct RawKeyConfig {
     pub prefix: Option<String>,
     pub bindings: BTreeMap<String, String>,
@@ -116,7 +124,7 @@ struct RawKeyConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct MouseConfig {
     pub enabled: bool,
     pub focus_on_click: bool,
@@ -126,30 +134,32 @@ pub struct MouseConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct BehaviorConfig {
     pub scrollback_lines: usize,
     pub default_shell: Option<String>,
     pub resize_step: u16,
     pub copy_page_size: Option<u16>,
     pub workspace_snapshot_lines: usize,
+    pub window_base: u64,
+    pub pane_base: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DefaultsConfig {
     pub session: SessionDefaults,
     pub window: WindowDefaults,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SessionDefaults {
     pub name_prefix: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct WindowDefaults {
     pub shell_name: String,
     pub use_command_name: bool,
@@ -168,6 +178,7 @@ pub enum StatusPosition {
 pub enum StatusStyle {
     #[default]
     TmuxPlus,
+    Minimal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -205,6 +216,7 @@ pub struct ResolvedConfig {
     pub ui: ResolvedUiConfig,
     pub keys: ResolvedKeyConfig,
     pub mouse: MouseConfig,
+    pub clipboard: ClipboardConfig,
     pub behavior: BehaviorConfig,
     pub defaults: DefaultsConfig,
 }
@@ -212,7 +224,9 @@ pub struct ResolvedConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedUiConfig {
     pub status_position: StatusPosition,
+    pub status_style: StatusStyle,
     pub show_pane_labels: bool,
+    pub status_show_pane: bool,
     pub status: StatusConfig,
     pub dividers: DividerConfig,
     pub theme: ThemeConfig,
@@ -319,6 +333,7 @@ impl Default for Config {
             ui: UiConfig::default(),
             keys: KeyConfig::default(),
             mouse: MouseConfig::default(),
+            clipboard: ClipboardConfig::default(),
             behavior: BehaviorConfig::default(),
             defaults: DefaultsConfig::default(),
         }
@@ -454,7 +469,7 @@ impl Default for KeyConfig {
             prefix: "Ctrl-b".into(),
             bindings: default_legacy_leader_bindings(),
             normal: BTreeMap::new(),
-            leader: default_leader_bindings(),
+            leader: default_leader_bindings(1),
             copy_mode: default_copy_mode_bindings(),
         }
     }
@@ -479,12 +494,14 @@ impl<'de> Deserialize<'de> for KeyConfig {
     {
         let raw = RawKeyConfig::deserialize(deserializer)?;
         let defaults = KeyConfig::default();
+        let mut copy_mode = defaults.copy_mode.clone();
+        copy_mode.extend(raw.copy_mode);
         let mut config = KeyConfig {
             prefix: raw.prefix.unwrap_or_else(|| defaults.prefix.clone()),
             bindings: raw.bindings,
             normal: raw.normal,
             leader: BTreeMap::new(),
-            copy_mode: raw.copy_mode,
+            copy_mode,
         };
 
         if let Some(value) = raw.leader {
@@ -533,6 +550,8 @@ impl Default for BehaviorConfig {
             resize_step: 50,
             copy_page_size: None,
             workspace_snapshot_lines: 500,
+            window_base: 1,
+            pane_base: 1,
         }
     }
 }
@@ -576,12 +595,51 @@ impl Config {
     }
 
     pub fn resolve(&self) -> Result<ResolvedConfig> {
+        if self.behavior.scrollback_lines == 0 {
+            bail!("behavior.scrollback_lines must be greater than zero");
+        }
+        if self.behavior.scrollback_lines > MAX_SCROLLBACK_LINES {
+            bail!("behavior.scrollback_lines must not exceed {MAX_SCROLLBACK_LINES}");
+        }
+        if self.behavior.resize_step == 0 {
+            bail!("behavior.resize_step must be greater than zero");
+        }
+        if self.behavior.resize_step > MAX_RESIZE_STEP {
+            bail!("behavior.resize_step must not exceed {MAX_RESIZE_STEP}");
+        }
+        if let Some(copy_page_size) = self.behavior.copy_page_size {
+            if copy_page_size == 0 {
+                bail!("behavior.copy_page_size must be greater than zero when set");
+            }
+            if copy_page_size > MAX_COPY_PAGE_SIZE {
+                bail!("behavior.copy_page_size must not exceed {MAX_COPY_PAGE_SIZE}");
+            }
+        }
+        if self.behavior.workspace_snapshot_lines == 0 {
+            bail!("behavior.workspace_snapshot_lines must be greater than zero");
+        }
+        if self.behavior.workspace_snapshot_lines > MAX_WORKSPACE_SNAPSHOT_LINES {
+            bail!(
+                "behavior.workspace_snapshot_lines must not exceed {MAX_WORKSPACE_SNAPSHOT_LINES}"
+            );
+        }
+        if matches!(self.clipboard.backend, ClipboardBackend::ExternalCommand)
+            && self.clipboard.command.is_empty()
+        {
+            bail!("clipboard.command is required when clipboard.backend is external-command");
+        }
         let status = resolve_status_config(&self.ui);
-        let key_config = resolve_key_config(&self.keys, self.behavior.resize_step)?;
+        let key_config = resolve_key_config(
+            &self.keys,
+            self.behavior.resize_step,
+            self.behavior.window_base,
+        )?;
         Ok(ResolvedConfig {
             ui: ResolvedUiConfig {
                 status_position: self.ui.status_position,
+                status_style: self.ui.status_style,
                 show_pane_labels: self.ui.show_pane_labels,
+                status_show_pane: self.ui.status_show_pane,
                 status,
                 dividers: self.ui.dividers.clone(),
                 theme: self.ui.theme.clone(),
@@ -591,6 +649,7 @@ impl Config {
             },
             keys: key_config,
             mouse: self.mouse.clone(),
+            clipboard: self.clipboard.clone(),
             behavior: self.behavior.clone(),
             defaults: self.defaults.clone(),
         })
@@ -608,12 +667,20 @@ fn resolve_status_config(ui: &UiConfig) -> StatusConfig {
     status
 }
 
-fn resolve_key_config(config: &KeyConfig, resize_step: u16) -> Result<ResolvedKeyConfig> {
+fn resolve_key_config(
+    config: &KeyConfig,
+    resize_step: u16,
+    window_base: u64,
+) -> Result<ResolvedKeyConfig> {
     let prefix = parse_key_pattern(&config.prefix)
         .with_context(|| format!("invalid keys.prefix '{}'", config.prefix))?;
-    let normal = resolve_table("keys.normal", &config.normal, resize_step)?;
+    let mut normal_raw = default_normal_bindings(window_base);
+    for (action, key) in &config.normal {
+        normal_raw.insert(action.clone(), key.clone());
+    }
+    let normal = resolve_table("keys.normal", &normal_raw, resize_step)?;
 
-    let mut leader_raw = default_leader_bindings();
+    let mut leader_raw = default_leader_bindings(window_base);
     for (action, key) in &config.bindings {
         leader_raw.insert(action.clone(), key.clone());
     }
@@ -661,6 +728,16 @@ pub fn parse_key_pattern(value: &str) -> Result<KeyPattern> {
             modifiers: KeyPatternModifiers::default(),
         });
     }
+    if matches!(value.to_ascii_lowercase().as_str(), "page-up" | "page-down") {
+        return Ok(KeyPattern {
+            code: if value.eq_ignore_ascii_case("page-up") {
+                KeyPatternCode::PageUp
+            } else {
+                KeyPatternCode::PageDown
+            },
+            modifiers: KeyPatternModifiers::default(),
+        });
+    }
     let mut modifiers = KeyPatternModifiers::default();
     let mut parts = value.split('-').peekable();
     let mut last = None;
@@ -693,7 +770,15 @@ pub fn parse_key_pattern(value: &str) -> Result<KeyPattern> {
         "delete" | "del" => KeyPatternCode::Delete,
         "pageup" | "page-up" => KeyPatternCode::PageUp,
         "pagedown" | "page-down" => KeyPatternCode::PageDown,
-        _ if key.chars().count() == 1 => KeyPatternCode::Char(key.chars().next().unwrap()),
+        _ if key.chars().count() == 1 => {
+            let character = key.chars().next().expect("single-character key is present");
+            if character.is_ascii_uppercase() {
+                modifiers.shift = true;
+                KeyPatternCode::Char(character.to_ascii_lowercase())
+            } else {
+                KeyPatternCode::Char(character)
+            }
+        }
         _ => return Err(anyhow!("unknown key '{key}'")),
     };
     Ok(KeyPattern { code, modifiers })
@@ -709,7 +794,14 @@ pub fn key_event_matches(pattern: &KeyPattern, event: KeyEvent) -> bool {
     if pattern.modifiers.alt != event.modifiers.contains(KeyModifiers::ALT) {
         return false;
     }
-    if matches!(pattern.code, KeyPatternCode::Char(_)) {
+    if let KeyPatternCode::Char(character) = pattern.code {
+        // Terminal libraries generally report alphabetic shifted keys as an
+        // uppercase character plus SHIFT. Punctuation has no comparable
+        // canonical form, so preserve the historical permissive behavior
+        // unless the user explicitly requested Shift.
+        if character.is_ascii_alphabetic() || pattern.modifiers.shift {
+            return pattern.modifiers.shift == event.modifiers.contains(KeyModifiers::SHIFT);
+        }
         return true;
     }
     pattern.modifiers.shift == event.modifiers.contains(KeyModifiers::SHIFT)
@@ -717,7 +809,7 @@ pub fn key_event_matches(pattern: &KeyPattern, event: KeyEvent) -> bool {
 
 fn key_event_code(event: &KeyEvent) -> KeyPatternCode {
     match event.code {
-        KeyCode::Char(ch) => KeyPatternCode::Char(ch),
+        KeyCode::Char(ch) => KeyPatternCode::Char(ch.to_ascii_lowercase()),
         KeyCode::Enter => KeyPatternCode::Enter,
         KeyCode::Esc => KeyPatternCode::Esc,
         KeyCode::Tab => KeyPatternCode::Tab,
@@ -736,6 +828,12 @@ fn key_event_code(event: &KeyEvent) -> KeyPatternCode {
 }
 
 fn parse_action_name(value: &str) -> Result<Action> {
+    if let Some(index) = value.strip_prefix("select_window_") {
+        let index = index
+            .parse::<u8>()
+            .with_context(|| format!("invalid window index '{index}'"))?;
+        return Ok(Action::SelectWindowIndex(index));
+    }
     Ok(match value {
         "detach" => Action::Detach,
         "split_vertical" | "split-right" => Action::SplitVertical,
@@ -746,16 +844,6 @@ fn parse_action_name(value: &str) -> Result<Action> {
         "new_window" => Action::NewWindow,
         "next_window" => Action::NextWindow,
         "prev_window" | "previous_window" => Action::PrevWindow,
-        "select_window_0" => Action::SelectWindowIndex(0),
-        "select_window_1" => Action::SelectWindowIndex(1),
-        "select_window_2" => Action::SelectWindowIndex(2),
-        "select_window_3" => Action::SelectWindowIndex(3),
-        "select_window_4" => Action::SelectWindowIndex(4),
-        "select_window_5" => Action::SelectWindowIndex(5),
-        "select_window_6" => Action::SelectWindowIndex(6),
-        "select_window_7" => Action::SelectWindowIndex(7),
-        "select_window_8" => Action::SelectWindowIndex(8),
-        "select_window_9" => Action::SelectWindowIndex(9),
         "focus_left" => Action::FocusLeft,
         "focus_down" => Action::FocusDown,
         "focus_up" => Action::FocusUp,
@@ -792,7 +880,18 @@ fn default_legacy_leader_bindings() -> BTreeMap<String, String> {
     BTreeMap::new()
 }
 
-fn default_leader_bindings() -> BTreeMap<String, String> {
+fn default_normal_bindings(window_base: u64) -> BTreeMap<String, String> {
+    let mut bindings = BTreeMap::new();
+    for offset in 0..=9u64 {
+        let public = window_base + offset;
+        if (1..=9).contains(&public) {
+            bindings.insert(format!("select_window_{public}"), format!("Alt-{public}"));
+        }
+    }
+    bindings
+}
+
+fn default_leader_bindings(window_base: u64) -> BTreeMap<String, String> {
     let mut bindings = BTreeMap::new();
     bindings.insert("detach".into(), "d".into());
     bindings.insert("split_vertical".into(), "%".into());
@@ -817,16 +916,12 @@ fn default_leader_bindings() -> BTreeMap<String, String> {
     bindings.insert("list_buffers".into(), "#".into());
     bindings.insert("delete_top_buffer".into(), "-".into());
     bindings.insert("choose_buffer".into(), "=".into());
-    bindings.insert("select_window_0".into(), "0".into());
-    bindings.insert("select_window_1".into(), "1".into());
-    bindings.insert("select_window_2".into(), "2".into());
-    bindings.insert("select_window_3".into(), "3".into());
-    bindings.insert("select_window_4".into(), "4".into());
-    bindings.insert("select_window_5".into(), "5".into());
-    bindings.insert("select_window_6".into(), "6".into());
-    bindings.insert("select_window_7".into(), "7".into());
-    bindings.insert("select_window_8".into(), "8".into());
-    bindings.insert("select_window_9".into(), "9".into());
+    for offset in 0..=9u64 {
+        let public = window_base + offset;
+        if public <= 9 {
+            bindings.insert(format!("select_window_{public}"), public.to_string());
+        }
+    }
     bindings.insert("reload_config".into(), "r".into());
     bindings
 }
@@ -887,6 +982,8 @@ mod tests {
         assert!(resolved.ui.status.show_clock);
         assert!(resolved.ui.status.show_window_list);
         assert_eq!(resolved.behavior.scrollback_lines, 10_000);
+        assert_eq!(resolved.behavior.window_base, 1);
+        assert_eq!(resolved.behavior.pane_base, 1);
         assert!(resolved.mouse.enabled);
         assert!(
             resolved
@@ -894,6 +991,12 @@ mod tests {
                 .leader
                 .iter()
                 .any(|(_, action)| *action == Action::Detach)
+        );
+        assert!(
+            resolved.keys.normal.iter().any(|(pattern, action)| {
+                *action == Action::SelectWindowIndex(1)
+                    && *pattern == parse_key_pattern("Alt-1").expect("alt-1 pattern")
+            })
         );
     }
 
@@ -921,6 +1024,125 @@ mod tests {
     }
 
     #[test]
+    fn status_show_pane_is_preserved_in_resolved_ui_config() {
+        let config = Config::from_toml(
+            r#"
+                [ui]
+                status_show_pane = false
+            "#,
+        )
+        .expect("config");
+        let resolved = config.resolve().expect("resolve config");
+        assert!(!resolved.ui.status_show_pane);
+    }
+
+    #[test]
+    fn minimal_status_style_is_preserved_in_resolved_ui_config() {
+        let config = Config::from_toml(
+            r#"
+                [ui]
+                status_style = "minimal"
+            "#,
+        )
+        .expect("config");
+        let resolved = config.resolve().expect("resolve config");
+        assert_eq!(resolved.ui.status_style, StatusStyle::Minimal);
+    }
+
+    #[test]
+    fn partial_copy_mode_configuration_extends_defaults() {
+        let config = Config::from_toml(
+            r#"
+                [keys.copy_mode]
+                exit_copy_mode = "q"
+            "#,
+        )
+        .expect("parse config");
+        let resolved = config.resolve().expect("resolve config");
+
+        assert!(resolved.keys.copy_mode.iter().any(|(pattern, action)| {
+            *action == Action::ExitCopyMode
+                && *pattern == parse_key_pattern("q").expect("exit pattern")
+        }));
+        assert!(
+            resolved
+                .keys
+                .copy_mode
+                .iter()
+                .any(|(_, action)| *action == Action::CopyMoveLeft)
+        );
+    }
+
+    #[test]
+    fn page_key_aliases_parse_without_being_treated_as_modifiers() {
+        assert_eq!(
+            parse_key_pattern("page-up").expect("page-up"),
+            KeyPattern {
+                code: KeyPatternCode::PageUp,
+                modifiers: KeyPatternModifiers::default(),
+            }
+        );
+        assert_eq!(
+            parse_key_pattern("page-down").expect("page-down"),
+            KeyPattern {
+                code: KeyPatternCode::PageDown,
+                modifiers: KeyPatternModifiers::default(),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_behavior_sizes() {
+        for input in [
+            "[behavior]\nscrollback_lines = 0",
+            "[behavior]\nresize_step = 0",
+            "[behavior]\ncopy_page_size = 0",
+            "[behavior]\nworkspace_snapshot_lines = 0",
+            &format!("[behavior]\nscrollback_lines = {}", MAX_SCROLLBACK_LINES + 1),
+            &format!("[behavior]\nresize_step = {}", MAX_RESIZE_STEP + 1),
+            &format!("[behavior]\ncopy_page_size = {}", MAX_COPY_PAGE_SIZE + 1),
+            &format!(
+                "[behavior]\nworkspace_snapshot_lines = {}",
+                MAX_WORKSPACE_SNAPSHOT_LINES + 1
+            ),
+        ] {
+            assert!(Config::from_toml(input)
+                .expect("parse config")
+                .resolve()
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn external_clipboard_requires_a_command() {
+        let error = Config::from_toml(
+            r#"
+[clipboard]
+backend = "external-command"
+"#,
+        )
+        .expect("parse config")
+        .resolve()
+        .expect_err("external backend without command must fail");
+        assert!(error.to_string().contains("clipboard.command"));
+
+        let resolved = Config::from_toml(
+            r#"
+[clipboard]
+backend = "external-command"
+command = ["wl-copy", "--type", "text/plain"]
+"#,
+        )
+        .expect("parse config")
+        .resolve()
+        .expect("resolve configured external clipboard");
+        assert_eq!(
+            resolved.clipboard.backend,
+            ClipboardBackend::ExternalCommand
+        );
+    }
+
+    #[test]
     fn defaults_include_buffer_bindings() {
         let resolved = Config::default().resolve().expect("resolve config");
         assert!(
@@ -936,6 +1158,51 @@ mod tests {
                 .leader
                 .iter()
                 .any(|(_, action)| *action == Action::ChooseBuffer)
+        );
+    }
+
+    #[test]
+    fn numbering_bases_shift_default_window_digit_bindings() {
+        let config = Config::from_toml(
+            r#"
+                [behavior]
+                window_base = 1
+                pane_base = 2
+            "#,
+        )
+        .expect("config");
+        let resolved = config.resolve().expect("resolve");
+
+        assert_eq!(resolved.behavior.window_base, 1);
+        assert_eq!(resolved.behavior.pane_base, 2);
+        assert!(
+            resolved.keys.leader.iter().any(|(pattern, action)| {
+                *action == Action::SelectWindowIndex(1)
+                    && *pattern == parse_key_pattern("1").expect("digit binding")
+            })
+        );
+        assert!(
+            !resolved.keys.leader.iter().any(|(_, action)| {
+                *action == Action::SelectWindowIndex(0)
+            })
+        );
+        assert!(
+            !resolved
+                .keys
+                .leader
+                .iter()
+                .any(|(pattern, _)| *pattern == parse_key_pattern("0").expect("digit binding"))
+        );
+        assert!(
+            resolved.keys.normal.iter().any(|(pattern, action)| {
+                *action == Action::SelectWindowIndex(1)
+                    && *pattern == parse_key_pattern("Alt-1").expect("alt-1 pattern")
+            })
+        );
+        assert!(
+            !resolved.keys.normal.iter().any(|(_, action)| {
+                *action == Action::SelectWindowIndex(0)
+            })
         );
     }
 
@@ -1017,11 +1284,45 @@ mod tests {
     }
 
     #[test]
+    fn unknown_configuration_fields_are_rejected() {
+        let _top_level = Config::from_toml("typo = true").expect_err("reject top-level typo");
+        let nested = Config::from_toml("[behavior]\nscrollbak_lines = 1000")
+            .expect_err("reject nested typo");
+        assert!(!nested.to_string().is_empty());
+        let _keys = Config::from_toml("[keys]\nprefx = 'Ctrl-a'")
+            .expect_err("reject key-section typo");
+    }
+
+    #[test]
     fn key_event_matching_recognizes_control_keys() {
         let pattern = parse_key_pattern("Ctrl-b").expect("pattern");
         assert!(key_event_matches(
             &pattern,
             KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)
+        ));
+    }
+
+    #[test]
+    fn character_bindings_match_shift_consistently() {
+        let lower = parse_key_pattern("h").expect("lowercase binding");
+        let shifted = parse_key_pattern("Shift-h").expect("explicit shift binding");
+        let uppercase = parse_key_pattern("H").expect("uppercase shorthand binding");
+        let shifted_event = KeyEvent::new(KeyCode::Char('H'), KeyModifiers::SHIFT);
+        let lower_event = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE);
+
+        assert!(key_event_matches(&lower, lower_event));
+        assert!(!key_event_matches(&lower, shifted_event));
+        assert!(key_event_matches(&shifted, shifted_event));
+        assert!(key_event_matches(&uppercase, shifted_event));
+        assert!(!key_event_matches(&shifted, lower_event));
+    }
+
+    #[test]
+    fn punctuation_bindings_keep_their_existing_shift_tolerance() {
+        let dollar = parse_key_pattern("$").expect("dollar binding");
+        assert!(key_event_matches(
+            &dollar,
+            KeyEvent::new(KeyCode::Char('$'), KeyModifiers::SHIFT)
         ));
     }
 

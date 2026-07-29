@@ -1,25 +1,39 @@
 use std::{
     collections::BTreeMap,
     fs,
+    fs::OpenOptions,
     io::{Read, Write},
+    os::unix::{fs::{MetadataExt, OpenOptionsExt, PermissionsExt}, io::AsRawFd},
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    thread,
+    time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, bail};
+const IPC_TIMEOUT: Duration = Duration::from_secs(5);
+const PRUNE_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_IPC_MESSAGE_BYTES: u64 = 1024 * 1024;
+const MAX_SESSION_NAME_BYTES: usize = 64;
+const MAX_WINDOW_NAME_BYTES: usize = 128;
+const CLIENT_VIEWPORT_LEASE: Duration = Duration::from_secs(5);
+const INPUT_CLIENT_LEASE: Duration = Duration::from_secs(30);
+
+use anyhow::{Context, Result, anyhow, bail};
 
 use crate::{
-    buffer::BufferStore,
+    buffer::{BufferStore, MAX_BUFFER_BYTES},
     config::{Config, ResolvedConfig},
     ipc::{
-        BufferSummary, CURRENT_PROTOCOL_VERSION, CommandRequest, CommandResponse, CycleDirection,
-        NavigationDirection, ProtocolVersion, SessionSummary,
+        BufferSummary, CURRENT_PROTOCOL_VERSION, ChooseTreeSession, ChooseTreeWindow,
+        ClientViewport, CommandRequest, CommandResponse, CycleDirection, NavigationDirection,
+        PaneSummary, ProtocolVersion, SessionSummary,
     },
+    numbering::Numbering,
     pane::{PaneId, WindowId},
     persistence::{PersistedSession, PersistedState, load_state, save_state},
     session::Session,
-    workspace::{WorkspaceLoad, load_workspace, save_workspace},
+    workspace::{WorkspaceLoad, save_workspace},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,12 +48,28 @@ pub struct SessionStore {
     persisted_sessions: BTreeMap<String, PersistedSession>,
     state_path: Option<std::path::PathBuf>,
     helper_dir: PathBuf,
-    pending_switches: BTreeMap<String, String>,
+    pending_switches: BTreeMap<(String, String), String>,
+    input_clients: BTreeMap<(String, u64, u64), InputClientLease>,
     workspace_mappings: BTreeMap<String, String>,
     last_session: Option<String>,
     next_window_id: u64,
     config_path: Option<std::path::PathBuf>,
     config: ResolvedConfig,
+    last_prune: Option<Instant>,
+    client_viewports: BTreeMap<String, BTreeMap<String, ClientViewportLease>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ClientViewportLease {
+    rows: u16,
+    cols: u16,
+    last_seen: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct InputClientLease {
+    client_id: String,
+    last_seen: Instant,
 }
 
 impl Default for SessionStore {
@@ -51,6 +81,7 @@ impl Default for SessionStore {
             state_path: None,
             helper_dir: PathBuf::from("/tmp/admux-helpers"),
             pending_switches: BTreeMap::new(),
+            input_clients: BTreeMap::new(),
             workspace_mappings: BTreeMap::new(),
             last_session: None,
             next_window_id: 0,
@@ -58,6 +89,8 @@ impl Default for SessionStore {
             config: Config::default()
                 .resolve()
                 .expect("default config should resolve"),
+            last_prune: None,
+            client_viewports: BTreeMap::new(),
         }
     }
 }
@@ -69,6 +102,54 @@ struct TargetRef {
     pane: Option<PaneId>,
 }
 
+fn request_changes_persisted_state(request: &CommandRequest) -> bool {
+    matches!(
+        request,
+        CommandRequest::NewSession { .. }
+            | CommandRequest::UpWorkspace { .. }
+            | CommandRequest::SetBuffer { .. }
+            | CommandRequest::DeleteBuffer { .. }
+            | CommandRequest::LoadBuffer { .. }
+            | CommandRequest::KillSession { .. }
+            | CommandRequest::KillWindow { .. }
+            | CommandRequest::KillPane { .. }
+            | CommandRequest::SplitPane { .. }
+            | CommandRequest::NewWindow { .. }
+            | CommandRequest::SelectPane { .. }
+            | CommandRequest::SelectWindow { .. }
+            | CommandRequest::CycleWindow { .. }
+            | CommandRequest::ResizePane { .. }
+            | CommandRequest::RenameWindow { .. }
+            | CommandRequest::Resize { .. }
+    )
+}
+
+fn validate_session_name(name: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        bail!("session name cannot be empty");
+    }
+    if name.len() > MAX_SESSION_NAME_BYTES {
+        bail!("session name exceeds {MAX_SESSION_NAME_BYTES} bytes");
+    }
+    if name.chars().any(char::is_control) {
+        bail!("session name cannot contain control characters");
+    }
+    Ok(())
+}
+
+fn validate_window_name(name: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        bail!("window name cannot be empty");
+    }
+    if name.len() > MAX_WINDOW_NAME_BYTES {
+        bail!("window name exceeds {MAX_WINDOW_NAME_BYTES} bytes");
+    }
+    if name.chars().any(char::is_control) {
+        bail!("window name cannot contain control characters");
+    }
+    Ok(())
+}
+
 impl SessionStore {
     pub fn with_paths(
         state_path: std::path::PathBuf,
@@ -76,14 +157,24 @@ impl SessionStore {
         helper_dir: PathBuf,
     ) -> Result<Self> {
         let persisted = load_state(&state_path)?;
+        let legacy_buffers_present = !persisted.buffers.is_empty();
+        let next_window_id = persisted.next_window_id.max(
+            persisted
+                .sessions
+                .values()
+                .flat_map(|session| session.windows.keys())
+                .map(|window_id| window_id.0)
+                .max()
+                .unwrap_or(0),
+        );
         let mut store = Self {
-            buffers: BufferStore::from_persisted(persisted.buffers),
+            buffers: BufferStore::default(),
             workspace_mappings: persisted.workspaces,
             persisted_sessions: persisted.sessions,
             state_path: Some(state_path),
             helper_dir,
             last_session: persisted.last_session,
-            next_window_id: persisted.next_window_id,
+            next_window_id,
             config_path: Some(config_path),
             ..Self::default()
         };
@@ -94,19 +185,34 @@ impl SessionStore {
                 &persisted,
                 store.config.behavior.default_shell.clone(),
                 store.config.behavior.scrollback_lines,
+                store.numbering(),
                 store.config.defaults.window.clone(),
                 store.helper_dir.clone(),
             ) {
+                store
+                    .persisted_sessions
+                    .insert(name.clone(), PersistedSession::from_live(&session));
                 store.sessions.insert(name, session);
             } else {
                 store.persisted_sessions.remove(&name);
+                store.remove_workspace_mappings_for_session(&name);
             }
+        }
+        if legacy_buffers_present {
+            store.persist_metadata()?;
         }
         Ok(store)
     }
 
     pub fn handle(&mut self, request: CommandRequest) -> CommandResponse {
-        self.prune_dead_sessions();
+        let persist_requested = request_changes_persisted_state(&request);
+        let previous_last_session = self.last_session.clone();
+        let pruned = if self.prune_due() {
+            self.last_prune = Some(Instant::now());
+            self.prune_dead_sessions()
+        } else {
+            false
+        };
 
         let response = match request {
             CommandRequest::Hello { version } => self.handle_hello(version),
@@ -116,13 +222,17 @@ impl SessionStore {
                 command,
                 switch_from,
             } => {
-                let name = name.unwrap_or_else(|| {
-                    format!(
-                        "{}-{}",
-                        self.config.defaults.session.name_prefix,
-                        self.sessions.len() + 1
-                    )
-                });
+                let name = name.unwrap_or_else(|| self.next_session_name());
+                if let Err(error) = validate_session_name(&name) {
+                    CommandResponse::Error {
+                        message: error.to_string(),
+                    }
+                } else if self.sessions.contains_key(&name) || self.persisted_sessions.contains_key(&name)
+                {
+                    CommandResponse::Error {
+                        message: format!("session {name} already exists"),
+                    }
+                } else {
                 let command = self.effective_command(command);
                 let window_id = self.next_window();
                 match Session::new(
@@ -133,68 +243,95 @@ impl SessionStore {
                     window_id,
                     self.config.behavior.default_shell.clone(),
                     self.config.behavior.scrollback_lines,
+                    self.numbering(),
                     self.config.defaults.window.clone(),
                     self.helper_dir.clone(),
                 ) {
                     Ok(session) => {
                         self.sessions.insert(name.clone(), session);
                         self.last_session = Some(name.clone());
-                        if let Some(source) = switch_from
-                            && self.sessions.get(&source.session).is_some_and(|session| {
-                                session.contains_window_pane(
-                                    WindowId(source.window_id),
-                                    PaneId(source.pane_id),
-                                )
-                            })
-                        {
-                            self.pending_switches.insert(source.session, name.clone());
+                        if let Some(source) = switch_from {
+                            self.queue_nested_switch(source, &name);
                         }
                         CommandResponse::SessionCreated {
                             session: name,
-                            pane_id: 0,
+                            pane_id: self.config.behavior.pane_base,
                         }
                     }
                     Err(error) => CommandResponse::Error {
                         message: error.to_string(),
                     },
                 }
+                }
             }
             CommandRequest::UpWorkspace {
                 manifest_path,
                 rebuild,
                 switch_from,
-            } => match load_workspace(&manifest_path) {
+            } => match crate::workspace::load_workspace_with_snapshot(
+                &manifest_path,
+                self.numbering(),
+                !rebuild,
+            ) {
                 Ok(workspace) => self.up_workspace(workspace, rebuild, switch_from),
                 Err(error) => CommandResponse::Error {
                     message: error.to_string(),
                 },
             },
             CommandRequest::SaveWorkspace { session } => self.save_workspace(session),
-            CommandRequest::Attach { session } => {
+            CommandRequest::Attach { session, viewport } => {
                 let Some(session_name) = self.resolve_session(session) else {
                     return CommandResponse::Error {
                         message: "no sessions available".into(),
                     };
                 };
+                let client_id = viewport.as_ref().map(|viewport| viewport.client_id.clone());
                 let session_name = self
                     .pending_switches
-                    .remove(&session_name)
+                    .remove(&(session_name.clone(), client_id.unwrap_or_default()))
                     .filter(|target| self.sessions.contains_key(target))
                     .unwrap_or(session_name);
                 if self.sessions.contains_key(&session_name) {
+                    self.last_session = Some(session_name.clone());
+                    let render_area = match viewport {
+                        Some(viewport) => match self.update_client_viewport(&session_name, viewport) {
+                            Ok(area) => area,
+                            Err(error) => {
+                                return CommandResponse::Error {
+                                    message: error.to_string(),
+                                };
+                            }
+                        },
+                        None => self
+                            .sessions
+                            .get(&session_name)
+                            .expect("checked contains")
+                            .pane_area(),
+                    };
                     let session = self.sessions.get(&session_name).expect("checked contains");
-                    let snapshot =
+                    let mut snapshot =
                         session
-                            .render_snapshot(session.pane_area())
-                            .map(|mut snapshot| {
-                                snapshot.sessions = self.list_session_summaries();
-                                snapshot
-                            });
+                            .render_snapshot(render_area)
+                            ;
+                    let (preview, formatted_preview, formatted_cursor) = snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.panes.iter().find(|pane| pane.focused))
+                        .map(|pane| {
+                            (
+                                pane.preview.clone(),
+                                pane.formatted_preview.clone(),
+                                pane.formatted_cursor.clone(),
+                            )
+                        })
+                        .unwrap_or_default();
+                    if let Some(snapshot) = &mut snapshot {
+                        snapshot.sessions = self.list_session_summaries();
+                    }
                     CommandResponse::Attached {
                         session: session_name,
-                        preview: session.active_pane_preview(),
-                        formatted_preview: session.active_pane_formatted_preview(),
-                        formatted_cursor: session.active_pane_formatted_cursor(),
+                        preview,
+                        formatted_preview,
+                        formatted_cursor,
                         snapshot,
                     }
                 } else if self.persisted_sessions.contains_key(&session_name) {
@@ -209,13 +346,24 @@ impl SessionStore {
                     };
                 }
             }
-            CommandRequest::PreviewSession { session } => match self.sessions.get(&session) {
-                Some(runtime) => match runtime.render_session_preview(crate::pane::Rect {
-                    x: 0,
-                    y: 0,
-                    width: 80,
-                    height: 24,
-                }) {
+            CommandRequest::PreviewSession { session, target } => match self.sessions.get(&session) {
+                Some(runtime) => {
+                    let size = crate::pane::Rect {
+                        x: 0,
+                        y: 0,
+                        width: 80,
+                        height: 24,
+                    };
+                    let preview = match target {
+                        Some(target) => match self.parse_target(&target) {
+                            Ok(target) if target.session == session => target.window.and_then(|window| {
+                                runtime.render_window_preview(window, target.pane, size)
+                            }),
+                            _ => None,
+                        },
+                        None => runtime.render_session_preview(size),
+                    };
+                    match preview {
                     Some(mut snapshot) => {
                         snapshot.sessions = self.list_session_summaries();
                         CommandResponse::SessionPreview { snapshot }
@@ -223,13 +371,17 @@ impl SessionStore {
                     None => CommandResponse::Error {
                         message: format!("could not render session preview for {session}"),
                     },
-                },
+                    }
+                }
                 None => CommandResponse::Error {
                     message: format!("unknown session {session}"),
                 },
             },
             CommandRequest::ListSessions => CommandResponse::SessionList {
                 sessions: self.list_session_summaries(),
+            },
+            CommandRequest::ListChooseTree => CommandResponse::ChooseTreeList {
+                sessions: self.list_choose_tree(),
             },
             CommandRequest::ListBuffers => CommandResponse::BufferList {
                 buffers: self.list_buffer_summaries(),
@@ -247,10 +399,14 @@ impl SessionStore {
                 buffer,
                 data,
                 append,
-            } => {
-                let name = self.buffers.set(buffer, data, append).name.clone();
-                CommandResponse::BufferSet { name }
-            }
+            } => match self.buffers.set(buffer, data, append) {
+                Ok(buffer) => CommandResponse::BufferSet {
+                    name: buffer.name.clone(),
+                },
+                Err(error) => CommandResponse::Error {
+                    message: error.to_string(),
+                },
+            },
             CommandRequest::DeleteBuffer { buffer } => match self.buffers.delete(buffer.as_deref())
             {
                 Some(buffer) => CommandResponse::BufferDeleted { name: buffer.name },
@@ -260,7 +416,7 @@ impl SessionStore {
             },
             CommandRequest::PasteBuffer { target, buffer } => {
                 match self.buffers.get(buffer.as_deref()) {
-                    Some(buffer) => match parse_target(&target) {
+                    Some(buffer) => match self.parse_target(&target) {
                         Ok(target) => match self.sessions.get(&target.session) {
                             Some(session) => match session.send_keys(
                                 target.window,
@@ -301,37 +457,25 @@ impl SessionStore {
                     },
                 }
             }
-            CommandRequest::LoadBuffer { path, buffer } => match std::fs::read_to_string(&path) {
+            CommandRequest::LoadBuffer { path, buffer } => match read_buffer_file(&path) {
                 Ok(data) => {
-                    let name = self.buffers.set(buffer, data, false).name.clone();
-                    CommandResponse::BufferLoaded { name }
+                    match self.buffers.set(buffer, data, false) {
+                        Ok(buffer) => CommandResponse::BufferLoaded {
+                            name: buffer.name.clone(),
+                        },
+                        Err(error) => CommandResponse::Error {
+                            message: error.to_string(),
+                        },
+                    }
                 }
                 Err(error) => CommandResponse::Error {
                     message: format!("failed to load buffer: {error}"),
                 },
             },
             CommandRequest::ListWindows { session } => {
-                if let Some(session) = self.sessions.get(&session) {
+                if let Some(windows) = self.list_windows_for_session(&session) {
                     CommandResponse::WindowList {
-                        windows: session.list_windows(),
-                    }
-                } else if let Some(session) = self.persisted_sessions.get(&session) {
-                    CommandResponse::WindowList {
-                        windows: session
-                            .window_order
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(index, id)| {
-                                let window = session.windows.get(id)?;
-                                Some(crate::window::WindowSummary::new(
-                                    *id,
-                                    index,
-                                    window.name.clone(),
-                                    *id == session.active_window,
-                                    Some(*id) == session.last_window,
-                                ))
-                            })
-                            .collect(),
+                        windows,
                     }
                 } else {
                     CommandResponse::Error {
@@ -339,52 +483,31 @@ impl SessionStore {
                     }
                 }
             }
-            CommandRequest::ListPanes { target } => match parse_target(&target) {
-                Ok(target) => match self.sessions.get(&target.session) {
-                    Some(session) => CommandResponse::PaneList {
-                        panes: session.list_panes(target.window),
-                    },
-                    None => match self.persisted_sessions.get(&target.session) {
-                        Some(session) => {
-                            let window_id = target.window.unwrap_or(session.active_window);
-                            let panes = session
-                                .windows
-                                .get(&window_id)
-                                .map(|window| {
-                                    window
-                                        .layout
-                                        .panes()
-                                        .into_iter()
-                                        .filter_map(|pane_id| {
-                                            let pane = window.panes.get(&pane_id)?;
-                                            Some(crate::ipc::PaneSummary {
-                                                id: pane.id.0,
-                                                title: pane.title.clone(),
-                                                active: pane_id == window.layout.active,
-                                                window_id: window.id.0,
-                                            })
-                                        })
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-                            CommandResponse::PaneList { panes }
-                        }
-                        None => CommandResponse::Error {
-                            message: format!("unknown session {}", target.session),
-                        },
+            CommandRequest::ListPanes { target } => match self.parse_target(&target) {
+                Ok(target) => match self.list_panes_for_session(&target.session, target.window) {
+                    Some(panes) => CommandResponse::PaneList { panes },
+                    None => CommandResponse::Error {
+                        message: format!("unknown session {}", target.session),
                     },
                 },
                 Err(message) => CommandResponse::Error { message },
             },
             CommandRequest::KillSession { session } => {
-                if let Some(removed) = self.sessions.remove(&session) {
-                    let _ = removed.kill();
+                if let Some(live) = self.sessions.get(&session) {
+                    if let Err(error) = live.kill() {
+                        return CommandResponse::Error {
+                            message: format!("failed to shut down session {session}: {error}"),
+                        };
+                    }
+                    self.sessions.remove(&session);
                     self.persisted_sessions.remove(&session);
+                    self.remove_workspace_mappings_for_session(&session);
                     if self.last_session.as_deref() == Some(session.as_str()) {
                         self.last_session = self.sessions.keys().next_back().cloned();
                     }
                     CommandResponse::SessionKilled { session }
                 } else if self.persisted_sessions.remove(&session).is_some() {
+                    self.remove_workspace_mappings_for_session(&session);
                     CommandResponse::SessionKilled { session }
                 } else {
                     CommandResponse::Error {
@@ -392,15 +515,15 @@ impl SessionStore {
                     }
                 }
             }
-            CommandRequest::KillWindow { target } => match parse_target(&target) {
+            CommandRequest::KillWindow { target } => match self.parse_target(&target) {
                 Ok(target) => self.kill_window(target),
                 Err(message) => CommandResponse::Error { message },
             },
-            CommandRequest::KillPane { target } => match parse_target(&target) {
+            CommandRequest::KillPane { target } => match self.parse_target(&target) {
                 Ok(target) => self.kill_pane(target),
                 Err(message) => CommandResponse::Error { message },
             },
-            CommandRequest::SendKeys { target, keys } => match parse_target(&target) {
+            CommandRequest::SendKeys { target, keys } => match self.parse_target(&target) {
                 Ok(target) => match self.sessions.get(&target.session) {
                     Some(session) => match session.send_keys(target.window, target.pane, &keys) {
                         Ok(_) => CommandResponse::KeysSent,
@@ -414,11 +537,28 @@ impl SessionStore {
                 },
                 Err(message) => CommandResponse::Error { message },
             },
+            CommandRequest::SendBytes { target, bytes } => match self.parse_target(&target) {
+                Ok(target) => match self.sessions.get(&target.session) {
+                    Some(session) => match session.send_bytes(target.window, target.pane, &bytes) {
+                        Ok(_) => CommandResponse::KeysSent,
+                        Err(error) => CommandResponse::Error {
+                            message: error.to_string(),
+                        },
+                    },
+                    None => CommandResponse::Error {
+                        message: format!("unknown session {}", target.session),
+                    },
+                },
+                Err(message) => CommandResponse::Error { message },
+            },
+            CommandRequest::RegisterInput { source, client_id } => {
+                self.register_input_client(source, client_id)
+            }
             CommandRequest::SplitPane {
                 target,
                 axis,
                 command,
-            } => match parse_target(&target) {
+            } => match self.parse_target(&target) {
                 Ok(target) => self.split_pane(target, axis, command),
                 Err(message) => CommandResponse::Error { message },
             },
@@ -427,26 +567,43 @@ impl SessionStore {
                 name,
                 command,
             } => {
-                let window_id = self.next_window();
-                let command = self.effective_command(command);
-                match self.sessions.get_mut(&session) {
+                if let Some(name) = name.as_deref()
+                    && let Err(error) = validate_window_name(name)
+                {
+                    return CommandResponse::Error {
+                        message: error.to_string(),
+                    };
+                }
+                if !self.sessions.contains_key(&session) {
+                    CommandResponse::Error {
+                        message: format!("unknown session {session}"),
+                    }
+                } else {
+                    let window_id = self.next_window();
+                    let command = self.effective_command(command);
+                    match self.sessions.get_mut(&session) {
                     Some(session) => match session.new_window(window_id, name, &command) {
                         Ok(created) => CommandResponse::WindowCreated {
                             session: session.name.clone(),
-                            window_id: created.window_id.0,
-                            pane_id: created.pane_id.0,
+                            window_id: session
+                                .numbering
+                                .public_window_id(created.window_id, &session.window_order)
+                                .unwrap_or(created.window_id.0),
+                            pane_id: session
+                                .numbering
+                                .public_pane_number(created.pane_id)
+                                .unwrap_or(created.pane_id.0),
                         },
                         Err(error) => CommandResponse::Error {
                             message: error.to_string(),
                         },
                     },
-                    None => CommandResponse::Error {
-                        message: format!("unknown session {session}"),
-                    },
+                    None => unreachable!("session existence checked before allocation"),
+                    }
                 }
             }
             CommandRequest::SelectPane { target, direction } => self.select_pane(target, direction),
-            CommandRequest::SelectWindow { target } => match parse_target(&target) {
+            CommandRequest::SelectWindow { target } => match self.parse_target(&target) {
                 Ok(target) => self.select_window(target),
                 Err(message) => CommandResponse::Error { message },
             },
@@ -469,7 +626,7 @@ impl SessionStore {
                 target,
                 direction,
                 amount,
-            } => match parse_target(&target) {
+            } => match self.parse_target(&target) {
                 Ok(target) => match self.sessions.get_mut(&target.session) {
                     Some(session) => {
                         match session.resize_active_pane(
@@ -490,46 +647,44 @@ impl SessionStore {
                 },
                 Err(message) => CommandResponse::Error { message },
             },
-            CommandRequest::RenameWindow { target, name } => match parse_target(&target) {
+            CommandRequest::RenameWindow { target, name } => match self.parse_target(&target) {
                 Ok(target) => self.rename_window(target, name),
                 Err(message) => CommandResponse::Error { message },
             },
             CommandRequest::MouseScroll {
                 session,
+                window_id,
+                pane_id,
                 row,
                 col,
                 direction,
             } => match self.sessions.get(&session) {
-                Some(session) => {
-                    let pane_id = session
-                        .render_snapshot(session.pane_area())
-                        .and_then(|snapshot| {
-                            snapshot
-                                .panes
-                                .into_iter()
-                                .find(|pane| pane.rect.contains(row, col))
-                        })
-                        .map(|pane| PaneId(pane.pane_id));
-                    match session.handle_mouse_scroll(pane_id, direction, row, col) {
-                        Ok(_) => CommandResponse::Scrolled,
-                        Err(error) => CommandResponse::Error {
-                            message: error.to_string(),
-                        },
-                    }
-                }
+                Some(session) => match session.handle_mouse_scroll(
+                    Some(window_id),
+                    Some(pane_id),
+                    direction,
+                    row,
+                    col,
+                ) {
+                    Ok(_) => CommandResponse::Scrolled,
+                    Err(error) => CommandResponse::Error {
+                        message: error.to_string(),
+                    },
+                },
                 None => CommandResponse::Error {
                     message: format!("unknown session {session}"),
                 },
             },
             CommandRequest::MousePane {
                 session,
+                window_id,
                 pane_id,
                 row,
                 col,
                 kind,
             } => match self.sessions.get(&session) {
                 Some(session) => {
-                    match session.handle_pane_mouse(Some(PaneId(pane_id)), kind, row, col) {
+                    match session.handle_pane_mouse(Some(window_id), Some(pane_id), kind, row, col) {
                         Ok(_) => CommandResponse::FocusChanged,
                         Err(error) => CommandResponse::Error {
                             message: error.to_string(),
@@ -542,20 +697,25 @@ impl SessionStore {
             },
             CommandRequest::CopySelection {
                 session,
+                window_id,
                 pane_id,
-                start_row,
+                start_from_bottom,
                 start_col,
-                end_row,
+                end_from_bottom,
                 end_col,
             } => match self.sessions.get(&session) {
-                Some(session) => CommandResponse::SelectionCopied {
-                    text: session.active_pane_selection_text(
-                        pane_id.map(PaneId),
-                        start_row,
+                Some(session) => match session.pane_selection_text(
+                        window_id,
+                        pane_id,
+                        start_from_bottom,
                         start_col,
-                        end_row,
+                        end_from_bottom,
                         end_col,
-                    ),
+                    ) {
+                    Ok(text) => CommandResponse::SelectionCopied { text },
+                    Err(error) => CommandResponse::Error {
+                        message: error.to_string(),
+                    },
                 },
                 None => CommandResponse::Error {
                     message: format!("unknown session {session}"),
@@ -563,10 +723,27 @@ impl SessionStore {
             },
             CommandRequest::ScrollPane {
                 session,
+                window_id,
                 pane_id,
                 lines,
             } => match self.sessions.get(&session) {
-                Some(session) => match session.scroll_pane(pane_id.map(PaneId), lines) {
+                Some(session) => match session.scroll_pane(window_id, pane_id, lines) {
+                    Ok(_) => CommandResponse::Scrolled,
+                    Err(error) => CommandResponse::Error {
+                        message: error.to_string(),
+                    },
+                },
+                None => CommandResponse::Error {
+                    message: format!("unknown session {session}"),
+                },
+            },
+            CommandRequest::ScrollPaneTo {
+                session,
+                window_id,
+                pane_id,
+                position,
+            } => match self.sessions.get(&session) {
+                Some(session) => match session.scroll_pane_to(window_id, pane_id, position) {
                     Ok(_) => CommandResponse::Scrolled,
                     Err(error) => CommandResponse::Error {
                         message: error.to_string(),
@@ -598,8 +775,20 @@ impl SessionStore {
                 },
             },
         };
-        self.persist_metadata();
-        response
+        if !(persist_requested || pruned || self.last_session != previous_last_session) {
+            return response;
+        }
+        match self.persist_metadata() {
+            Ok(()) => response,
+            Err(error) => match response {
+                CommandResponse::Error { message } => CommandResponse::Error {
+                    message: format!("{message}; additionally failed to persist state: {error}"),
+                },
+                _ => CommandResponse::Error {
+                    message: format!("command completed in memory but failed to persist state: {error}"),
+                },
+            },
+        }
     }
 
     fn next_window(&mut self) -> WindowId {
@@ -607,7 +796,28 @@ impl SessionStore {
         WindowId(self.next_window_id)
     }
 
-    fn prune_dead_sessions(&mut self) {
+    fn remove_workspace_mappings_for_session(&mut self, session: &str) -> bool {
+        let before = self.workspace_mappings.len();
+        self.workspace_mappings.retain(|_, mapped| mapped != session);
+        before != self.workspace_mappings.len()
+    }
+
+    fn next_session_name(&self) -> String {
+        let prefix = &self.config.defaults.session.name_prefix;
+        let mut suffix = 1_u64;
+        loop {
+            let candidate = format!("{prefix}-{suffix}");
+            if !self.sessions.contains_key(&candidate)
+                && !self.persisted_sessions.contains_key(&candidate)
+            {
+                return candidate;
+            }
+            suffix = suffix.saturating_add(1);
+        }
+    }
+
+    fn prune_dead_sessions(&mut self) -> bool {
+        let mut changed = false;
         let dead_sessions: Vec<_> = self
             .sessions
             .iter_mut()
@@ -616,15 +826,111 @@ impl SessionStore {
         for session in dead_sessions {
             self.sessions.remove(&session);
             self.persisted_sessions.remove(&session);
+            self.remove_workspace_mappings_for_session(&session);
+            changed = true;
         }
-        self.pending_switches.retain(|source, target| {
+        let pending_switches = self.pending_switches.len();
+        self.pending_switches.retain(|(source, _), target| {
             self.sessions.contains_key(source) && self.sessions.contains_key(target)
         });
+        changed |= self.pending_switches.len() != pending_switches;
+        let input_clients = self.input_clients.len();
+        self.input_clients.retain(|(session, _, _), lease| {
+            self.sessions.contains_key(session)
+                && lease.last_seen.elapsed() <= INPUT_CLIENT_LEASE
+        });
+        changed |= self.input_clients.len() != input_clients;
         if let Some(last) = self.last_session.as_ref()
             && !self.sessions.contains_key(last)
         {
             self.last_session = self.sessions.keys().next_back().cloned();
+            changed = true;
         }
+        changed
+    }
+
+    fn update_client_viewport(
+        &mut self,
+        session_name: &str,
+        viewport: ClientViewport,
+    ) -> Result<crate::pane::Rect> {
+        let now = Instant::now();
+        let rows = viewport.rows.max(1);
+        let cols = viewport.cols.max(1);
+        let leases = self
+            .client_viewports
+            .entry(session_name.to_string())
+            .or_default();
+        leases.retain(|_, lease| now.duration_since(lease.last_seen) <= CLIENT_VIEWPORT_LEASE);
+        leases.insert(
+            viewport.client_id,
+            ClientViewportLease {
+                rows,
+                cols,
+                last_seen: now,
+            },
+        );
+        let pty_rows = leases.values().map(|lease| lease.rows).max().unwrap_or(rows);
+        let pty_cols = leases.values().map(|lease| lease.cols).max().unwrap_or(cols);
+        let session = self
+            .sessions
+            .get_mut(session_name)
+            .ok_or_else(|| anyhow!("unknown session {session_name}"))?;
+        if session.rows != pty_rows || session.cols != pty_cols {
+            session.set_viewport(pty_rows, pty_cols)?;
+        }
+        Ok(session.pane_area_for_viewport(rows, cols))
+    }
+
+    fn register_input_client(&mut self, source: crate::ipc::SwitchSource, client_id: String) -> CommandResponse {
+        if client_id.is_empty() {
+            return CommandResponse::Error {
+                message: "client id cannot be empty".into(),
+            };
+        }
+        let Some(session) = self.sessions.get(&source.session) else {
+            return CommandResponse::Error {
+                message: format!("unknown session {}", source.session),
+            };
+        };
+        if !session.contains_window_pane(WindowId(source.window_id), PaneId(source.pane_id)) {
+            return CommandResponse::Error {
+                message: "unknown source pane".into(),
+            };
+        }
+        self.input_clients.insert(
+            (source.session, source.window_id, source.pane_id),
+            InputClientLease {
+                client_id,
+                last_seen: Instant::now(),
+            },
+        );
+        CommandResponse::InputRegistered
+    }
+
+    fn queue_nested_switch(&mut self, source: crate::ipc::SwitchSource, target: &str) {
+        let source_valid = self.sessions.get(&source.session).is_some_and(|session| {
+            session.contains_window_pane(WindowId(source.window_id), PaneId(source.pane_id))
+        });
+        if !source_valid {
+            return;
+        }
+        let key = (source.session.clone(), source.window_id, source.pane_id);
+        let Some(lease) = self.input_clients.get(&key) else {
+            return;
+        };
+        if lease.last_seen.elapsed() > INPUT_CLIENT_LEASE {
+            return;
+        }
+        self.pending_switches.insert(
+            (source.session, lease.client_id.clone()),
+            target.to_string(),
+        );
+    }
+
+    fn prune_due(&self) -> bool {
+        self.last_prune
+            .is_none_or(|last_prune| last_prune.elapsed() >= PRUNE_INTERVAL)
     }
 
     fn handle_hello(&self, version: ProtocolVersion) -> CommandResponse {
@@ -651,7 +957,10 @@ impl SessionStore {
             Some(_) => None,
             None => self
                 .last_session
-                .clone()
+                .as_ref()
+                .filter(|session| self.sessions.contains_key(*session))
+                .cloned()
+                .or_else(|| self.sessions.keys().next_back().cloned())
                 .or_else(|| self.persisted_sessions.keys().next_back().cloned()),
         }
     }
@@ -670,6 +979,99 @@ impl SessionStore {
             .collect()
     }
 
+    fn list_choose_tree(&self) -> Vec<ChooseTreeSession> {
+        self.list_session_summaries()
+            .into_iter()
+            .map(|session| {
+                let windows = self
+                    .list_windows_for_session(&session.name)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|window| {
+                        let panes = self
+                            .list_panes_for_session(
+                                &session.name,
+                                Some(WindowId(window.id)),
+                            )
+                            .unwrap_or_default();
+                        ChooseTreeWindow { window, panes }
+                    })
+                    .collect();
+                ChooseTreeSession {
+                    name: session.name,
+                    stale: session.stale,
+                    windows,
+                }
+            })
+            .collect()
+    }
+
+    fn list_windows_for_session(&self, session_name: &str) -> Option<Vec<crate::window::WindowSummary>> {
+        if let Some(session) = self.sessions.get(session_name) {
+            return Some(session.list_windows());
+        }
+        let session = self.persisted_sessions.get(session_name)?;
+        Some(
+            session
+                .window_order
+                .iter()
+                .enumerate()
+                .filter_map(|(index, id)| {
+                    let window = session.windows.get(id)?;
+                    Some(crate::window::WindowSummary::new(
+                        *id,
+                        self.numbering()
+                            .public_window_number(index)
+                            .unwrap_or(index as u64),
+                        window.name.clone(),
+                        *id == session.active_window,
+                        Some(*id) == session.last_window,
+                    ))
+                })
+                .collect(),
+        )
+    }
+
+    fn list_panes_for_session(
+        &self,
+        session_name: &str,
+        window_id: Option<WindowId>,
+    ) -> Option<Vec<PaneSummary>> {
+        if let Some(session) = self.sessions.get(session_name) {
+            return Some(session.list_panes(window_id));
+        }
+        let session = self.persisted_sessions.get(session_name)?;
+        let window_id = window_id.unwrap_or(session.active_window);
+        Some(
+            session
+                .windows
+                .get(&window_id)
+                .map(|window| {
+                    window
+                        .layout
+                        .panes()
+                        .into_iter()
+                        .filter_map(|pane_id| {
+                            let pane = window.panes.get(&pane_id)?;
+                            Some(PaneSummary {
+                                id: self
+                                    .numbering()
+                                    .public_pane_number(pane.id)
+                                    .unwrap_or(pane.id.0),
+                                title: pane.title.clone(),
+                                active: pane_id == window.layout.active,
+                                window_id: self
+                                    .numbering()
+                                    .public_window_id(window.id, &session.window_order)
+                                    .unwrap_or(window.id.0),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        )
+    }
+
     fn list_buffer_summaries(&self) -> Vec<BufferSummary> {
         self.buffers
             .summaries()
@@ -682,22 +1084,23 @@ impl SessionStore {
             .collect()
     }
 
-    fn persist_metadata(&mut self) {
+    fn persist_metadata(&mut self) -> Result<()> {
         for (name, session) in &self.sessions {
             self.persisted_sessions
                 .insert(name.clone(), PersistedSession::from_live(session));
         }
         let Some(path) = self.state_path.as_ref() else {
-            return;
+            return Ok(());
         };
         let state = PersistedState {
+            schema_version: crate::persistence::STATE_SCHEMA_VERSION,
             last_session: self.last_session.clone(),
             next_window_id: self.next_window_id,
-            buffers: self.buffers.snapshot(),
+            buffers: Vec::new(),
             workspaces: self.workspace_mappings.clone(),
             sessions: self.persisted_sessions.clone(),
         };
-        let _ = save_state(path, &state);
+        save_state(path, &state)
     }
 
     fn split_pane(
@@ -709,18 +1112,31 @@ impl SessionStore {
         let command = self.effective_command(command);
         match self.sessions.get_mut(&target.session) {
             Some(session) => {
-                if let Some(window) = target.window {
-                    session.active_window = window;
-                }
-                if let Some(pane) = target.pane {
-                    let _ = session.select_pane(target.window, pane);
-                }
-                match session.split_active_pane(axis, &command) {
-                    Ok(split) => CommandResponse::PaneSplit {
-                        session: session.name.clone(),
-                        window_id: split.window_id.0,
-                        pane_id: split.pane_id.0,
-                    },
+                let window_id = target.window.unwrap_or(session.active_window);
+                match session.split_pane_in_window(
+                    window_id,
+                    target.pane,
+                    axis,
+                    500,
+                    None,
+                    &command,
+                ) {
+                    Ok(split) => {
+                        // A successful split becomes the active pane in its
+                        // target window; only now make that window visible.
+                        session.active_window = split.window_id;
+                        CommandResponse::PaneSplit {
+                            session: session.name.clone(),
+                            window_id: session
+                                .numbering
+                                .public_window_id(split.window_id, &session.window_order)
+                                .unwrap_or(split.window_id.0),
+                            pane_id: session
+                                .numbering
+                                .public_pane_number(split.pane_id)
+                                .unwrap_or(split.pane_id.0),
+                        }
+                    }
                     Err(error) => CommandResponse::Error {
                         message: error.to_string(),
                     },
@@ -738,7 +1154,21 @@ impl SessionStore {
         direction: Option<NavigationDirection>,
     ) -> CommandResponse {
         match (target, direction) {
-            (Some(target), _) => match parse_target(&target) {
+            (Some(target), Some(direction)) => match self.parse_target(&target) {
+                Ok(target) => match self.sessions.get_mut(&target.session) {
+                    Some(session) => match session.move_focus(direction, session.pane_area()) {
+                        Ok(()) => CommandResponse::FocusChanged,
+                        Err(error) => CommandResponse::Error {
+                            message: error.to_string(),
+                        },
+                    },
+                    None => CommandResponse::Error {
+                        message: format!("unknown session {}", target.session),
+                    },
+                },
+                Err(message) => CommandResponse::Error { message },
+            },
+            (Some(target), None) => match self.parse_target(&target) {
                 Ok(target) => match self.sessions.get_mut(&target.session) {
                     Some(session) => match target.pane {
                         Some(pane_id) => match session.select_pane(target.window, pane_id) {
@@ -758,21 +1188,9 @@ impl SessionStore {
                 Err(message) => CommandResponse::Error { message },
             },
             (None, Some(direction)) => {
-                let Some(session_name) = self.last_session.clone() else {
-                    return CommandResponse::Error {
-                        message: "no sessions available".into(),
-                    };
-                };
-                match self.sessions.get_mut(&session_name) {
-                    Some(session) => match session.move_focus(direction, session.pane_area()) {
-                        Ok(_) => CommandResponse::FocusChanged,
-                        Err(error) => CommandResponse::Error {
-                            message: error.to_string(),
-                        },
-                    },
-                    None => CommandResponse::Error {
-                        message: format!("unknown session {session_name}"),
-                    },
+                let _ = direction;
+                CommandResponse::Error {
+                    message: "directional select-pane requires a session target".into(),
                 }
             }
             _ => CommandResponse::Error {
@@ -802,23 +1220,43 @@ impl SessionStore {
 
     fn kill_pane(&mut self, target: TargetRef) -> CommandResponse {
         match self.sessions.get_mut(&target.session) {
-            Some(session) => match session.kill_pane(target.window, target.pane) {
-                Ok(Some(killed)) => CommandResponse::PaneKilled {
-                    session: session.name.clone(),
-                    window_id: killed.window_id.0,
-                    pane_id: killed.pane_id.0,
-                },
-                Ok(None) => {
-                    if !session.is_alive() {
-                        self.sessions.remove(&target.session);
-                        self.persisted_sessions.remove(&target.session);
+            Some(session) => {
+                let window_id = target.window.unwrap_or(session.active_window);
+                match session.kill_pane(target.window, target.pane) {
+                    Ok(Some(killed)) => CommandResponse::PaneKilled {
+                        session: session.name.clone(),
+                        window_id: session
+                            .numbering
+                            .public_window_id(killed.window_id, &session.window_order)
+                            .unwrap_or(killed.window_id.0),
+                        pane_id: session
+                            .numbering
+                            .public_pane_number(killed.pane_id)
+                            .unwrap_or(killed.pane_id.0),
+                    },
+                    Ok(None) => {
+                        if !session.is_alive() {
+                            self.sessions.remove(&target.session);
+                            self.persisted_sessions.remove(&target.session);
+                            self.remove_workspace_mappings_for_session(&target.session);
+                            CommandResponse::SessionKilled {
+                                session: target.session,
+                            }
+                        } else {
+                            CommandResponse::WindowKilled {
+                                session: session.name.clone(),
+                                window_id: session
+                                    .numbering
+                                    .public_window_id(window_id, &session.window_order)
+                                    .unwrap_or(window_id.0),
+                            }
+                        }
                     }
-                    CommandResponse::FocusChanged
+                    Err(error) => CommandResponse::Error {
+                        message: error.to_string(),
+                    },
                 }
-                Err(error) => CommandResponse::Error {
-                    message: error.to_string(),
-                },
-            },
+            }
             None => CommandResponse::Error {
                 message: format!("unknown session {}", target.session),
             },
@@ -833,6 +1271,7 @@ impl SessionStore {
                         if !still_alive {
                             self.sessions.remove(&target.session);
                             self.persisted_sessions.remove(&target.session);
+                            self.remove_workspace_mappings_for_session(&target.session);
                         }
                         CommandResponse::WindowKilled {
                             session: target.session,
@@ -854,6 +1293,11 @@ impl SessionStore {
     }
 
     fn rename_window(&mut self, target: TargetRef, name: String) -> CommandResponse {
+        if let Err(error) = validate_window_name(&name) {
+            return CommandResponse::Error {
+                message: error.to_string(),
+            };
+        }
         match self.sessions.get_mut(&target.session) {
             Some(session) => {
                 if let Some(window_id) = target.window {
@@ -883,17 +1327,17 @@ impl SessionStore {
         switch_from: Option<crate::ipc::SwitchSource>,
     ) -> CommandResponse {
         let manifest_key = workspace.manifest_key.clone();
-        if rebuild && let Some(existing) = self.workspace_mappings.get(&manifest_key).cloned() {
-            if let Some(session) = self.sessions.remove(&existing) {
-                let _ = session.kill();
-            }
-            self.persisted_sessions.remove(&existing);
+        let session_name = workspace.spec.name.clone();
+        if let Err(error) = validate_session_name(&session_name) {
+            return CommandResponse::Error {
+                message: error.to_string(),
+            };
         }
-
         if let Some(existing) = self.workspace_mappings.get(&manifest_key).cloned()
             && self.sessions.get(&existing).is_some_and(|session| {
                 session.workspace_manifest.as_deref() == Some(manifest_key.as_str())
             })
+            && !rebuild
         {
             self.last_session = Some(existing.clone());
             return CommandResponse::WorkspaceReady {
@@ -902,10 +1346,12 @@ impl SessionStore {
             };
         }
 
-        let session_name = workspace.spec.name.clone();
-        if self.sessions.contains_key(&session_name)
+        let replacing = rebuild
+            .then(|| self.workspace_mappings.get(&manifest_key).cloned())
+            .flatten();
+        if (self.sessions.contains_key(&session_name)
             || self.persisted_sessions.contains_key(&session_name)
-        {
+        ) && replacing.as_deref() != Some(session_name.as_str()) {
             return CommandResponse::Error {
                 message: format!(
                     "session {session_name} already exists; set [workspace].name to a unique value or use --rebuild"
@@ -913,30 +1359,47 @@ impl SessionStore {
             };
         }
 
+        let next_window_id = self.next_window_id;
         match self.create_workspace_session(&workspace, !rebuild) {
-            Ok(()) => {
+            Ok(session) => {
+                if let Some(existing) = replacing {
+                    if let Some(previous) = self.sessions.get(&existing)
+                        && let Err(error) = previous.kill()
+                    {
+                        let cleanup = session.kill();
+                        return CommandResponse::Error {
+                            message: match cleanup {
+                                Ok(()) => format!(
+                                    "failed to shut down existing workspace session {existing}: {error}"
+                                ),
+                                Err(cleanup_error) => format!(
+                                    "failed to shut down existing workspace session {existing}: {error}; additionally failed to clean up replacement: {cleanup_error}"
+                                ),
+                            },
+                        };
+                    }
+                    self.sessions.remove(&existing);
+                    self.persisted_sessions.remove(&existing);
+                    self.remove_workspace_mappings_for_session(&existing);
+                }
+                self.sessions.insert(session.name.clone(), session);
                 self.workspace_mappings
                     .insert(manifest_key.clone(), session_name.clone());
                 self.last_session = Some(session_name.clone());
-                if let Some(source) = switch_from
-                    && self.sessions.get(&source.session).is_some_and(|session| {
-                        session.contains_window_pane(
-                            WindowId(source.window_id),
-                            PaneId(source.pane_id),
-                        )
-                    })
-                {
-                    self.pending_switches
-                        .insert(source.session, session_name.clone());
+                if let Some(source) = switch_from {
+                    self.queue_nested_switch(source, &session_name);
                 }
                 CommandResponse::WorkspaceReady {
                     session: session_name,
                     created: true,
                 }
             }
-            Err(error) => CommandResponse::Error {
-                message: error.to_string(),
-            },
+            Err(error) => {
+                self.next_window_id = next_window_id;
+                CommandResponse::Error {
+                    message: error.to_string(),
+                }
+            }
         }
     }
 
@@ -944,7 +1407,7 @@ impl SessionStore {
         &mut self,
         workspace: &WorkspaceLoad,
         use_snapshot: bool,
-    ) -> Result<()> {
+    ) -> Result<Session> {
         let first_window_id = self.next_window();
         let first_window =
             workspace.spec.windows.first().ok_or_else(|| {
@@ -952,10 +1415,13 @@ impl SessionStore {
             })?;
         let root_seed = use_snapshot
             .then(|| {
+                let first_window_public = self.numbering().public_window_number(0).ok()?;
                 workspace
                     .snapshot
                     .as_ref()
-                    .and_then(|snapshot| snapshot.pane(0, 0))
+                    .and_then(|snapshot| {
+                        snapshot.pane(first_window_public as usize, self.config.behavior.pane_base)
+                    })
                     .map(|pane| crate::pty::PaneRestoreSeed {
                         rows: pane.rows,
                         cols: pane.cols,
@@ -971,50 +1437,77 @@ impl SessionStore {
             first_window_id,
             self.config.behavior.default_shell.clone(),
             self.config.behavior.scrollback_lines,
+            self.numbering(),
             self.config.defaults.window.clone(),
             self.helper_dir.clone(),
             root_seed,
         )?;
         session.cwd = Some(workspace.spec.cwd.clone());
-        session.rename_active_window(first_window.name.clone())?;
-        self.apply_workspace_window(&mut session, first_window_id, first_window, workspace, 0)?;
-
-        for (window_index, window) in workspace.spec.windows.iter().enumerate().skip(1) {
-            let window_id = self.next_window();
-            let root_seed = use_snapshot
-                .then(|| {
-                    workspace
-                        .snapshot
-                        .as_ref()
-                        .and_then(|snapshot| snapshot.pane(window_index, 0))
-                        .map(|pane| crate::pty::PaneRestoreSeed {
-                            rows: pane.rows,
-                            cols: pane.cols,
-                            vt: pane.vt.clone(),
-                        })
-                })
-                .flatten();
-            session.new_window_with_cwd_and_restore(
-                window_id,
-                Some(window.name.clone()),
-                Some(window.cwd.clone()),
-                &window.root.command,
-                root_seed,
+        let construction = (|| {
+            session.rename_active_window(first_window.name.clone())?;
+            self.apply_workspace_window(
+                &mut session,
+                first_window_id,
+                first_window,
+                workspace,
+                0,
+                use_snapshot,
             )?;
-            session.select_window(window_id)?;
-            self.apply_workspace_window(&mut session, window_id, window, workspace, window_index)?;
-        }
 
-        if let Some(window_id) = session
-            .window_order
-            .get(workspace.spec.active_window)
-            .copied()
-        {
-            session.select_window(window_id)?;
-        }
+            for (window_index, window) in workspace.spec.windows.iter().enumerate().skip(1) {
+                let window_id = self.next_window();
+                let root_seed = use_snapshot
+                    .then(|| {
+                        let window_public = self.numbering().public_window_number(window_index).ok()?;
+                        workspace
+                            .snapshot
+                            .as_ref()
+                            .and_then(|snapshot| {
+                                snapshot.pane(window_public as usize, self.config.behavior.pane_base)
+                            })
+                            .map(|pane| crate::pty::PaneRestoreSeed {
+                                rows: pane.rows,
+                                cols: pane.cols,
+                                vt: pane.vt.clone(),
+                            })
+                    })
+                    .flatten();
+                session.new_window_with_cwd_and_restore(
+                    window_id,
+                    Some(window.name.clone()),
+                    Some(window.cwd.clone()),
+                    &window.root.command,
+                    root_seed,
+                )?;
+                session.select_window(window_id)?;
+                self.apply_workspace_window(
+                    &mut session,
+                    window_id,
+                    window,
+                    workspace,
+                    window_index,
+                    use_snapshot,
+                )?;
+            }
 
-        self.sessions.insert(session.name.clone(), session);
-        Ok(())
+            if let Some(window_id) = session
+                .window_order
+                .get(workspace.spec.active_window)
+                .copied()
+            {
+                session.select_window(window_id)?;
+            }
+            Ok(())
+        })();
+        match construction {
+            Ok(()) => Ok(session),
+            Err(error) => match session.kill() {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(error.context(format!(
+                    "additionally failed to clean up partial workspace session: {cleanup_error}"
+                ))),
+            },
+        }
     }
 
     fn apply_workspace_window(
@@ -1024,18 +1517,30 @@ impl SessionStore {
         window: &crate::workspace::WorkspaceWindowSpec,
         workspace: &WorkspaceLoad,
         window_index: usize,
+        use_snapshot: bool,
     ) -> Result<()> {
         session.select_window(window_id)?;
         for (split_index, split) in window.splits.iter().enumerate() {
-            let restore_seed = workspace
-                .snapshot
-                .as_ref()
-                .and_then(|snapshot| snapshot.pane(window_index, (split_index + 1) as u64))
-                .map(|pane| crate::pty::PaneRestoreSeed {
-                    rows: pane.rows,
-                    cols: pane.cols,
-                    vt: pane.vt.clone(),
-                });
+            let window_public = self.numbering().public_window_number(window_index).ok();
+            let pane_public = self
+                .numbering()
+                .public_pane_number(PaneId((split_index + 1) as u64))
+                .ok();
+            let restore_seed = if use_snapshot {
+                workspace
+                    .snapshot
+                    .as_ref()
+                    .and_then(|snapshot| {
+                        snapshot.pane(window_public? as usize, pane_public?)
+                    })
+                    .map(|pane| crate::pty::PaneRestoreSeed {
+                        rows: pane.rows,
+                        cols: pane.cols,
+                        vt: pane.vt.clone(),
+                    })
+            } else {
+                None
+            };
             session.split_pane_in_window_with_restore(
                 window_id,
                 Some(PaneId(split.target)),
@@ -1046,12 +1551,23 @@ impl SessionStore {
                 restore_seed,
             )?;
         }
-        let active_pane = workspace
-            .snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.active_pane(window_index))
-            .unwrap_or(window.active_pane);
-        session.select_pane(Some(window_id), PaneId(active_pane))?;
+        let active_pane = if use_snapshot {
+            workspace
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| {
+                    self.numbering()
+                        .public_window_number(window_index)
+                        .ok()
+                        .and_then(|window_public| snapshot.active_pane(window_public as usize))
+                })
+                .map(|public| self.numbering().parse_public_pane_number(public))
+                .transpose()?
+        } else {
+            None
+        }
+        .unwrap_or(PaneId(window.active_pane));
+        session.select_pane(Some(window_id), active_pane)?;
         Ok(())
     }
 
@@ -1075,6 +1591,73 @@ impl SessionStore {
                 message: error.to_string(),
             },
         }
+    }
+
+    fn numbering(&self) -> Numbering {
+        Numbering {
+            window_base: self.config.behavior.window_base,
+            pane_base: self.config.behavior.pane_base,
+        }
+    }
+
+    fn parse_target(&self, target: &str) -> Result<TargetRef, String> {
+        let (session, rest) = target
+            .split_once(':')
+            .map_or((target, None), |(session, rest)| (session, Some(rest)));
+        if session.is_empty() {
+            return Err("target requires a session name".into());
+        }
+
+        let numbering = self.numbering();
+        let empty_order: Vec<WindowId> = Vec::new();
+        let window_order = if let Some(runtime) = self.sessions.get(session) {
+            runtime.window_order.as_slice()
+        } else if let Some(persisted) = self.persisted_sessions.get(session) {
+            persisted.window_order.as_slice()
+        } else {
+            empty_order.as_slice()
+        };
+
+        let (window, pane) = match rest {
+            Some(rest) => {
+                let (window, pane) = rest
+                    .split_once('.')
+                    .map_or((rest, None), |(window, pane)| (window, Some(pane)));
+                let window = if window.is_empty() {
+                    None
+                } else {
+                    let public = window
+                        .parse::<u64>()
+                        .map_err(|_| format!("invalid window id in target {target}"))?;
+                    Some(
+                        numbering
+                            .parse_public_window_id(public, window_order)
+                            .map_err(|error| error.to_string())?,
+                    )
+                };
+                let pane = match pane {
+                    Some(value) if !value.is_empty() => {
+                        let public = value
+                            .parse::<u64>()
+                            .map_err(|_| format!("invalid pane id in target {target}"))?;
+                        Some(
+                            numbering
+                                .parse_public_pane_number(public)
+                                .map_err(|error| error.to_string())?,
+                        )
+                    }
+                    _ => None,
+                };
+                (window, pane)
+            }
+            None => (None, None),
+        };
+
+        Ok(TargetRef {
+            session: session.into(),
+            window,
+            pane,
+        })
     }
 
     fn effective_command(&self, command: Vec<String>) -> Vec<String> {
@@ -1108,90 +1691,147 @@ impl SessionStore {
 
 pub fn serve(socket_path: &Path, state_path: &Path, config_path: &Path) -> Result<()> {
     if let Some(parent) = socket_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create socket directory {}", parent.display()))?;
+        ensure_private_directory(parent, "socket")?;
     }
+    let _daemon_lock = acquire_daemon_lock(socket_path)?;
     let helper_dir = socket_path
         .parent()
         .map(|parent| parent.join("panes"))
         .unwrap_or_else(|| PathBuf::from("/tmp/admux-panes"));
-    fs::create_dir_all(&helper_dir)
-        .with_context(|| format!("failed to create helper directory {}", helper_dir.display()))?;
+    ensure_private_directory(&helper_dir, "helper")?;
     if socket_path.exists() {
-        fs::remove_file(socket_path)
-            .with_context(|| format!("failed to remove stale socket {}", socket_path.display()))?;
+        match UnixStream::connect(socket_path) {
+            Ok(_) => bail!("admuxd is already serving {}", socket_path.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                fs::remove_file(socket_path).with_context(|| {
+                    format!("failed to remove stale socket {}", socket_path.display())
+                })?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "refusing to remove unreachable socket {}",
+                        socket_path.display()
+                    )
+                });
+            }
+        }
     }
 
     let listener = UnixListener::bind(socket_path)
         .with_context(|| format!("failed to bind socket {}", socket_path.display()))?;
+    fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600)).with_context(|| {
+        format!("failed to restrict daemon socket permissions {}", socket_path.display())
+    })?;
     let state = Arc::new(Mutex::new(SessionStore::with_paths(
         state_path.to_path_buf(),
         config_path.to_path_buf(),
         helper_dir,
     )?));
     for stream in listener.incoming() {
-        let mut stream = stream.context("failed to accept client")?;
-        let response = {
-            let request = read_request(&mut stream)?;
-            let mut state = state.lock().expect("session store lock poisoned");
-            state.handle(request)
+        let stream = match stream {
+            Ok(stream) => stream,
+            Err(error) => {
+                eprintln!("admuxd: failed to accept client: {error:#}");
+                thread::sleep(Duration::from_millis(25));
+                continue;
+            }
         };
-        write_response(&mut stream, &response)?;
+        let state = Arc::clone(&state);
+        thread::spawn(move || handle_client(stream, state));
     }
 
     bail!("listener stopped unexpectedly")
 }
 
-fn parse_target(target: &str) -> Result<TargetRef, String> {
-    let (session, rest) = target
-        .split_once(':')
-        .map_or((target, None), |(session, rest)| (session, Some(rest)));
-    if session.is_empty() {
-        return Err("target requires a session name".into());
+fn ensure_private_directory(path: &Path, kind: &str) -> Result<()> {
+    let existed = path.exists();
+    fs::create_dir_all(path)
+        .with_context(|| format!("failed to create {kind} directory {}", path.display()))?;
+    if !existed {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).with_context(|| {
+            format!("failed to restrict {kind} directory permissions {}", path.display())
+        })?;
     }
-    let (window, pane) = match rest {
-        Some(rest) => {
-            let (window, pane) = rest
-                .split_once('.')
-                .map_or((rest, None), |(window, pane)| (window, Some(pane)));
-            let window = if window.is_empty() {
-                None
-            } else {
-                Some(
-                    window
-                        .parse::<u64>()
-                        .map(WindowId)
-                        .map_err(|_| format!("invalid window id in target {target}"))?,
-                )
-            };
-            let pane = match pane {
-                Some(value) if !value.is_empty() => Some(
-                    value
-                        .parse::<u64>()
-                        .map(PaneId)
-                        .map_err(|_| format!("invalid pane id in target {target}"))?,
-                ),
-                _ => None,
-            };
-            (window, pane)
-        }
-        None => (None, None),
-    };
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("failed to inspect {kind} directory {}", path.display()))?;
+    if !metadata.is_dir() {
+        bail!("{kind} path {} is not a directory", path.display());
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        bail!("refusing {kind} directory not owned by the effective user: {}", path.display());
+    }
+    if metadata.mode() & 0o077 != 0 {
+        bail!("refusing non-private {kind} directory {}", path.display());
+    }
+    Ok(())
+}
 
-    Ok(TargetRef {
-        session: session.into(),
-        window,
-        pane,
-    })
+fn acquire_daemon_lock(socket_path: &Path) -> Result<fs::File> {
+    let lock_path = socket_path.with_extension("lock");
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open daemon lock {}", lock_path.display()))?;
+    lock.set_permissions(fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to restrict permissions on {}", lock_path.display()))?;
+    // SAFETY: the returned file remains open for the daemon's entire lifetime.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            bail!("admuxd is already starting or serving {}", socket_path.display());
+        }
+        return Err(error).with_context(|| format!("failed to lock {}", lock_path.display()));
+    }
+    Ok(lock)
+}
+
+fn handle_client(mut stream: UnixStream, state: Arc<Mutex<SessionStore>>) {
+        if let Err(error) = configure_ipc_stream(&stream) {
+            eprintln!("admuxd: failed to configure client stream: {error:#}");
+            return;
+        }
+        let response = {
+            let request = match read_request(&mut stream) {
+                Ok(request) => request,
+                Err(error) => {
+                    eprintln!("admuxd: rejected client request: {error:#}");
+                    return;
+                }
+            };
+            let mut state = state.lock().expect("session store lock poisoned");
+            state.handle(request)
+        };
+        if let Err(error) = write_response(&mut stream, &response) {
+            eprintln!("admuxd: failed to write client response: {error:#}");
+        }
 }
 
 fn read_request(stream: &mut UnixStream) -> Result<CommandRequest> {
-    let mut payload = Vec::new();
-    stream
-        .read_to_end(&mut payload)
-        .context("failed to read request payload")?;
+    let payload = read_limited(stream, MAX_IPC_MESSAGE_BYTES, "request")?;
     let request = serde_json::from_slice(&payload).context("failed to decode request")?;
     Ok(request)
+}
+
+fn configure_ipc_stream(stream: &UnixStream) -> Result<()> {
+    stream.set_read_timeout(Some(IPC_TIMEOUT))?;
+    stream.set_write_timeout(Some(IPC_TIMEOUT))?;
+    Ok(())
+}
+
+fn read_limited(stream: &mut UnixStream, limit: u64, kind: &str) -> Result<Vec<u8>> {
+    let mut payload = Vec::new();
+    (&mut *stream)
+        .take(limit + 1)
+        .read_to_end(&mut payload)
+        .with_context(|| format!("failed to read {kind} payload"))?;
+    if payload.len() as u64 > limit {
+        bail!("{kind} payload exceeds {limit} byte limit");
+    }
+    Ok(payload)
 }
 
 fn write_response(stream: &mut UnixStream, response: &CommandResponse) -> Result<()> {
@@ -1202,6 +1842,20 @@ fn write_response(stream: &mut UnixStream, response: &CommandResponse) -> Result
     Ok(())
 }
 
+fn read_buffer_file(path: &Path) -> Result<String> {
+    let file = fs::File::open(path)
+        .with_context(|| format!("failed to open buffer file {}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_BUFFER_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read buffer file {}", path.display()))?;
+    if bytes.len() > MAX_BUFFER_BYTES {
+        bail!("buffer file exceeds the {MAX_BUFFER_BYTES} byte limit");
+    }
+    String::from_utf8(bytes)
+        .with_context(|| format!("buffer file {} is not valid UTF-8", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1209,7 +1863,118 @@ mod tests {
         ipc::{CommandRequest, SwitchSource},
         layout::SplitAxis,
     };
-    use tempfile::tempdir;
+    use tempfile::{TempDir, tempdir as make_tempdir};
+
+    fn tempdir() -> TempDir {
+        make_tempdir().expect("tempdir")
+    }
+
+    #[test]
+    fn daemon_lock_rejects_a_second_startup() {
+        let dir = tempdir();
+        let socket = dir.path().join("socket");
+        let first = acquire_daemon_lock(&socket).expect("acquire first daemon lock");
+        assert!(acquire_daemon_lock(&socket).is_err());
+        drop(first);
+        assert!(acquire_daemon_lock(&socket).is_ok());
+    }
+
+    #[test]
+    fn removing_a_session_removes_its_workspace_mapping() {
+        let mut store = SessionStore::default();
+        store
+            .workspace_mappings
+            .insert("/work/admux.toml".into(), "work".into());
+        store
+            .workspace_mappings
+            .insert("/other/admux.toml".into(), "other".into());
+
+        assert!(store.remove_workspace_mappings_for_session("work"));
+        assert_eq!(
+            store.workspace_mappings,
+            BTreeMap::from([("/other/admux.toml".into(), "other".into())])
+        );
+        assert!(!store.remove_workspace_mappings_for_session("missing"));
+    }
+
+    #[test]
+    fn oversized_buffer_files_are_rejected_before_loading() {
+        let dir = tempdir();
+        let path = dir.path().join("oversized.txt");
+        fs::write(&path, vec![b'x'; MAX_BUFFER_BYTES + 1]).expect("write oversized buffer");
+        let error = read_buffer_file(&path).expect_err("reject oversized file");
+        assert!(error.to_string().contains("byte limit"));
+    }
+
+    #[test]
+    fn failed_rebuild_keeps_the_existing_workspace_session() {
+        let helper_dir = tempdir();
+        let mut store = SessionStore::default();
+        store.helper_dir = helper_dir.path().join("helpers");
+        let manifest_key = helper_dir.path().join("admux.toml").display().to_string();
+        let created = store.handle(CommandRequest::NewSession {
+            name: Some("work".into()),
+            cwd: Some(helper_dir.path().to_path_buf()),
+            command: vec!["sh".into()],
+            switch_from: None,
+        });
+        assert!(matches!(created, CommandResponse::SessionCreated { .. }));
+        store
+            .sessions
+            .get_mut("work")
+            .expect("existing session")
+            .workspace_manifest = Some(manifest_key.clone());
+        store
+            .workspace_mappings
+            .insert(manifest_key.clone(), "work".into());
+
+        let workspace = WorkspaceLoad {
+            manifest_key: manifest_key.clone(),
+            manifest_digest: "test".into(),
+            spec: crate::workspace::WorkspaceSpec {
+                manifest_path: helper_dir.path().join("admux.toml"),
+                manifest_dir: helper_dir.path().to_path_buf(),
+                name: "work".into(),
+                cwd: helper_dir.path().to_path_buf(),
+                active_window: 0,
+                windows: vec![crate::workspace::WorkspaceWindowSpec {
+                    name: "editor".into(),
+                    cwd: helper_dir.path().to_path_buf(),
+                    active_pane: 0,
+                    root: crate::workspace::WorkspacePaneSpec {
+                        cwd: helper_dir.path().to_path_buf(),
+                        command: vec!["sh".into()],
+                    },
+                    splits: vec![crate::workspace::WorkspaceSplitSpec {
+                        target: 99,
+                        direction: SplitAxis::Vertical,
+                        ratio: 500,
+                        pane: crate::workspace::WorkspacePaneSpec {
+                            cwd: helper_dir.path().to_path_buf(),
+                            command: vec!["sh".into()],
+                        },
+                    }],
+                }],
+            },
+            snapshot: None,
+        };
+
+        assert!(matches!(
+            store.up_workspace(workspace, true, None),
+            CommandResponse::Error { .. }
+        ));
+        assert!(store.sessions.contains_key("work"));
+        assert_eq!(
+            store.workspace_mappings.get(&manifest_key),
+            Some(&"work".to_string())
+        );
+        store
+            .sessions
+            .get("work")
+            .expect("preserved session")
+            .kill()
+            .expect("clean up session");
+    }
 
     #[test]
     fn store_creates_and_lists_sessions() {
@@ -1224,7 +1989,7 @@ mod tests {
             created,
             CommandResponse::SessionCreated {
                 session,
-                pane_id: 0
+                pane_id: 1
             } if session == "work"
         ));
 
@@ -1238,6 +2003,151 @@ mod tests {
                 }]
             }
         );
+    }
+
+    #[test]
+    fn choose_tree_snapshot_contains_windows_and_panes_in_one_response() {
+        let helper_dir = tempdir();
+        let mut store = SessionStore::default();
+        store.helper_dir = helper_dir.path().join("helpers");
+        assert!(matches!(
+            store.handle(CommandRequest::NewSession {
+                name: Some("work".into()),
+                cwd: Some(helper_dir.path().to_path_buf()),
+                command: vec!["sleep".into(), "30".into()],
+                switch_from: None,
+            }),
+            CommandResponse::SessionCreated { .. }
+        ));
+
+        let tree = store.handle(CommandRequest::ListChooseTree);
+
+        assert!(matches!(
+            tree,
+            CommandResponse::ChooseTreeList { ref sessions }
+                if sessions.len() == 1
+                    && sessions[0].name == "work"
+                    && !sessions[0].stale
+                    && sessions[0].windows.len() == 1
+                    && sessions[0].windows[0].window.name == "sleep"
+                    && sessions[0].windows[0].panes.len() == 1
+        ), "actual tree: {tree:?}");
+        store
+            .sessions
+            .get("work")
+            .expect("created session")
+            .kill()
+            .expect("clean up session");
+    }
+
+    #[test]
+    fn duplicate_session_creation_preserves_the_existing_session() {
+        let mut store = SessionStore::default();
+        let request = |command| CommandRequest::NewSession {
+            name: Some("work".into()),
+            cwd: None,
+            command,
+            switch_from: None,
+        };
+
+        assert!(matches!(
+            store.handle(request(vec!["sh".into()])),
+            CommandResponse::SessionCreated { .. }
+        ));
+        assert!(matches!(
+            store.handle(request(vec!["definitely-not-a-command".into()])),
+            CommandResponse::Error { ref message } if message == "session work already exists"
+        ));
+        assert!(store.sessions.contains_key("work"));
+    }
+
+    #[test]
+    fn session_creation_rejects_empty_control_and_overlong_names() {
+        let mut store = SessionStore::default();
+        for name in [" ".into(), "bad\nname".into(), "x".repeat(65)] {
+            assert!(matches!(
+                store.handle(CommandRequest::NewSession {
+                    name: Some(name),
+                    cwd: None,
+                    command: vec!["sh".into()],
+                    switch_from: None,
+                }),
+                CommandResponse::Error { .. }
+            ));
+        }
+        assert!(store.sessions.is_empty());
+    }
+
+    #[test]
+    fn automatic_session_names_skip_existing_names() {
+        let mut store = SessionStore::default();
+        for name in ["session-2", "session-1"] {
+            assert!(matches!(
+                store.handle(CommandRequest::NewSession {
+                    name: Some(name.into()),
+                    cwd: None,
+                    command: vec!["sh".into()],
+                    switch_from: None,
+                }),
+                CommandResponse::SessionCreated { .. }
+            ));
+        }
+        assert!(matches!(
+            store.handle(CommandRequest::NewSession {
+                name: None,
+                cwd: None,
+                command: vec!["sh".into()],
+                switch_from: None,
+            }),
+            CommandResponse::SessionCreated { ref session, .. } if session == "session-3"
+        ));
+    }
+
+    #[test]
+    fn failed_window_creation_does_not_consume_a_window_id() {
+        let mut store = SessionStore::default();
+        assert_eq!(store.next_window_id, 0);
+
+        assert!(matches!(
+            store.handle(CommandRequest::NewWindow {
+                session: "missing".into(),
+                name: None,
+                command: vec!["sh".into()],
+            }),
+            CommandResponse::Error { .. }
+        ));
+
+        assert_eq!(store.next_window_id, 0);
+    }
+
+    #[test]
+    fn invalid_split_target_does_not_change_focus_or_create_a_pane() {
+        let mut store = SessionStore::default();
+        assert!(matches!(
+            store.handle(CommandRequest::NewSession {
+                name: Some("work".into()),
+                cwd: None,
+                command: vec!["sh".into()],
+                switch_from: None,
+            }),
+            CommandResponse::SessionCreated { .. }
+        ));
+        let before = store.sessions.get("work").expect("session");
+        let active_window = before.active_window;
+        let pane_count = before.windows[&active_window].panes.len();
+
+        assert!(matches!(
+            store.handle(CommandRequest::SplitPane {
+                target: "work:1.99".into(),
+                axis: SplitAxis::Vertical,
+                command: vec!["sh".into()],
+            }),
+            CommandResponse::Error { .. }
+        ));
+
+        let after = store.sessions.get("work").expect("session");
+        assert_eq!(after.active_window, active_window);
+        assert_eq!(after.windows[&active_window].panes.len(), pane_count);
     }
 
     #[test]
@@ -1280,6 +2190,16 @@ mod tests {
     }
 
     #[test]
+    fn global_liveness_pruning_is_rate_limited() {
+        let mut store = SessionStore::default();
+        assert!(store.prune_due());
+        store.last_prune = Some(Instant::now());
+        assert!(!store.prune_due());
+        store.last_prune = Some(Instant::now() - PRUNE_INTERVAL);
+        assert!(store.prune_due());
+    }
+
+    #[test]
     fn split_command_creates_second_pane() {
         let mut store = SessionStore::default();
         let _ = store.handle(CommandRequest::NewSession {
@@ -1300,7 +2220,7 @@ mod tests {
             CommandResponse::PaneSplit {
                 session,
                 window_id: 1,
-                pane_id: 1
+                pane_id: 2
             } if session == "work"
         ));
     }
@@ -1314,17 +2234,191 @@ mod tests {
             command: vec!["sh".into(), "-lc".into(), "printf attached; sleep 1".into()],
             switch_from: None,
         });
-        std::thread::sleep(std::time::Duration::from_millis(100));
-
-        let attached = store.handle(CommandRequest::Attach { session: None });
+        let mut attached = None;
+        for _ in 0..50 {
+            let response = store.handle(CommandRequest::Attach {
+                session: None,
+                viewport: None,
+            });
+            if matches!(
+                response,
+                CommandResponse::Attached { ref preview, .. } if preview.contains("attached")
+            ) {
+                attached = Some(response);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let attached = attached.expect("attach should eventually expose pane output");
 
         assert!(matches!(
-            attached,
+            &attached,
             CommandResponse::Attached {
                 session,
                 preview,
                 ..
             } if session == "work" && preview.contains("attached")
+        ));
+        if let CommandResponse::Attached {
+            preview,
+            formatted_preview,
+            formatted_cursor,
+            snapshot: Some(snapshot),
+            ..
+        } = attached
+        {
+            let focused = snapshot
+                .panes
+                .iter()
+                .find(|pane| pane.focused)
+                .expect("focused pane");
+            assert_eq!(preview, focused.preview);
+            assert_eq!(formatted_preview, focused.formatted_preview);
+            assert_eq!(formatted_cursor, focused.formatted_cursor);
+        } else {
+            panic!("expected attached snapshot");
+        }
+        store
+            .sessions
+            .remove("work")
+            .expect("session")
+            .kill()
+            .expect("clean up session");
+    }
+
+    #[test]
+    fn attached_clients_render_their_own_viewports_while_ptys_use_the_largest_lease() {
+        let mut store = SessionStore::default();
+        assert!(matches!(
+            store.handle(CommandRequest::NewSession {
+                name: Some("work".into()),
+                cwd: None,
+                command: vec!["sh".into()],
+                switch_from: None,
+            }),
+            CommandResponse::SessionCreated { .. }
+        ));
+
+        let attach = |store: &mut SessionStore, client_id: &str, rows, cols| {
+            match store.handle(CommandRequest::Attach {
+                session: Some("work".into()),
+                viewport: Some(ClientViewport {
+                    client_id: client_id.into(),
+                    rows,
+                    cols,
+                }),
+            }) {
+                CommandResponse::Attached {
+                    snapshot: Some(snapshot),
+                    ..
+                } => snapshot,
+                other => panic!("unexpected attach response: {other:?}"),
+            }
+        };
+
+        let small = attach(&mut store, "small", 24, 80);
+        assert_eq!(small.panes[0].rect.width, 80);
+        assert_eq!(small.panes[0].rect.height, 23);
+        let large = attach(&mut store, "large", 50, 160);
+        assert_eq!(large.panes[0].rect.width, 160);
+        assert_eq!(large.panes[0].rect.height, 49);
+        let small_again = attach(&mut store, "small", 24, 80);
+        assert_eq!(small_again.panes[0].rect.width, 80);
+        assert_eq!(small_again.panes[0].rect.height, 23);
+
+        let session = store.sessions.get("work").expect("live session");
+        assert_eq!((session.rows, session.cols), (50, 160));
+        let pane = session
+            .active_window()
+            .expect("active window")
+            .panes
+            .get(&PaneId(0))
+            .expect("root pane");
+        assert_eq!(pane.process.screen_size().expect("query PTY size"), (49, 160));
+        session.kill().expect("clean up session");
+    }
+
+    #[test]
+    fn default_attachment_prefers_live_session_over_stale_last_session() {
+        let mut store = SessionStore::default();
+        let _ = store.handle(CommandRequest::NewSession {
+            name: Some("live".into()),
+            cwd: None,
+            command: vec!["sh".into(), "-lc".into(), "sleep 1".into()],
+            switch_from: None,
+        });
+        let persisted = PersistedSession::from_live(
+            store.sessions.get("live").expect("live session"),
+        );
+        store.persisted_sessions.insert("stale".into(), persisted);
+        store.last_session = Some("stale".into());
+
+        assert_eq!(store.resolve_session(None).as_deref(), Some("live"));
+        store
+            .sessions
+            .get("live")
+            .expect("live session")
+            .kill()
+            .expect("clean up live session");
+    }
+
+    #[test]
+    fn killing_the_last_pane_reports_that_the_session_was_killed() {
+        let mut store = SessionStore::default();
+        let _ = store.handle(CommandRequest::NewSession {
+            name: Some("work".into()),
+            cwd: None,
+            command: vec!["sh".into()],
+            switch_from: None,
+        });
+
+        assert_eq!(
+            store.handle(CommandRequest::KillPane {
+                target: "work".into(),
+            }),
+            CommandResponse::SessionKilled {
+                session: "work".into(),
+            }
+        );
+        assert!(!store.sessions.contains_key("work"));
+    }
+
+    #[test]
+    fn persistence_failures_are_reported_to_the_caller() {
+        let dir = tempdir();
+        let blocked_parent = dir.path().join("not-a-directory");
+        fs::write(&blocked_parent, "file").expect("create blocked parent");
+        let mut store = SessionStore::default();
+        store.state_path = Some(blocked_parent.join("state.json"));
+
+        let response = store.handle(CommandRequest::SetBuffer {
+            buffer: None,
+            data: "hello".into(),
+            append: false,
+        });
+
+        assert!(matches!(
+            response,
+            CommandResponse::Error { message }
+                if message.contains("completed in memory but failed to persist state")
+        ));
+        assert_eq!(
+            store.buffers.get(None).map(|buffer| buffer.data.clone()),
+            Some("hello".into())
+        );
+    }
+
+    #[test]
+    fn read_only_requests_do_not_write_state() {
+        let dir = tempdir();
+        let blocked_parent = dir.path().join("not-a-directory");
+        fs::write(&blocked_parent, "file").expect("create blocked parent");
+        let mut store = SessionStore::default();
+        store.state_path = Some(blocked_parent.join("state.json"));
+
+        assert!(matches!(
+            store.handle(CommandRequest::ListSessions),
+            CommandResponse::SessionList { sessions } if sessions.is_empty()
         ));
     }
 
@@ -1351,7 +2445,7 @@ mod tests {
             CommandResponse::WindowList {
                 windows: vec![crate::window::WindowSummary {
                     id: 1,
-                    index: 0,
+                    index: 1,
                     name: "editor".into(),
                     active: true,
                     last_selected: false,
@@ -1361,7 +2455,43 @@ mod tests {
     }
 
     #[test]
-    fn nested_new_session_redirects_next_attach() {
+    fn window_names_reject_empty_control_and_overlong_values() {
+        let mut store = SessionStore::default();
+        let _ = store.handle(CommandRequest::NewSession {
+            name: Some("work".into()),
+            cwd: None,
+            command: vec!["sh".into()],
+            switch_from: None,
+        });
+
+        for name in [String::new(), "line\nbreak".into(), "x".repeat(MAX_WINDOW_NAME_BYTES + 1)] {
+            assert!(matches!(
+                store.handle(CommandRequest::RenameWindow {
+                    target: "work:1".into(),
+                    name,
+                }),
+                CommandResponse::Error { .. }
+            ));
+        }
+        assert!(matches!(
+            store.handle(CommandRequest::NewWindow {
+                session: "work".into(),
+                name: Some("\u{1b}[2J".into()),
+                command: vec!["sh".into()],
+            }),
+            CommandResponse::Error { .. }
+        ));
+        assert_eq!(store.next_window_id, 1, "invalid names must not consume IDs");
+        store
+            .sessions
+            .get("work")
+            .expect("work session")
+            .kill()
+            .expect("clean up session");
+    }
+
+    #[test]
+    fn nested_new_session_redirects_only_the_client_that_submitted_it() {
         let mut store = SessionStore::default();
         let created = store.handle(CommandRequest::NewSession {
             name: Some("work".into()),
@@ -1369,38 +2499,63 @@ mod tests {
             command: vec!["sh".into()],
             switch_from: None,
         });
-        let pane_id = match created {
-            CommandResponse::SessionCreated { pane_id, .. } => pane_id,
+        match created {
+            CommandResponse::SessionCreated { .. } => {}
             other => panic!("unexpected response: {other:?}"),
-        };
+        }
 
+        let source = SwitchSource {
+            session: "work".into(),
+            window_id: 1,
+            pane_id: 0,
+        };
+        assert!(matches!(
+            store.handle(CommandRequest::RegisterInput {
+                source: source.clone(),
+                client_id: "author".into(),
+            }),
+            CommandResponse::InputRegistered
+        ));
         let response = store.handle(CommandRequest::NewSession {
             name: Some("logs".into()),
             cwd: None,
             command: vec!["sh".into()],
-            switch_from: Some(SwitchSource {
-                session: "work".into(),
-                window_id: 1,
-                pane_id,
-            }),
+            switch_from: Some(source),
         });
         assert!(matches!(
             response,
             CommandResponse::SessionCreated { session, .. } if session == "logs"
         ));
 
-        let attached = store.handle(CommandRequest::Attach {
+        let other_client = store.handle(CommandRequest::Attach {
             session: Some("work".into()),
+            viewport: Some(ClientViewport {
+                client_id: "viewer".into(),
+                rows: 24,
+                cols: 80,
+            }),
         });
         assert!(matches!(
-            attached,
+            other_client,
+            CommandResponse::Attached { session, .. } if session == "work"
+        ));
+        let author = store.handle(CommandRequest::Attach {
+            session: Some("work".into()),
+            viewport: Some(ClientViewport {
+                client_id: "author".into(),
+                rows: 24,
+                cols: 80,
+            }),
+        });
+        assert!(matches!(
+            author,
             CommandResponse::Attached { session, .. } if session == "logs"
         ));
     }
 
     #[test]
-    fn persisted_metadata_survives_store_restart() {
-        let dir = tempdir().expect("tempdir");
+    fn persisted_metadata_survives_store_restart_without_paste_contents() {
+        let dir = tempdir();
         let state_path = dir.path().join("state.json");
         let config_path = dir.path().join("config.toml");
 
@@ -1444,26 +2599,25 @@ mod tests {
         assert!(matches!(
             restarted.handle(CommandRequest::Attach {
                 session: Some("work".into()),
+                viewport: None,
             }),
             CommandResponse::Attached { session, .. } if session == "work"
         ));
-        assert_eq!(
+        assert!(matches!(
             restarted.handle(CommandRequest::ShowBuffer { buffer: None }),
-            CommandResponse::BufferShown {
-                name: "buffer0001".into(),
-                data: "hello".into(),
-            }
-        );
+            CommandResponse::Error { message } if message == "no matching paste buffer"
+        ));
     }
 
     #[test]
     fn unrecoverable_persisted_sessions_are_pruned_on_startup() {
-        let dir = tempdir().expect("tempdir");
+        let dir = tempdir();
         let state_path = dir.path().join("state.json");
         let config_path = dir.path().join("config.toml");
         fs::write(
             &state_path,
             serde_json::to_vec_pretty(&PersistedState {
+                schema_version: crate::persistence::STATE_SCHEMA_VERSION,
                 last_session: Some("ghost".into()),
                 next_window_id: 1,
                 buffers: Vec::new(),
@@ -1524,7 +2678,7 @@ mod tests {
 
     #[test]
     fn reload_config_updates_future_creation_defaults() {
-        let dir = tempdir().expect("tempdir");
+        let dir = tempdir();
         let state_path = dir.path().join("state.json");
         let config_path = dir.path().join("config.toml");
         fs::write(
@@ -1568,7 +2722,7 @@ mod tests {
 
     #[test]
     fn invalid_reload_keeps_previous_config() {
-        let dir = tempdir().expect("tempdir");
+        let dir = tempdir();
         let state_path = dir.path().join("state.json");
         let config_path = dir.path().join("config.toml");
         fs::write(
@@ -1599,6 +2753,78 @@ mod tests {
         assert!(matches!(
             created,
             CommandResponse::SessionCreated { ref session, .. } if session == "work-1"
+        ));
+    }
+
+    #[test]
+    fn configurable_public_numbering_applies_to_sessions_and_targets() {
+        let dir = tempdir();
+        let state_path = dir.path().join("state.json");
+        let config_path = dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+                [behavior]
+                window_base = 1
+                pane_base = 2
+            "#,
+        )
+        .expect("write config");
+
+        let mut store = SessionStore::with_paths(state_path, config_path, dir.path().join("panes"))
+            .expect("create store");
+
+        let created = store.handle(CommandRequest::NewSession {
+            name: Some("work".into()),
+            cwd: None,
+            command: vec!["sh".into()],
+            switch_from: None,
+        });
+        assert!(matches!(
+            created,
+            CommandResponse::SessionCreated {
+                session,
+                pane_id: 2
+            } if session == "work"
+        ));
+
+        assert_eq!(
+            store.handle(CommandRequest::ListWindows {
+                session: "work".into(),
+            }),
+            CommandResponse::WindowList {
+                windows: vec![crate::window::WindowSummary {
+                    id: 1,
+                    index: 1,
+                    name: "sh".into(),
+                    active: true,
+                    last_selected: false,
+                }]
+            }
+        );
+
+        let split = store.handle(CommandRequest::SplitPane {
+            target: "work:1.2".into(),
+            axis: SplitAxis::Vertical,
+            command: Vec::new(),
+        });
+        assert!(matches!(
+            split,
+            CommandResponse::PaneSplit {
+                session,
+                window_id: 1,
+                pane_id: 3
+            } if session == "work"
+        ));
+
+        assert!(matches!(
+            store.handle(CommandRequest::ListPanes {
+                target: "work:1".into(),
+            }),
+            CommandResponse::PaneList { panes }
+                if panes.len() == 2
+                    && panes.iter().any(|pane| pane.id == 2 && pane.window_id == 1)
+                    && panes.iter().any(|pane| pane.id == 3 && pane.window_id == 1)
         ));
     }
 

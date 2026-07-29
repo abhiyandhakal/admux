@@ -1,3 +1,4 @@
+pub mod alias;
 pub mod buffer;
 pub mod cli;
 pub mod client;
@@ -8,6 +9,7 @@ pub mod copy_mode;
 pub mod input;
 pub mod ipc;
 pub mod layout;
+pub mod numbering;
 pub mod pane;
 pub mod paths;
 pub mod persistence;

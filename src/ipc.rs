@@ -11,7 +11,14 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtocolVersion(pub u16);
 
-pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(5);
+pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(12);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientViewport {
+    pub client_id: String,
+    pub rows: u16,
+    pub cols: u16,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommandRequest {
@@ -34,11 +41,15 @@ pub enum CommandRequest {
     },
     Attach {
         session: Option<String>,
+        #[serde(default)]
+        viewport: Option<ClientViewport>,
     },
     PreviewSession {
         session: String,
+        target: Option<String>,
     },
     ListSessions,
+    ListChooseTree,
     ListWindows {
         session: String,
     },
@@ -82,6 +93,14 @@ pub enum CommandRequest {
         target: String,
         keys: Vec<String>,
     },
+    SendBytes {
+        target: String,
+        bytes: Vec<u8>,
+    },
+    RegisterInput {
+        source: SwitchSource,
+        client_id: String,
+    },
     SplitPane {
         target: String,
         axis: SplitAxis,
@@ -114,12 +133,15 @@ pub enum CommandRequest {
     },
     MouseScroll {
         session: String,
+        window_id: u64,
+        pane_id: u64,
         row: u16,
         col: u16,
         direction: ScrollDirection,
     },
     MousePane {
         session: String,
+        window_id: u64,
         pane_id: u64,
         row: u16,
         col: u16,
@@ -127,16 +149,24 @@ pub enum CommandRequest {
     },
     CopySelection {
         session: String,
+        window_id: Option<u64>,
         pane_id: Option<u64>,
-        start_row: u16,
+        start_from_bottom: u32,
         start_col: u16,
-        end_row: u16,
+        end_from_bottom: u32,
         end_col: u16,
     },
     ScrollPane {
         session: String,
+        window_id: Option<u64>,
         pane_id: Option<u64>,
         lines: i16,
+    },
+    ScrollPaneTo {
+        session: String,
+        window_id: Option<u64>,
+        pane_id: Option<u64>,
+        position: ScrollbackPosition,
     },
     Resize {
         session: String,
@@ -189,6 +219,9 @@ pub enum CommandResponse {
     SessionList {
         sessions: Vec<SessionSummary>,
     },
+    ChooseTreeList {
+        sessions: Vec<ChooseTreeSession>,
+    },
     WindowList {
         windows: Vec<WindowSummary>,
     },
@@ -231,6 +264,7 @@ pub enum CommandResponse {
         pane_id: u64,
     },
     KeysSent,
+    InputRegistered,
     SelectionCopied {
         text: String,
     },
@@ -250,10 +284,22 @@ pub enum ScrollDirection {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScrollbackPosition {
+    Top,
+    Bottom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PaneMouseKind {
     LeftDown,
     LeftDrag,
     LeftUp,
+    MiddleDown,
+    MiddleDrag,
+    MiddleUp,
+    RightDown,
+    RightDrag,
+    RightUp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -293,6 +339,16 @@ pub struct PaneRender {
     pub helper_socket: Option<PathBuf>,
     #[serde(default)]
     pub mouse_reporting: bool,
+    #[serde(default)]
+    pub application_cursor: bool,
+    #[serde(default)]
+    pub scrollback: u32,
+    #[serde(default)]
+    pub preview: String,
+    #[serde(default)]
+    pub formatted_preview: String,
+    #[serde(default)]
+    pub formatted_cursor: String,
     pub rows_plain: Vec<String>,
     pub rows_formatted: Vec<String>,
     pub cursor: Option<PaneCursor>,
@@ -326,6 +382,20 @@ pub struct SessionSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChooseTreeSession {
+    pub name: String,
+    #[serde(default)]
+    pub stale: bool,
+    pub windows: Vec<ChooseTreeWindow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChooseTreeWindow {
+    pub window: WindowSummary,
+    pub panes: Vec<PaneSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BufferSummary {
     pub name: String,
     pub bytes: usize,
@@ -343,6 +413,17 @@ mod tests {
             cwd: Some(PathBuf::from("/tmp")),
             command: vec!["bash".into()],
             switch_from: None,
+        };
+        let encoded = serde_json::to_vec(&request).expect("encode request");
+        let decoded: CommandRequest = serde_json::from_slice(&encoded).expect("decode request");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn direct_input_request_preserves_arbitrary_bytes() {
+        let request = CommandRequest::SendBytes {
+            target: "work:1.0".into(),
+            bytes: vec![0x00, 0x1b, 0x80, 0xff],
         };
         let encoded = serde_json::to_vec(&request).expect("encode request");
         let decoded: CommandRequest = serde_json::from_slice(&encoded).expect("decode request");

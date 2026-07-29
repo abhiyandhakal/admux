@@ -19,6 +19,8 @@ It combines tmux-style terminal multiplexing with project-scoped workspaces, rep
 ```bash
 admux new
 admux up
+admux alias add demo ~/coding/projects/demo/admux.toml
+admux demo
 admux save
 admux ls
 admux attach work
@@ -29,6 +31,8 @@ Key points:
 - `admux` autostarts the daemon; normal usage does not require launching `admuxd` manually
 - `admux new` starts in the current shell directory by default
 - `admux up` reads `./admux.toml`
+- `admux alias add <name> [path]` stores a reusable workspace shortcut
+- `admux <alias>` launches the aliased workspace
 - `admux save` writes `admux.toml` and `.admux/snapshot.json` into the session directory
 
 ## Product Model
