@@ -1,13 +1,19 @@
 use std::{
     collections::BTreeMap,
     env, fs,
+    fs::OpenOptions,
+    os::unix::{fs::{OpenOptionsExt, PermissionsExt}, io::AsRawFd},
     path::{Path, PathBuf},
+    process,
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::{numbering::Numbering, workspace::load_workspace};
+
+static ALIAS_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct AliasRegistry {
@@ -28,13 +34,33 @@ impl AliasRegistry {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create alias directory {}", parent.display()))?;
-        }
-        let tmp = path.with_extension("json.tmp");
+        let _writer_lock = lock_alias_writer(path)?;
+        self.save_unlocked(path)
+    }
+
+    pub fn update<T>(path: &Path, update: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        let _writer_lock = lock_alias_writer(path)?;
+        let mut registry = Self::load(path)?;
+        let result = update(&mut registry)?;
+        registry.save_unlocked(path)?;
+        Ok(result)
+    }
+
+    fn save_unlocked(&self, path: &Path) -> Result<()> {
+        let tmp = alias_temporary_path(path)?;
         let raw = serde_json::to_vec_pretty(self).context("failed to encode alias file")?;
-        fs::write(&tmp, raw).with_context(|| format!("failed to write {}", tmp.display()))?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .with_context(|| format!("failed to create {}", tmp.display()))?;
+        std::io::Write::write_all(&mut file, &raw)
+            .with_context(|| format!("failed to write {}", tmp.display()))?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to restrict permissions on {}", tmp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync {}", tmp.display()))?;
         fs::rename(&tmp, path)
             .with_context(|| format!("failed to rename {} to {}", tmp.display(), path.display()))?;
         Ok(())
@@ -75,6 +101,49 @@ impl AliasRegistry {
     }
 }
 
+fn alias_temporary_path(path: &Path) -> Result<PathBuf> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("alias file {} has no parent directory", path.display()))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create alias directory {}", parent.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("alias file {} has no valid file name", path.display()))?;
+    let counter = ALIAS_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    Ok(parent.join(format!(".{file_name}.{}.{}.tmp", process::id(), counter)))
+}
+
+fn lock_alias_writer(path: &Path) -> Result<fs::File> {
+    let lock_path = path.with_extension("json.lock");
+    let parent = lock_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("alias lock {} has no parent directory", lock_path.display()))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create alias directory {}", parent.display()))?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open alias lock {}", lock_path.display()))?;
+    lock.set_permissions(fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to restrict permissions on {}", lock_path.display()))?;
+    loop {
+        // SAFETY: `lock` stays open while the exclusive advisory lock is held.
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(lock);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error)
+                .with_context(|| format!("failed to lock alias file {}", path.display()));
+        }
+    }
+}
+
 fn validate_alias_name(name: &str, reserved_names: &[&str]) -> Result<()> {
     if name.is_empty() {
         bail!("alias name cannot be empty");
@@ -106,6 +175,7 @@ fn resolve_manifest_path(path: Option<&Path>) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{sync::{Arc, Barrier}, thread};
     use tempfile::tempdir;
 
     fn numbering() -> Numbering {
@@ -147,6 +217,49 @@ root = { command = ["sh"] }
         let loaded = AliasRegistry::load(&path).expect("load aliases");
 
         assert_eq!(loaded, registry);
+    }
+
+    #[test]
+    fn alias_temp_paths_are_unique() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("aliases.json");
+
+        let first = alias_temporary_path(&path).expect("first temp path");
+        let second = alias_temporary_path(&path).expect("second temp path");
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn concurrent_updates_preserve_both_aliases() {
+        let dir = tempdir().expect("tempdir");
+        let path = Arc::new(dir.path().join("aliases.json"));
+        let start = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+
+        for name in ["one", "two"] {
+            let path = Arc::clone(&path);
+            let start = Arc::clone(&start);
+            workers.push(thread::spawn(move || {
+                start.wait();
+                AliasRegistry::update(&path, |registry| {
+                    registry.aliases.insert(
+                        name.into(),
+                        PathBuf::from(format!("/tmp/{name}/admux.toml")),
+                    );
+                    Ok(())
+                })
+            }));
+        }
+        start.wait();
+        for worker in workers {
+            worker.join().expect("worker panicked").expect("update aliases");
+        }
+
+        let registry = AliasRegistry::load(&path).expect("load aliases");
+        assert_eq!(registry.aliases.len(), 2);
+        assert!(registry.aliases.contains_key("one"));
+        assert!(registry.aliases.contains_key("two"));
     }
 
     #[test]

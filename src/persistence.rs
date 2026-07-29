@@ -398,11 +398,24 @@ fn lock_state_writer(path: &Path) -> Result<fs::File> {
     lock.set_permissions(fs::Permissions::from_mode(0o600))
         .with_context(|| format!("failed to restrict permissions on {}", lock_path.display()))?;
     // SAFETY: `lock` stays open while the exclusive advisory lock is held.
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("failed to lock state file {}", path.display()));
-    }
+    retry_interrupted_lock(|| {
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    })
+    .with_context(|| format!("failed to lock state file {}", path.display()))?;
     Ok(lock)
+}
+
+fn retry_interrupted_lock(mut acquire: impl FnMut() -> std::io::Result<()>) -> std::io::Result<()> {
+    loop {
+        match acquire() {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => return result,
+        }
+    }
 }
 
 fn backup_current_state(path: &Path) -> Result<()> {
@@ -660,5 +673,22 @@ mod tests {
         let mut session = persisted_session();
         session.window_order.push(WindowId(1));
         assert!(session.normalized().is_err());
+    }
+
+    #[test]
+    fn interrupted_lock_acquisition_is_retried() {
+        let mut attempts = 0;
+
+        retry_interrupted_lock(|| {
+            attempts += 1;
+            if attempts == 1 {
+                Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+            } else {
+                Ok(())
+            }
+        })
+        .expect("retry interrupted lock");
+
+        assert_eq!(attempts, 2);
     }
 }

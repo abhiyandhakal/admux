@@ -1794,27 +1794,27 @@ fn numbering_from_config(config: &ResolvedConfig) -> Numbering {
 }
 
 fn run_alias_command(paths: &RuntimePaths, args: AliasArgs) -> Result<()> {
-    let mut registry = AliasRegistry::load(&paths.aliases_path)?;
     match args.command {
         AliasCommand::Add(AliasAddArgs { name, path }) => {
             let config = load_config(paths)?;
-            let manifest = registry.add(
-                &name,
-                path.as_deref(),
-                numbering_from_config(&config),
-                crate::cli::TOP_LEVEL_COMMAND_NAMES,
-            )?;
-            registry.save(&paths.aliases_path)?;
+            let manifest = AliasRegistry::update(&paths.aliases_path, |registry| {
+                registry.add(
+                    &name,
+                    path.as_deref(),
+                    numbering_from_config(&config),
+                    crate::cli::TOP_LEVEL_COMMAND_NAMES,
+                )
+            })?;
             println!("added alias {name} {}", manifest.display());
         }
         AliasCommand::List => {
+            let registry = AliasRegistry::load(&paths.aliases_path)?;
             for (name, path) in registry.list() {
                 println!("{name} {}", path.display());
             }
         }
         AliasCommand::Remove(args) => {
-            registry.remove(&args.name)?;
-            registry.save(&paths.aliases_path)?;
+            AliasRegistry::update(&paths.aliases_path, |registry| registry.remove(&args.name))?;
             println!("removed alias {}", args.name);
         }
     }

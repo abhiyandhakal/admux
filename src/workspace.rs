@@ -291,11 +291,7 @@ pub fn save_workspace(session: &Session, snapshot_lines: usize) -> Result<PathBu
             return Err(error);
         }
     };
-    if let Err(error) = commit_workspace_file(&snapshot_tmp, &snapshot_path) {
-        let _ = fs::remove_file(&manifest_tmp);
-        return Err(error);
-    }
-    commit_workspace_file(&manifest_tmp, &path)?;
+    commit_workspace_pair(&manifest_tmp, &path, &snapshot_tmp, &snapshot_path)?;
     Ok(path)
 }
 
@@ -830,6 +826,44 @@ fn commit_workspace_file(temporary: &Path, path: &Path) -> Result<()> {
         .with_context(|| format!("failed to open workspace directory {}", parent.display()))?
         .sync_all()
         .with_context(|| format!("failed to sync workspace directory {}", parent.display()))
+}
+
+fn commit_workspace_pair(
+    manifest_tmp: &Path,
+    manifest_path: &Path,
+    snapshot_tmp: &Path,
+    snapshot_path: &Path,
+) -> Result<()> {
+    commit_workspace_pair_with(
+        manifest_tmp,
+        manifest_path,
+        snapshot_tmp,
+        snapshot_path,
+        commit_workspace_file,
+    )
+}
+
+fn commit_workspace_pair_with<F>(
+    manifest_tmp: &Path,
+    manifest_path: &Path,
+    snapshot_tmp: &Path,
+    snapshot_path: &Path,
+    mut commit: F,
+) -> Result<()>
+where
+    F: FnMut(&Path, &Path) -> Result<()>,
+{
+    if let Err(error) = commit(manifest_tmp, manifest_path) {
+        let _ = fs::remove_file(manifest_tmp);
+        let _ = fs::remove_file(snapshot_tmp);
+        return Err(error);
+    }
+    if let Err(error) = commit(snapshot_tmp, snapshot_path) {
+        let _ = fs::remove_file(snapshot_tmp);
+        return Err(error)
+            .context("workspace manifest was saved but its snapshot sidecar was not updated");
+    }
+    Ok(())
 }
 
 fn ensure_snapshot_gitignore(gitignore: &Path) -> Result<()> {
@@ -1624,6 +1658,38 @@ root = { command = ["sh"] }
         assert_eq!(fs::read_to_string(&manifest_path).expect("read manifest"), original);
 
         let _ = session.kill();
+    }
+
+    #[test]
+    fn failed_manifest_commit_preserves_the_previous_snapshot() {
+        let dir = tempdir();
+        let manifest_path = dir.path().join("admux.toml");
+        let snapshot_path = dir.path().join("snapshot.json");
+        fs::write(&manifest_path, "version = 1\n").expect("write manifest");
+        fs::write(&snapshot_path, "previous snapshot").expect("write snapshot");
+        let manifest_tmp = stage_workspace_file(&manifest_path, b"version = 2\n")
+            .expect("stage manifest");
+        let snapshot_tmp = stage_workspace_file(&snapshot_path, b"new snapshot")
+            .expect("stage snapshot");
+
+        let error = commit_workspace_pair_with(
+            &manifest_tmp,
+            &manifest_path,
+            &snapshot_tmp,
+            &snapshot_path,
+            |_, path| {
+                if path == manifest_path {
+                    bail!("injected manifest commit failure");
+                }
+                Ok(())
+            },
+        )
+        .expect_err("manifest commit should fail");
+
+        assert!(error.to_string().contains("injected manifest"));
+        assert_eq!(fs::read_to_string(&snapshot_path).expect("read snapshot"), "previous snapshot");
+        assert!(!manifest_tmp.exists());
+        assert!(!snapshot_tmp.exists());
     }
 
     #[test]
