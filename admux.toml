@@ -1,0 +1,48 @@
+version = 1
+
+[workspace]
+name = "session-1"
+cwd = "."
+active_window = 3
+
+[[windows]]
+name = "zsh"
+
+[windows.root]
+command = [
+    "nvim",
+    "Cargo.toml",
+]
+
+[[windows]]
+name = "zsh"
+
+[windows.root]
+command = [
+    "node",
+    "/home/abhiyan/.nvm/versions/node/v24.12.0/bin/pnpm",
+    "start:dev",
+]
+
+[[windows]]
+name = "zsh"
+
+[windows.root]
+command = ["/usr/bin/zsh"]
+
+[[windows]]
+name = "zsh"
+active_pane = 1
+
+[windows.root]
+command = ["/usr/bin/zsh"]
+
+[[windows.splits]]
+target = 0
+direction = "vertical"
+size = 0.45
+command = [
+    "node",
+    "/home/abhiyan/.nvm/versions/node/v24.12.0/bin/copilot",
+    "--resume",
+]
